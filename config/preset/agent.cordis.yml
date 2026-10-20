@@ -1,0 +1,240 @@
+﻿# android-runner —— 主 Agent 用来派发 Android 用例执行的 preset。
+#
+# 解决的问题（用户原话）：
+#   "子 Agent 默认继承父方的工具集 这个需要限制下。让其能够只用我们提供的方法"
+#
+# 默认情况下 child 继承父方**全部**工具（实测 28 个，含 pwsh / write / workflow /
+# ralph）。那些工具能绕开 LangGraph 骨架直接调 adb、直接改文件，
+# 我们辛苦加的纪律（坐标合法性、落点判定、结论闸门、死循环阻断）全部形同虚设。
+#
+# 这里的做法：给 subagent **这一行**配上 toolFilter.allow。
+#   · toolFilter 是 tool-subagent 的**配置**（不是调用参数），
+#     所以它对该行发出的每一次委派都生效 —— 这正是我们要的"这个入口只能干这个"
+#   · 子 Agent 的工具面因此被收窄到：android_case + 少数辅助
+#
+# 为什么用 allow 而不是 deny：
+#   deny 要列举"不许用什么"，父方工具集一变就可能漏掉新增的危险工具（黑名单会过期）；
+#   allow 是白名单，新增工具默认进不来 —— 安全边界不会随时间腐化。
+#
+# 为什么 maxDepth: 1：
+#   子 Agent 不该再派孙 Agent，否则"限制工具面"可以被绕开：
+#   派一个不带过滤的孙 Agent 就行。
+#   顶层 depth=0，子 Agent=depth 1，孙 Agent=depth 2。
+#   maxDepth: 1 允许子 Agent、拒绝孙 Agent。（写 0 会把子 Agent 也拒掉。）
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# persona 说明主 Agent 的职责边界。
+#
+# ★ prefix 是**必填**（suffix 才有默认值 ""）。踩过：只写 suffix 会报
+#   "invalid config: $.prefix missing required value"，整个 preset 切不过去。
+#
+# ⚠️ 这段以前写的是"你负责在真实设备上执行用例"，方向是错的 ——
+#   主 Agent 读了就会自己调 android_case（实测发生过：`android_case · 168`
+#   一步到位，子 Agent 根本没被创建）。
+#   真实分工是：**主 Agent 拆解 + 派发，子 Agent 执行**。
+#   代码侧的强制闸门在插件里（主 Agent 调 android_case 会被直接拒），
+#   这里写的是让它**一开始就不往那个方向走**，少绕一圈。
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: >-
+      你负责 Android GUI 测试用例的**拆解与派发**，不亲自操作设备。
+
+      你的两件事：
+      1. 拆解 —— 把需求变成 steps（每步的落点判据 landing）、asserts、preconditions；
+         或优先复用已经沉淀好的用例 YAML（用 glob 找 storage/cases/*.yaml）。
+      2. 派发 —— 用 subagent 工具把用例交给执行子 Agent，再如实转述它的报告。
+
+      ⚠️ 你不能直接跑用例：主 Agent 调用 android_case 会被**代码拒绝**。
+      执行节奏、坐标合法性、落点复核、死循环阻断都在子 Agent 侧的执行器里，
+      你绕过去等于把那些纪律全作废。想跑用例只有一条路 —— 派子 Agent。
+
+      转述报告时看三个字段：steps_done（=0 表示一步没跑，别说成"功能有问题"）、
+      engine（autopilot 不是真结论）、status（PASS/FAIL 才是结论）。
+
+# ── 技能：SKILL 提供决策纪律 ────────────────────────────────────────────────
+#
+# skill 工具要留着 —— 它是子 Agent 读"怎么做"的入口。
+# （toolFilter 的 restrictableNames 包含所有祖先层工具，所以 allow 里可以写 skill；
+#   见 dsh-tools/lib/index.js view() 的 restrictableNames 构造。）
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── 只读文件工具：子 Agent 靠它读用例和知识卡 ──────────────────────────────
+#
+# ★ 必须显式挂载。web profile 的 dsh-web-app 把这些行**故意禁用**了
+#   （cordis.patch.yml: "tool-fs / tool-fs-search disabled: true"），
+#   文件工具改由 preset 自己负责挂。不挂的话：
+#     · 父方工具面里根本没有 read/glob/grep
+#     · toolFilter.allow 里写它们 → restrict() 抛
+#       "names unknown global tools"，子 Agent **完全派不出去**
+#   实测踩过：整个委派在构造阶段就失败，跟提示词无关。
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── 执行器工具 ──────────────────────────────────────────────────────────────
+#
+# ⚠️ 这里挂着的 android_case **同时暴露给主 Agent 和子 Agent**，
+#   因为子 Agent 的工具面是**继承**父 Agent 再收窄的
+#   （dsh-subagent 的 parentAgentOptionsForDelegation：
+#     child options = { ...parent.options }，没有"给子 Agent 单独挂插件"的机制）。
+#
+#   于是有个绕不开的事实：
+#     主 Agent 不挂 → 子 Agent 也继承不到 → toolFilter.allow 里写 android_case
+#     会直接抛 "names unknown global tool"，子 Agent 根本派不出去。
+#
+#   ⇒ 所以"别让主 Agent 自己跑"不能靠"不发工具"实现。
+#     真正的强制闸门在**插件内部**（runner-tool/lib/index.js 的 execute）：
+#       · 主 Agent（subagentDepth=0）调用 → 直接拒绝，并告诉它改用 subagent
+#       · 子 Agent（subagentDepth=1）调用 → 放行
+#     delegationDepth 是持久化且单调的，模型改不了 —— 这个判断绕不过去。
+#
+#     这比"在 prompt 里叮嘱"可靠：工具在，但主 Agent 用了会被**代码**挡回来。
+- id: tool-android-case
+  name: 'dsh-tool-android-case'
+
+# ── 压缩 ────────────────────────────────────────────────────────────────────
+#
+# 这个 preset 早先**完全没有压缩组件**，所以上下文一路涨到
+# CONTEXT_WINDOW_EXCEEDED 直接报错 —— 自动压缩不是框架内建的，是插件提供的。
+#
+# 子 Agent 通过 composeFrom(childCtx, parent.ctx) 完整继承本 preset
+# （dsh-subagent/lib/index.js:543），所以**配一次两边都有**：
+# 主 Agent（拆解/派发）和执行子 Agent（跑用例）都受同一份配置管理。
+#
+# ⚠️ 压缩需求两边不一样，但**不需要两套配置**：
+#    子 Agent 的 context 里是几十轮的执行轨迹（每轮整屏 XML），涨得最快；
+#    主 Agent 还混着普通对话（用户提问、架构讨论）。
+#    划分维度不是"谁在看"，而是"这是不是用例产出" —— 见下面 pruner 的白名单。
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    # 兜底：真到阈值时压缩历史。这一条必须有 ——
+    # 没有它，上下文满时没有任何东西会被触发。
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    # `/compact` 手动压缩命令
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    # ★ 用**语义裁剪器**替代标准 tool-result-pruner。
+    #
+    # 标准版是按字符切的（留头 4096 + 尾 1024，中间砍掉）。而 android_case
+    # 报告的结构是「骨架 + 中间全是 issues/findings + 尾部重复坐标」，
+    # 一刀切中间恰好砍掉了**唯一有价值的部分**，裁完读不出结论。
+    #
+    # 我们的版本按 JSON 结构裁：issues 聚合同类并带计数、按严重度排序
+    # （致命在前、噪声在后），findings 保留 status/actual、砍掉重复的界面描述。
+    # 实测 5326 → 2260 字符（省 57.6%），判定信息全在，耗时 1.3ms。
+    #
+    # ⚠️ **不能和 @deepseek-ai/dsh-compaction-tool-result-pruner 同时挂**：
+    #    两者注册的服务名都是 `toolResultPruner`，重复时谁生效取决于挂载顺序。
+    #
+    # ⚠️ 只裁 android_case 的结果（PRUNE_TOOLS 白名单）。
+    #    主 Agent 的普通对话不是这个工具产的，**原样放行，零影响** ——
+    #    这正是"主 Agent 还有别的对话"这个顾虑的解决办法：
+    #    按工具名划分，不按 Agent 划分。
+    - id: android-result-pruner
+      name: 'dsh-compaction-android-pruner'
+
+# ── 委派入口（带工具面过滤）────────────────────────────────────────────────
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+
+    # ★★★ 子 Agent 的 persona —— 不写它，子 Agent 就是"第二个主 Agent"。
+    #
+    # 踩过的坑（用户实测三次）：
+    #   子 Agent 被派出去后，回复"这条用例被派发给负责执行的子 Agent 来处理"，
+    #   然后 ── 崩了。因为它以为自己是主 Agent，想把任务再往下派。
+    #
+    # 为什么会这样（代码依据）：
+    #   dsh-subagent 的 applyChildComposition()：
+    #     childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx);
+    #     if (composition.persona !== undefined) { ...section('deployment:persona-prefix') }
+    #
+    #   composeFrom() 让子 Agent **完整加入父的 preset**（继承全套插件 ——
+    #   这正是 android_case 能给到子 Agent 的原因，见上面那段注释）。
+    #   但 persona 是**另一条路径**：只有 tool-subagent 的 config.persona
+    #   非 undefined 时，才会给子 Agent 覆盖 `deployment:persona-prefix` 这一段。
+    #
+    #   不写 config.persona ⇒ 子 Agent 原样继承父的 persona
+    #   ⇒ 读到"你负责拆解与派发，不亲自操作设备"
+    #   ⇒ 它拿着 android_case 却认为"我不该执行"，转而找下家
+    #   ⇒ 但 maxDepth: 1 不许它再派 → 那一轮 turn 非常规结束
+    #   ⇒ toStopReason() 落到 default → 上层只看到 "subagent run failed"
+    #
+    #   注意：这个失败**不会**在我加的 depth 闸门里留下痕迹
+    #   （闸门在 execute 内，而子 Agent 压根没调 android_case，
+    #    探针日志一直是空的 —— 这就是排除闸门误判的依据）。
+    #
+    # 所以这里必须把父的那段"拆解与派发"**明确推翻**，
+    # 而不是"补充说明"：子 Agent 读到的必须是"你就是执行者"。
+    persona: >-
+      你是**执行子 Agent**。你的唯一职责是执行用例，不是派发。
+
+      ⚠️ 你和委派你的主 Agent 用的是同一个 preset，所以系统里能看到的
+      "拆解与派发职责"那段话是**给主 Agent 的，不是给你的**。
+      你没有 subagent 工具，也不能再向下派 —— 向上/向下找人都不可行。
+      你手上只有 android_case，它就是你的全部工作手段。
+
+      ## 你要做的事
+
+      收到用例后，**立即调用 android_case**，不要先做调研、不要先读 YAML 再说
+      "我理解了"：
+
+        android_case(case_name="168")
+
+      主 Agent 给了 case_name 就用 case_name（加载器会自己读 steps/asserts/
+      preconditions，你再传会和 YAML 打架）。
+      主 Agent 给了内联的 steps/asserts，就原样传进去，**不要改判据**。
+
+      ## 汇报
+
+      调完就把报告里的 status / engine / steps_done / issues 原样转述，
+      不要润色、不要下"功能正常/不正常"的结论。
+      steps_done=0 就直说"一步都没跑"。
+
+      ⚠️ 这里以前写的是 `android_case(case_name="168", replay=true)`，
+      并要求汇报 `replay_stats` —— 那两个东西现在都不存在了：
+      回放机制整体删除（YAML 存坐标不可靠），参数和报告字段也一并去掉。
+      自动化率看报告里一直有的 auto_rate。
+
+    # ★ 核心：子 Agent 只能用这些工具。
+    # 名单必须是**子 Agent 继承到的**工具名，否则 restrict() 会抛 unknown tool。
+    #
+    # ★ 特别不要 include `subagent` —— 那等于把"再派一层"的能力给回去。
+    toolFilter:
+      allow:
+        - android_case      # 唯一能碰设备的口子
+        - skill             # 读 SKILL 决策纪律
+        - read              # 读用例/知识卡（只读，不能写）
+        - glob              # 定位文件
+        - grep              # 搜索内容
+    # 不许再派孙 Agent —— 否则可以借一层"无过滤"的中间人绕开上面的白名单。
+    #
+    # ★ maxDepth 的语义：childDepth = 父的 depth + 1，childDepth > maxDepth 就抛。
+    #   顶层 Agent 的 depth 是 0，它的第一个子 Agent 是 depth 1。
+    #   所以 maxDepth: 0 会连**第一次委派**都拒掉（实测报
+    #   "subagent depth 1 exceeds maxDepth 0"，主 Agent 根本派不出子 Agent）。
+    #   要让"子 Agent 不能再派"，正确值是 1：子 Agent 是 depth 1（允许），
+    #   它再派就是 depth 2 > 1 → 拒。
+    maxDepth: 1
+    backgroundMode: one-shot

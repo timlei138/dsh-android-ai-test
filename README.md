@@ -281,11 +281,60 @@ asserts:
 **`device/` 是唯一能调 adb 的层。** 别在别处 `subprocess.run(["adb", ...])` ——
 绕过它就失去了设备锁、事件账本和崩溃检测。
 
+> 唯一例外：`run_case_json.py` 里有一次 `adb devices`，只为挑出唯一在线设备当
+> serial，不点、不看、不改设备状态。真正的设备动作全在 `run_case()` 内部。
+
 **`cases/` 不碰设备。** 给它一个用例名，它只回答「有哪些步骤、判据是什么」。
 
 **`agent/` 负责编排。** 节点输入 `ChildState`，输出要更新的字段。
 
 **判定集中在 `nodes.py`。** 能在代码里判死的都在这里判，这是分工的落点。
+
+---
+
+## 子 Agent：三层职责不靠自觉
+
+主 Agent **拆解 + 派发**，执行子 Agent **跑**，执行器**兜底**。
+这条分工不是靠提示词维持的，每一层都有代码闸门：
+
+| 闸门 | 位置 | 拦住什么 |
+|---|---|---|
+| 深度闸门 | `runner-tool/lib/index.js` | 主 Agent（`delegationDepth=0`）调 `android_case` 直接被拒 |
+| 工具面收窄 | `agent.cordis.yml` 的 `toolFilter.allow` | 子 Agent 只有 `android_case` + 只读工具；`maxDepth: 1` 不许再派孙 Agent |
+| 设备锁 | `device/lock.py` | 两条用例同时跑同一台设备 → 后来者排队，不会互相踩 |
+
+**为什么深度闸门不能靠"不给主 Agent 挂工具"**：子 Agent 的工具面是**继承**父方再收窄的
+（`childOptions = { ...parent.options }`），主 Agent 不挂，子 Agent 也继承不到，
+`toolFilter` 里写 `android_case` 会抛 "unknown global tool"，**根本派不出去**。
+所以工具必须在，只能靠运行时判断"谁在调"。`delegationDepth` 是持久化且单调的，模型改不了。
+
+> ⚠️ 别用提示词代替这些闸门。上面每一条都对应一次实测事故：
+> 主 Agent 顺手自己跑了（子 Agent 从没被创建）、
+> 子 Agent 以为自己是主 Agent 想再往下派（报 "subagent run failed"，连诊断都没有）、
+> 两个子 Agent 同时点同一台设备（产出一份看起来正常的错误报告，比直接报错危险得多）。
+
+### 仓库外的两个文件，同样决定子 Agent 行为
+
+```
+~/.dsh/.agent-presets/android-runner/agent.cordis.yml   工具面 + persona
+~/.agents/skills/android-case-runner/SKILL.md           子 Agent 读的技能卡
+~/.agents/skills/android-case-planner/SKILL.md          主 Agent 读的技能卡
+```
+
+它们不在 git 里，但**决定子 Agent 被教成什么样**。实测就是这么腐化的：
+代码里 `replay` 参数早就删了，两份技能卡却还在教子 Agent 写
+`android_case(replay=true)`、还在要求汇报不存在的 `replay_stats` ——
+子 Agent 读技能卡、跑代码，两边不一致它就会照着错的写。
+
+所以 `config/` 下存了它们的**镜像快照**（可 diff、可回退）：
+
+```powershell
+python sync_config.py            # 改完原文件，同步进快照
+python sync_config.py --check    # 只比对
+```
+
+`test_skill_card_consistency.py`（24 项）盯着两件事：
+**技能卡不许教代码里不存在的东西**、**快照不许和真实文件不一致**。
 
 ---
 
@@ -328,7 +377,16 @@ for f in tests/test_*.py; do .venv/Scripts/python.exe "$f"; done
 cd tests && for f in test_*.mjs; do node "$f"; done
 ```
 
-当前 **48 个 Python 测试全部通过**。
+当前 **51 个 Python 测试 + 7 个 JS 测试全部通过**。
+
+其中四个专门盯着"不靠自觉"这件事：
+
+| 测试 | 盯什么 |
+|---|---|
+| `test_subagent_chain.py` | 子 Agent 执行链完整：插件 → 执行器 → 设备层，导入不断、stdout 干净 |
+| `test_subagent_contract.py` | 三层闸门都在：主 Agent 被拒、工具面收窄、报告字段齐 |
+| `test_skill_card_consistency.py` | 技能卡不提代码里不存在的东西（`replay`/`replay_stats` 这类腐化） |
+| `test_perm_autogrant.py` | 权限自动处置 + 只记账不进 YAML |
 
 ---
 
