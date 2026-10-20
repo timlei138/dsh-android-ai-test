@@ -3,7 +3,7 @@
 
 为什么要有这个测试（2026-10 实测事故）：
 
-    用户派了两个子 Agent 同时跑用例，两个 `run_case_json.py` 抢 `51e8bf1c`：
+    用户派了两个子 Agent 同时跑用例，两个 `run_case_json.py` 抢 `<设备序列号>`：
 
       report_15  FAIL     起点不符：期望 TimetableActivity，实际 AllInOneActivity
       report_16  BLOCKED  连点 (2697,371) 无效，判卡死

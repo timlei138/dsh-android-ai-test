@@ -1,4 +1,4 @@
-"""用例执行的 JSON 入口 —— 给 DSH 工具插件（android_case）调用。
+﻿"""用例执行的 JSON 入口 —— 给 DSH 工具插件（android_case）调用。
 
 为什么单独开一个薄 CLI：
   · Node 插件不该懂 Python，也不该解析自由文本 —— 读 stdin 的 JSON、写 stdout 的 JSON
@@ -222,7 +222,7 @@ def main() -> int:
     # ★★ 设备互斥：**同一台设备同一时刻只能有一条用例在跑**。
     #
     # 为什么要在这里锁（2026-10 实测踩到）：
-    #   用户派了两个子 Agent 同时跑用例，两个进程抢 `51e8bf1c`，结果是
+    #   用户派了两个子 Agent 同时跑用例，两个进程抢 `<设备序列号>`，结果是
     #     · 起点检查失败（期望 TimetableActivity，实际 AllInOneActivity
     #       —— 另一条用例把页面翻走了）
     #     · 连点 btnCreateManually 两次没反应（另一个人在点别的）
