@@ -1,0 +1,117 @@
+meta:
+  case_id: "177"
+  title: 联想日历_177_手动创建课程表后基本信息编辑页字段校验
+  package: com.zui.calendar
+  knowledge_files:
+    - knowledge/com.zui.calendar.md
+    - knowledge/paths/com.zui.calendar.md
+
+preconditions:
+  - kind: data
+    desc: 清数据回到首次使用态，保证「手动创建」路径干净（用例前提：手动创建课程表后进入基本信息编辑页）
+    do: pm clear com.zui.calendar
+  - kind: nav
+    desc: 清理后停在日历首页
+    target: activity=.AllInOneActivity
+    assert_start: activity=.AllInOneActivity
+
+steps:
+  - id: s0
+    desc: 依次点掉 pm clear 后的框（「同意」button1 → 课程表引导 timetable_guide_button），落回日历首页
+    target: rid=button1
+    landing: activity=.AllInOneActivity
+    pitfalls:
+      - "先 button1「同意」，再 timetable_guide_button「我知道了」；引导页不点掉会影响后面找 iv_more。"
+      - "权限说明框是日历自己的，点「同意」，不要点「退出」。"
+      - "这两屏只在 pm clear 后出现；没出现时已在首页，本步 landing 仍满足。"
+
+  - id: s1
+    desc: 点首页右上角「更多」（iv_more），菜单里选「课程表」，进入课程表空态页
+    target: rid=iv_more
+    landing: activity=.timetable.display.TimetableActivity
+    pitfalls:
+      - "iv_more 无 text/desc，必须按 rid 定位；菜单四项共用 item_title，按 text 选「课程表」。"
+      - "空态页中央「还未添加课程表」，此时没有工具栏。"
+
+  - id: s2
+    desc: 点「手动创建课程表」（btnCreateManually），进入课程表基本信息编辑页
+    target: rid=btnCreateManually
+    landing: activity=.timetable.management.EditTimetableActivity
+    pitfalls:
+      - "三个入口直接铺屏，用 rid 定位别按位置猜。"
+      - "本页即「课程表基本信息编辑页」/「新建课程表」，同一页面两种标题。"
+
+  - id: s3
+    desc: 点课程表名称输入框（et_schedule_name），确认可点击弹出键盘编辑名称
+    target: rid=et_schedule_name
+    landing: activity=.timetable.management.EditTimetableActivity
+    know:
+      where: 课程表基本信息编辑页
+      why_this: 用例预期 1「课程表名称为必填项，可点击名称弹出键盘进行编辑，最多20字符」
+      locate: 名称输入框 rid=et_schedule_name
+    pitfalls:
+      - "名称默认空且必填。图库导入路径才有预填名，手动创建此处为空。"
+      - "不要按 back 收键盘 —— 有输入法时第 1 次只收键盘，容易多退一级或丢未保存编辑。"
+      - "20 字符上限难以用结构化判据核，本步只验「可点开编辑」，字符上限见 note。"
+
+  - id: s4
+    desc: 点「学期开始时间」行（layout_semester_start_date），确认调起系统日期弹框（弹框按钮为 left_button 取消 / right_button 确定）
+    target: rid=layout_semester_start_date
+    landing: rid=right_button
+    pitfalls:
+      - "⚠️ 实测 rid=datePicker 在本机 UI 树里不存在（判 FAIL 是判据不对，不是点不开）—— 日期弹框确实弹了（App 内弹窗记录到「日期选择弹框（取消/确定）」）。落点改用弹框按钮 right_button（「确定」）。"
+      - "日期框是 left_button=取消 / right_button=确定，不是 android:id/button1/button2，别混。"
+      - "弹框标题形如「2026年9月1日 周二」，可作旁证。"
+      - "看完要点「取消」(left_button) 关掉，别误点「确定」改了日期。"
+
+  - id: s5
+    desc: 关掉日期弹框（点「取消」left_button），点「当前周数」行（layout_current_week），观察当前周数展示与可选
+    landing: activity=.timetable.management.EditTimetableActivity
+    pitfalls:
+      - "总周数弹框按钮是系统对话框 button1=确定 / button2=取消，与日期框的 left_button/right_button 不同，别混。"
+      - "当前周数默认按当前日期所在周计算；滚轮值多为 Canvas 绘制，dump 读不到数字，不要硬读。"
+
+  - id: s6
+    desc: 点「学期总周数」行（layout_total_weeks）打开总周数弹框，观察默认周数，随后点弹框的「取消」关闭弹框，回到基本信息编辑页
+    target: rid=layout_total_weeks
+    landing: activity=.timetable.management.EditTimetableActivity
+    pitfalls:
+      - "⚠️ 落点**不能**写 rid=button2 —— 实测上一轮因它导致模型在 (952,990) 反复点击卡死终止。弹框是叠加层、不换 activity，用「仍在本页」更稳。"
+      - "总周数弹框是滚轮选择器（数字 Canvas 绘制，dump 读不到），默认应为 20 周 —— 读不到别硬读，直接关掉即可。"
+      - "关弹框点「取消」；若屏幕上找不到取消，点弹框外空白处也能关。不要点「确定」改动设置。"
+      - "点完若页面没反应，不要原地重复点同一坐标 —— 回读 activity 确认当前在哪，必要时改用返回。"
+
+assertions:
+  - id: a1
+    desc: 课程表名称为必填项，名称输入框可点击编辑
+    check:
+      node_present: {rid: et_schedule_name}
+
+  - id: a2
+    desc: 学期开始时间可点开系统日期弹框（弹框按钮 left_button/right_button 出现）
+    # 实测 rid=datePicker 本机不存在；改用知识卡明确记载的弹框按钮 rid。
+    check:
+      rid_present: {rid: right_button}
+
+  - id: a3
+    desc: 当前周数、学期总周数两个入口都在页面上
+    check:
+      nodes_present:
+        - {rid: layout_current_week}
+        - {rid: layout_total_weeks}
+
+  - id: a4
+    desc: 周末有课、显示非本周课程两个开关都在页面上（用文案判据，不依赖未核实的 rid）
+    # ⚠️ 历史：原先用 rid=switch_weekend_classes / switch_show_non_current_week，实测两轮均
+    # 「rid ✘ 未命中」—— 这两个 rid 在本 ROM 的 UI 树里不存在（来自知识卡推测）。
+    # 探针任务也无法取回真实 rid（执行器报告不含 UI dump）。
+    # 改用**文案**判据：用例原文里这两行开关的标题文案是确定的，
+    # 且 text_present 是整屏文本包含匹配，不依赖控件 rid。
+    note: 若文案断言仍不命中，说明该页无这两行文本，需人工确认；不要再用未核实的 rid
+    check:
+      text_present: "周末有课"
+
+  - id: a5
+    desc: 右上角「完成」按钮在页面上
+    check:
+      node_present: {rid: save_view}

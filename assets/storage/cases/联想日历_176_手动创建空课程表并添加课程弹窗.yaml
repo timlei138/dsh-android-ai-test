@@ -1,0 +1,121 @@
+meta:
+  case_id: "176"
+  title: 联想日历_176_手动创建空课程表并添加课程弹窗
+  package: com.zui.calendar
+  knowledge_files:
+    - knowledge/com.zui.calendar.md
+    - knowledge/paths/com.zui.calendar.md
+
+preconditions:
+  - kind: data
+    desc: 确保设备没有课程表（用例原文前提「可以清空APP数据」）
+    do: pm clear com.zui.calendar
+  - kind: nav
+    desc: 清理后停在日历首页
+    target: activity=.AllInOneActivity
+    assert_start: activity=.AllInOneActivity
+
+steps:
+  - id: s0
+    desc: 依次点掉 pm clear 后的两个框（「同意」权限说明框 button1 → 课程表引导框 timetable_guide_button「我知道了」），落回日历首页
+    target: rid=button1
+    landing: activity=.AllInOneActivity
+    pitfalls:
+      - "顺序不能反：先 button1「同意」，再 timetable_guide_button「我知道了」。"
+      - "权限说明框是日历自己的（包名仍 com.zui.calendar），点「同意」，不要点「退出」。"
+      - "这两屏只在 pm clear 之后出现；没出现时本步 landing 仍满足（已在首页），不算失败。"
+      - "引导页不点掉会影响后面找 iv_more。"
+
+  - id: s1
+    desc: 点首页右上角「更多」图标（iv_more），在菜单里选「课程表」，进入课程表空态页
+    target: rid=iv_more
+    landing: activity=.timetable.display.TimetableActivity
+    pitfalls:
+      - "iv_more 没有 text/desc，必须按 rid 定位；菜单四项共用 item_title，按 text 选「课程表」。"
+      - "落点应为空态：屏幕中央「还未添加课程表」，没有工具栏。"
+
+  - id: s2
+    desc: 在空态页点「手动创建课程表」（btnCreateManually），进入课程表基本信息编辑页
+    target: rid=btnCreateManually
+    landing: activity=.timetable.management.EditTimetableActivity
+    pitfalls:
+      - "三个入口按钮直接铺屏（拍照导入 / 从图库导入 / 手动创建），用 rid 定位别按位置猜。"
+      - "本页就是「课程表基本信息编辑页」，也叫「新建课程表」，同一页面两种标题。"
+
+  - id: s3
+    desc: 不填名称，直接点右上角「完成」（save_view），观察是否能保存空课程表
+    target: rid=save_view
+    landing: activity=.timetable.display.TimetableActivity
+    know:
+      where: 课程表基本信息编辑页 → 周视图
+      why_this: 用例步骤 3「点击完成应用信息到空课程表，查看显示」
+      locate: save_view 是右上角「完成」（action_save 是其不可点的父容器）
+    pitfalls:
+      - "名称是必填项。实测本 ROM 完成按钮并不置灰（enabled=true/clickable=true），点了会被校验拦住、页面停在原页 —— 若停在本页，说明必填校验生效，不要判成点击失败。"
+      - "若被必填校验拦住，需要先填一个课程表名称（et_schedule_name）再点完成。"
+      - "点完成保存后的落点是周视图（不是列表页）。"
+      - "不要按 back 收键盘 —— 有输入法时第 1 次只收键盘，容易多退一级。"
+
+  - id: s4
+    desc: 在空课程表周视图里点第一个小节格子（cv_empty_content），观察标题右侧周数与第一小节的加号提示
+    target: rid=cv_empty_content
+    landing: activity=.timetable.display.TimetableActivity
+    know:
+      where: 课程表页-周视图
+      why_this: 用例预期 3「标题右侧显示当前周数是第几周；进入空课程表后第一个小节显示加号示意可直接点击添加课程」
+      locate: 周网格空格子 rid=cv_empty_content
+    pitfalls:
+      - "点空格要两次：第一次点击被吸收（连 UI 树都不变），第二次才进页面。本步只做一次点击用于观察加号示意，不要因为没跳转就以为点错了。"
+      - "不要再等加号浮标 iv_add_hint —— 该中间态已随改版移除。"
+
+  - id: s5
+    desc: 再点一次该小节格子（cv_empty_content），进入添加/编辑课程页
+    target: rid=cv_empty_content
+    landing: activity=.timetable.course.EditCourseActivity
+    pitfalls:
+      - "这是第二次点击，第一次已被吸收；若仍未跳转，再点一次。"
+      - "进入后顶部有「课程名」输入区与「上课时间 / 上课周数 / 课程背景色」行。"
+
+  - id: s6
+    desc: 点「取消」或弹框以外的空白处关闭编辑弹窗，落回课程表周视图
+    landing: activity=.timetable.display.TimetableActivity
+    pitfalls:
+      - "本步没有可靠的取消 rid —— 用返回（转到上一层级）或点弹窗外空白关闭即可，判据看是否回到周视图。"
+      - "若有未保存内容弹二次确认，选「取消」/「不保存」。"
+
+assertions:
+  - id: a1
+    desc: 可打开课程表页面
+    check:
+      activity: .timetable.display.TimetableActivity
+
+  - id: a2
+    desc: 进入课程表基本信息编辑页面
+    check:
+      activity: .timetable.management.EditTimetableActivity
+
+  - id: a3
+    desc: 基本信息编辑页有课程表名称必填项输入框
+    check:
+      node_present: {rid: et_schedule_name}
+
+  - id: a4
+    desc: 空课程表周视图里可点小节格子能进入添加课程页
+    check:
+      activity: .timetable.course.EditCourseActivity
+
+  - id: a5
+    desc: 添加课程弹窗含课程名称必填项（课程名/教室/备注字段）
+    check:
+      nodes_present:
+        - {rid: etCourseName}
+        - {rid: etClassroom}
+        - {rid: etTeacher}
+
+  - id: a6
+    desc: 添加课程弹窗含上课时间、上课周数、课程背景色三个可编辑项
+    check:
+      nodes_present:
+        - {rid: llCourseTime}
+        - {rid: llCourseWeeks}
+        - {rid: llCourseColor}

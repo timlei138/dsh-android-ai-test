@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -43,6 +45,23 @@ from pathlib import Path
 from typing import Any
 
 from .bridge import ActResult
+
+
+def _adb_exe() -> str:
+    """adb 可执行文件路径。
+
+    优先环境变量（换机器/CI 不用改代码），其次 PATH，最后退回 Windows 常见安装位置。
+    """
+    import os
+
+    env = os.environ.get("ANDROID_ADB")
+    if env and Path(env).exists():
+        return env
+    found = shutil.which("adb")
+    if found:
+        return found
+    fallback = Path(r"D:\AndroidSdk\platform-tools\adb.exe")
+    return str(fallback) if fallback.exists() else "adb"
 
 
 def _load_perm():
@@ -246,6 +265,71 @@ class DirectDevice:
         self._last_perm_owner = ""
 
     # -- 观察 ---------------------------------------------------------------
+    def _app_current(self) -> dict:
+        """当前前台应用。**绝不许把整条用例卡死在这里。**
+
+        ⚠️ 为什么不能直接用 `u2.app_current()`：
+
+        uiautomator2 的 app_current 走 adbutils 的 `shell()`，而那个函数
+        挂着 `@retry`（`retry.api`，IndexError/BrokenPipeError 无限重试）。
+        实测踩到：一次 adb socket 异常后，`close (adbutils/_adb.py:98)`
+        → `shell (adbutils/_device_base.py:262)` → `app_current` 无限转圈，
+        进程 CPU 一直涨、日志一个字没有、用例卡死 20 分钟无从判断。
+
+        这里改成**直接发一条带超时的 adb 命令**：拿不到就返回空 dict，
+        让上层按"不知道当前在哪"处理（落点判不了 → 交给模型），
+        而不是让整个执行器停摆。
+        """
+        # 两条命令都试：不同 Android 版本、不同 ROM 给出的字段不一样。
+        # 实测这台（TB323FU / Android 15）`dumpsys window windows` 里**没有**
+        # mCurrentFocus，只有 `dumpsys activity activities` 有 topResumedActivity。
+        for cmd, pat in (
+            (["dumpsys", "activity", "activities"],
+             r"(?:topResumedActivity|mResumedActivity)\s*=\s*ActivityRecord\{\S+\s+\S+\s+"
+             r"(?P<pkg>[^\s/]+)/(?P<act>[^\s,}]+)"),
+            (["dumpsys", "window", "windows"],
+             r"mCurrentFocus=Window\{\S+\s+\S+\s+(?P<pkg>[^\s/]+)/(?P<act>[^\s}]+)\}"),
+        ):
+            try:
+                out = self._shell_text(cmd, timeout=8)
+            except Exception:  # noqa: BLE001  拿不到就换下一条，不许升级成卡死
+                continue
+            m = re.search(pat, out)
+            if m:
+                return {"package": m.group("pkg").strip(),
+                        "activity": m.group("act").strip()}
+        return {}
+
+    def _shell_text(self, cmd: list[str], *, timeout: float = 8.0) -> str:
+        """执行一条 adb shell 命令，**硬超时**。超时就抛，由调用方决定怎么降级。
+
+        直接走 `adb -s <serial> shell ...`，不经过 adbutils/uiautomator2 ——
+        那两层要么无限重试、要么没有超时参数，都不适合"必须能在有限时间内返回"的场景。
+        """
+        exe = _adb_exe()
+        args = [exe, "-s", self.serial, "shell", *cmd] if self.serial else \
+               [exe, "shell", *cmd]
+        proc = subprocess.run(args, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=timeout)
+        return proc.stdout or ""
+
+    def _window_size(self) -> tuple[int, int]:
+        """屏幕宽高。拿不到返回 (0, 0)，绝不允许卡住。
+
+        与 _app_current 同样的理由：`u2.window_size()` 底层是 adbutils 的
+        `shell()`，带无限重试装饰器。包一层 try/except 挡不住它 ——
+        因为异常永远不会被抛出，它只是不停地重试。
+        """
+        try:
+            out = self._shell_text(["wm", "size"], timeout=6)
+        except Exception:  # noqa: BLE001
+            return 0, 0
+        m = re.search(r"Override size:\s*(\d+)x(\d+)", out) or \
+            re.search(r"Physical size:\s*(\d+)x(\d+)", out)
+        if not m:
+            return 0, 0
+        return int(m.group(1)), int(m.group(2))
+
     def observe(self, *, name: str | None = None, with_shot: bool = True) -> Screen:
         """看一眼：XML + 截图落盘，返回可点清单。
 
@@ -265,9 +349,9 @@ class DirectDevice:
         xml = self._d.dump_hierarchy()
         xml_path.write_text(xml, encoding="utf-8")
 
-        cur = self._d.app_current() or {}
+        cur = self._app_current() or {}
         try:
-            w, h = self._d.window_size()
+            w, h = self._window_size()
         except Exception:  # noqa: BLE001
             w = h = 0
 
@@ -309,7 +393,7 @@ class DirectDevice:
         申请方在**整条链上不变**，所以框已经在前台时沿用上一次记下的。
         """
         try:
-            pkg = str((self._d.app_current() or {}).get("package") or "")
+            pkg = str((self._app_current() or {}).get("package") or "")
         except Exception:  # noqa: BLE001
             return ""
         if self._perm is not None and self._perm.is_system_perm_package(pkg):
@@ -499,8 +583,8 @@ class DirectDevice:
 
     def connected(self) -> tuple[bool, str]:
         try:
-            cur = self._d.app_current()
-            w, h = self._d.window_size()
+            cur = self._app_current()
+            w, h = self._window_size()
             return True, f"已连接：{w}x{h} {cur.get('package')}/{cur.get('activity')}"
         except Exception as e:  # noqa: BLE001
             return False, f"设备不可用：{e}"
