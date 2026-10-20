@@ -2560,6 +2560,59 @@ def _checkpoint():
     return _CHECKPOINT_MOD
 
 
+# ── 相册/图片选择器：只判"打开了某一类界面"，不判"哪一个" ────────────
+#
+# ## 为什么需要它
+#
+# 168 的 a3 原来写的是
+#     activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+# 一字不差地钉死。Android 17 上系统给的是 PhotoPickerUserSelectActivity，
+# 于是真机跑出来 FAIL —— 但**功能明明是对的，图库确实打开了**。
+#
+# 用户的原话：
+#     「打开相册。我不管打开的是哪个相册。打开就行了。」
+#
+# 这就是判据的语义本身：要验的是"能不能进到选图界面"，
+# 不是"系统用的是哪个具体 Activity 类"。
+# 后者是实现细节，换个 Android 版本、换个 ROM 就变，钉死它等于自找误报。
+#
+# ## 怎么判才算"够确定"
+#
+# 不能简单用 "PhotoPicker" 子串匹配 —— 那仍然绑死在同一个实现上。
+# 这里走**语义特征**：前台 activity 满足任意一条即可
+#   · 包名/类是系统媒体选择器的（photopicker / mediapicker）
+#   · 是文档选择器的（documentsui —— 部分 ROM 就是拿它当选图器）
+#   · 是相册类 App 的（gallery / photos / album）
+#
+# 这几条都是"这一屏是干什么用的"层面的特征，不绑具体类名，
+# 换 ROM、换版本都还成立。
+#
+# ⚠️ 仍然交给代码判，不问模型：这只是字符串规则，确定得很，
+#    没有模糊到需要模型介入。真正模糊的是"这算不算一个好相册"
+#    —— 那不在本用例范围内。
+
+#: 前台 activity 里出现这些片段，就算"进到了选图/相册界面"
+_ALBUM_MARKERS = (
+    "photopicker",      # AOSP 系统图片选择器
+    "mediapicker",      # 部分 ROM 的命名
+    "documentsui",      # DocumentsUI 也能当选图器用
+    "/gallery",         # 相册类 App
+    ".gallery",
+    "/photos",
+    ".photos",
+    "/album",
+    ".album",
+)
+
+#: 肯定**不是**选图界面的，先排除掉。
+#: 不排除的话，"PhotoPicker" 这种字样出现在权限页包名里会误判为已打开。
+_ALBUM_EXCLUDES = (
+    "permissioncontroller",   # 权限弹窗
+    "GrantPermissions",       # 授权页
+    "launcher",               # 桌面
+)
+
+
 def match_landing(expr: str, *, activity: str = "",
                   clickable: list[dict[str, Any]] | None = None,
                   nodes_text: str = "",
@@ -2580,6 +2633,28 @@ def match_landing(expr: str, *, activity: str = "",
     expr = (expr or "").strip()
     if not expr:
         return False, "无落点判据"
+
+    # ★ `album=any` —— "到了任意一个选图/相册界面"。
+    #
+    # 168 s2 的落点原本写死
+    #   activity=com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+    # Android 17 改叫 PhotoPickerUserSelectActivity，整步判"落点不符"，
+    # 明明图库已经打开了。
+    #
+    # 用户的要求是「打开相册，我不管打开的是哪个相册」——
+    # 落点判据就得能表达这个意思。这里只支持一个值 `any`：
+    # 判"这一屏是不是选图类的"，而不是"是不是那个类"。
+    # 别的词一律当写错，报出来别静默放行。
+    if expr.lower().startswith("album="):
+        want = expr.split("=", 1)[1].strip().lower()
+        if want != "any":
+            return False, f"album= 只支持 any，不认识 {want!r}"
+        low = (activity or "").lower()
+        if any(x.lower() in low for x in _ALBUM_EXCLUDES):
+            return False, f"当前是系统弹窗/桌面，不算打开相册：{activity}"
+        hit = any(m.lower() in low for m in _ALBUM_MARKERS)
+        return hit, (f"命中：{activity}" if hit
+                     else f"未命中：{activity or '未知界面'} 不是选图类界面")
 
     try:
         cp = _checkpoint()
@@ -3088,6 +3163,41 @@ def _steps_done(state: ChildState) -> int:
                 if f.get("kind") == "step" and f.get("status") != "give_up"])
 
 
+
+
+def _album_reached(state: ChildState, kinds: tuple[str, ...] | None = None
+                   ) -> tuple[bool, str]:
+    """本次执行过程中，有没有到过"选图/相册"这类界面。
+
+    返回 (是否算达成, 命中的那一屏或失败说明)。
+
+    ★ 和 activity= 一样要判"到达过"，不能判"现在在哪"：
+      断言在流程末尾统一判，那时可能为了收尾又翻走了。
+    """
+    marks = kinds or _ALBUM_MARKERS
+    acts: list[str] = []
+    for v in (state.get("visited") or []):
+        s = str(v)
+        if "->" in s:
+            left, right = s.split("->", 1)
+            acts.extend([left.strip(), right.strip()])
+        else:
+            acts.append(s.strip())
+    if state.get("last_activity"):
+        acts.append(str(state["last_activity"]))
+    # 去重但保序，方便把"命中的是哪一个"写进判据说明里
+    seen: set[str] = set()
+    uniq = [a for a in acts if a and not (a in seen or seen.add(a))]
+    for a in uniq:
+        low = a.lower()
+        if any(x.lower() in low for x in _ALBUM_EXCLUDES):
+            continue
+        if any(m.lower() in low for m in marks):
+            return True, a
+    return False, (f"没到过选图/相册界面（走过 {len(uniq)} 个页面，"
+                   f"最后停在 {uniq[-1] if uniq else '未知'}）")
+
+
 def _activity_reached(state: ChildState, check: Any) -> bool | None:
     """代码判定 activity= 判据是否"本次到达过"。
 
@@ -3169,6 +3279,21 @@ KNOWN_CHECKS = (
     #
     # 权限名和包名都是**唯一确定**的，符合"确定的给代码判"的原则。
     "permission",
+    # ★ album_reached —— "有没有打开某个选图/相册界面"。
+    #
+    # 168 的 a3 原来写死
+    #   activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+    # Android 17 上系统给的是 ...PhotoPickerUserSelectActivity，真机直接报 FAIL，
+    # 可功能是对的。用户的要求：
+    #   「打开相册。我不管打开的是哪个相册。打开就行了。」
+    #
+    # 所以判"这类界面到了没有"，不判是哪一个具体 Activity 类。
+    # 判法仍走代码（_album_reached 是纯字符串规则），不问模型。
+    #
+    # 写法：
+    #   album_reached: true                     任一类选图界面都行
+    #   album_reached: {kinds: [photopicker]}   限定只看系统选择器
+    "album_reached",
 )
 # 明确**不判**的键（注解性质，不是判据）
 ANNOTATION_CHECKS = (
@@ -3355,6 +3480,27 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
             ok = _activity_reached(state, f"activity={want}") is True
             results.append(ok)
             notes.append(f"activity {'✔' if ok else '✘'} {want}")
+
+        elif key == "album_reached":
+            # ★ 判"有没有打开某个选图/相册界面"，**不要求是哪一个**。
+            #
+            # 这是 168 踩出来的：写死 PhotoPickerGetContentActivity，
+            # Android 17 换成 PhotoPickerUserSelectActivity 就误报 FAIL。
+            # 用户要的是"打开了就行"，那判据就该按这个语义写。
+            kinds = None
+            if isinstance(val, dict):
+                raw_k = val.get("kinds") or val.get("kind")
+                if isinstance(raw_k, str):
+                    kinds = (raw_k,)
+                elif isinstance(raw_k, (list, tuple)):
+                    kinds = tuple(str(x) for x in raw_k)
+                elif raw_k is None:
+                    kinds = None
+            ok, where = _album_reached(state, kinds)
+            results.append(ok)
+            # 命中时把具体是哪一个写出来 —— 判"任意一个都行"不等于不记录是哪个，
+            # 出问题时得能在报告里看到实际打开的是哪一屏。
+            notes.append(f"album {'✔' if ok else '✘'} {where}")
 
         elif key == "package":
             want = str(val).strip()

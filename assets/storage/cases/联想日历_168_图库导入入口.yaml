@@ -25,7 +25,6 @@ confidence:
   reason: 链路已在真机上逐步走过（更多 → 课程表 → 从图库导入 → 提示框 → PhotoPicker）
   todo:
     - 不同分辨率下 iv_more 的 rid 是否稳定（已在 3040x1904 上验证）
-    - 系统图片选择器在不同 Android 版本上的 activity 名
 
 per_step_pitfalls: true
 
@@ -76,9 +75,12 @@ steps:
     # 直接进了图片选择器 —— 等轮到 s2 判定时框早没了，
     # 于是"声明完成但落点不符"，可三条断言其实全过（假 FAIL）。
     #
-    # 判据要落在"这条链路走完的稳定状态"上：PhotoPicker 一旦进去就一直在那，
+    # 判据要落在"这条链路走完的稳定状态"上：进了选图界面就一直在那，
     # 中间那两个瞬时框（App 提示框、系统权限框）谁先谁后都不影响判定。
-    landing: activity=com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+    #
+    # ★ 用 album=any 而不是写死 Activity 类名 —— 见 a3 的说明。
+    #   "到了任意一种选图/相册界面"就算落点达成。
+    landing: album=any
     pitfalls:
       - "空状态没有「更多」菜单：三个入口按钮直接铺屏（拍照导入 / 从图库导入 / 手动创建），用 rid 定位，别按位置猜。"
       - "本用例只验入口能进去，不验导入流程。到图片选择器即止，不要继续选图（会触发约 20s 云端解析）。"
@@ -102,9 +104,19 @@ assertions:
       node_present: {rid: btnImportFromGallery}
 
   - id: a3
-    desc: 可正常进入图片选择入口
-    # package 也要判：activity 同名在不同 App 里可能重名，
-    # 前台包名能确认这个 Activity 真是系统图库进程提供的。
+    desc: 可正常进入图片选择入口（打开任意一种选图/相册界面即算通过）
+    # ★ 这里**不写死具体 Activity 类名**。
+    #
+    # 原来写的是：
+    #     activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+    # 真机 Android 17 上系统给的是 ...PhotoPickerUserSelectActivity，直接 FAIL。
+    # 可功能是对的 —— 图库确实打开了，只是类名跟文档里不一样。
+    #
+    # 用例要验的是"能不能进到选图界面"，不是"系统用的是哪个类"。
+    # 后者是实现细节，换版本/换 ROM 就变，钉死它等于自找误报。
+    #
+    # album_reached 按界面**用途**判：系统图片选择器 / 文档选择器 /
+    # 相册类 App，命中任意一个就算到达。具体打开了哪一个会写进报告的
+    # actual 里，排查时仍然看得到。
     check:
-      activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
-      package: com.android.providers.media.module
+      album_reached: true

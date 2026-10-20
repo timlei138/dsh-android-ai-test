@@ -62,12 +62,17 @@ check("s1 落点是课程表页",
       "TimetableActivity" in (s1.landing or ""), str(s1.landing))
 check("s2 定位到图库导入按钮",
       s2.target == "rid=btnImportFromGallery", str(s2.target))
-# ★ s2 的落点必须是**稳定终态**（PhotoPicker），不能是"提示框弹出的那一瞬"。
+# ★ s2 的落点必须是**稳定终态**，不能是"提示框弹出的那一瞬"。
 #   早先把「点按钮 → 点掉提示框」拆成 s2/s3，s2 落点写 rid=button1，
 #   真机就 FAIL 了：模型点完按钮顺手把框也点了，等轮到 s2 判定时框已经没了，
 #   于是"声明完成但落点不符" —— 可三条断言其实全过（假 FAIL）。
-check("s2 落点是 PhotoPicker（稳定终态，不是瞬时的提示框）",
-      "PhotoPickerGetContentActivity" in (s2.landing or ""), str(s2.landing))
+#
+# ★ 而且要判"到了选图界面"，不能钉死具体 Activity 类名。
+#   原来写 PhotoPickerGetContentActivity，真机 Android 17 偶尔给的是
+#   PhotoPickerUserSelectActivity，就误报落点不符。
+#   用户的话：「打开相册。我不管打开的是哪个相册。打开就行了。」
+check("s2 落点是选图界面（稳定终态，且不钉死具体类名）",
+      (s2.landing or "").strip() == "album=any", str(s2.landing))
 
 print("\n=== 3) ★ 每个 target 都在代码能唯一判定的形态里 ===")
 # 早先这一步验的是「locate_seq 的两个动作都没丢」（点更多 + 点课程表）。
@@ -111,7 +116,14 @@ _UNKNOWN = [k for k in (a1.check or {}) if k not in nd.KNOWN_CHECKS]
 check("a1 的判据键都认识", not _UNKNOWN, str(_UNKNOWN))
 check("a2 是字典判据", isinstance(a2.check, dict), type(a2.check).__name__)
 check("a2 用了 node_present", "node_present" in (a2.check or {}), str(a2.check))
-check("a3 含 package", "package" in (a3.check or {}), str(a3.check))
+# ★ a3 判"打开某种选图/相册界面"，不判是哪一个具体 Activity。
+#   原来还要求 package: com.android.providers.media.module —— 但换成
+#   DocumentsUI 或厂商相册时包名就变了，这条判据会把"打开了"判成"没打开"。
+#   具体打开了哪个由 album_reached 写进报告的 actual，排查时照样看得到。
+check("a3 用 album_reached 判据（不钉死 Activity 类名）",
+      "album_reached" in (a3.check or {}), str(a3.check))
+_UNKNOWN_A3 = [k for k in (a3.check or {}) if k not in nd.KNOWN_CHECKS]
+check("a3 的判据键都认识", not _UNKNOWN_A3, str(_UNKNOWN_A3))
 
 print("\n=== 6) 坑跟着步骤走（用例 YAML 的核心设计）===")
 check("s1 有坑", len(s1.pitfalls) > 0, str(len(s1.pitfalls)))

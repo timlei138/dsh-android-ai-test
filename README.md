@@ -324,6 +324,45 @@ asserts:
 
 **判据不能落在流程中途的一闪而过上。**
 
+### 判「打开了那类界面」，不判「打开了那个类」
+
+168 的 a3 原来写死：
+
+```yaml
+activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+```
+
+同一个用例在真机上，系统这次给 `PhotoPickerGetContentActivity`，
+下次给 `PhotoPickerUserSelectActivity`，于是**偶发 FAIL** ——
+功能明明是对的，图库确实打开了。
+
+用户的原话：
+
+> 打开相册。我不管打开的是哪个相册。打开就行了。
+
+Activity 类名是实现细节，换 Android 版本、换 ROM 就变。钉死它等于自找误报。
+所以用判"界面用途"的判据：
+
+```yaml
+# 断言
+check:
+  album_reached: true        # 任一类选图界面都算
+  # album_reached: {kinds: [photopicker]}   也可以收窄范围
+
+# 落点
+landing: album=any
+```
+
+判的是什么：前台 activity 属于系统图片选择器 / 文档选择器 / 相册类 App
+（`photopicker` `mediapicker` `documentsui` `gallery` `photos` `album`），
+并且**排除**权限框、桌面这些会混淆的界面。
+
+判法仍然是**代码**（纯字符串规则，确定得了），不问模型。
+具体打开了哪一个会写进报告的 `actual`，排查时照样看得到。
+
+> 判宽的界在这里：`_ALBUM_EXCLUDES` 里那几类是**必须判假**的。
+> 把权限框当成"已打开相册"就是漏测 —— `tests/test_album_reached.py` 盯着这一点。
+
 ### 只有代码直点的动作会回写进 YAML
 
 模型点的动作是**猜测**，不是经验。把猜测写进用例，下次就照着错误的路子走。
