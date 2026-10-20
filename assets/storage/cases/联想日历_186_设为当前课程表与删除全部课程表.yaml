@@ -1,0 +1,113 @@
+meta:
+  case_id: "186"
+  title: 联想日历_186_设为当前课程表与删除全部课程表
+  package: com.zui.calendar
+  knowledge_files:
+    - knowledge/com.zui.calendar.md
+    - knowledge/paths/com.zui.calendar.md
+
+preconditions:
+  - kind: data
+    desc: 清数据回到干净状态
+    do: pm clear com.zui.calendar
+  - kind: nav
+    desc: 清理后停在日历首页
+    target: activity=.AllInOneActivity
+    assert_start: activity=.AllInOneActivity
+
+steps:
+  - id: s0
+    desc: 依次点掉 pm clear 后的框（「同意」android:id/button1 → 课程表引导 timetable_guide_button「我知道了」），落回日历首页
+    target: rid=button1
+    landing: activity=.AllInOneActivity
+    pitfalls:
+      - "先 button1「同意」，再 timetable_guide_button「我知道了」。"
+      - "已在首页则本步 landing 仍满足。"
+
+  - id: s1
+    desc: 点首页右上角「更多」图标 iv_more（无文字，按 rid 定位），在弹出菜单里选「课程表」，进入课程表页
+    target: rid=iv_more
+    landing: activity=.timetable.display.TimetableActivity
+    pitfalls:
+      - "iv_more 无 text/desc，必须按 rid 定位；菜单四项共用 item_title，按 text 选「课程表」。"
+      - "菜单未弹出（点空）时不要重复点同一位置，回读 activity 确认当前在哪。"
+
+  - id: s2
+    desc: 点「手动创建课程表」btnCreateManually，进入课程表基本信息编辑页
+    target: rid=btnCreateManually
+    landing: activity=.timetable.management.EditTimetableActivity
+    pitfalls:
+      - "三个入口直接铺屏，用 rid 定位别按位置猜。"
+
+  - id: s3
+    desc: 点课程表名称输入框 rid=et_schedule_name，输入任意名称（如「测试课表」），确认输入框里出现了文字
+    target: rid=et_schedule_name
+    landing: activity=.timetable.management.EditTimetableActivity
+    know:
+      where: 课程表基本信息编辑页
+      why_this: 名称必填，不填名字点「完成」会被校验拦住，必须先输入
+      locate: 名称输入框 rid=et_schedule_name
+    pitfalls:
+      - "⚠️ 本步只输入文字，不要点完成 —— 把输入和保存塞成一步时模型会长时间不收敛。"
+      - "输入后不要按 back 收键盘，直接进下一步点完成。"
+      - "找不到输入框时回读 activity 确认是否真在本页。"
+
+  - id: s4
+    desc: 点右上角「完成」rid=save_view，保存课程表，落到课程表周视图
+    target: rid=save_view
+    landing: activity=.timetable.display.TimetableActivity
+    know:
+      where: 课程表基本信息编辑页 → 周视图
+      why_this: 需要一个已保存的课程表，才能进列表页做多选与设为当前
+      locate: 右上角「完成」rid=save_view（action_save 是其不可点的父容器）
+    pitfalls:
+      - "若名称仍为空，点完成会停在原页（必填校验），回 s3 补输名字再点。"
+      - "保存后的落点是周视图，不是列表页。"
+
+  - id: s5
+    desc: 在周视图点顶栏「课程表设置」rid=action_curriculum_table_settings，进入全部课程表列表页
+    target: rid=action_curriculum_table_settings
+    landing: activity=.timetable.management.TimetableListActivity
+    know:
+      where: 周视图 → 全部课程表列表页
+      why_this: 用例操作要进入课程表列表页做多选与设为当前
+      locate: 顶栏「课程表设置」rid=action_curriculum_table_settings
+    pitfalls:
+      - "进课程表不会直接到列表页，必须经顶栏「课程表设置」。"
+      - "列表页标题「全部课程表」，列表项带「当前」角标。"
+
+  - id: s6
+    desc: 点顶栏「编辑」rid=action_schedule 进入多选态，观察多选按钮与底部两个操作，随后点「取消」退出多选态
+    landing: activity=.timetable.management.TimetableListActivity
+    pitfalls:
+      - "action_schedule 是同 rid 双态：普通态文案「编辑」，多选态变「取消」。"
+      - "多选态会出现 checkbox_select 与 btn_set_default / btn_delete。"
+      - "点「取消」没反应时不要原地重复点，回读 activity 确认状态。"
+
+assertions:
+  - id: a1
+    desc: 点击「课程表设置」后进入全部课程表列表页
+    check:
+      activity: .timetable.management.TimetableListActivity
+
+  - id: a2
+    desc: 列表页有课程表名称与「设置」入口
+    check:
+      nodes_present:
+        - {rid: tv_schedule_name}
+        - {rid: tv_schedule_info}
+
+  - id: a3
+    desc: 列表页顶栏有勾选（编辑）按钮和加号（添加课程表）按钮
+    check:
+      nodes_present:
+        - {rid: action_schedule}
+        - {rid: action_add_schedule}
+
+  - id: a4
+    desc: 多选态出现多选按钮与底部「设为当前课程表」「删除课程表」两个操作
+    check:
+      nodes_present:
+        - {rid: checkbox_select}
+        - {rid: btn_set_default}
+        - {rid: btn_delete}

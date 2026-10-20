@@ -110,6 +110,39 @@ function runCase(spec, signal) {
   });
 }
 
+/**
+ * 同一个 case 在**同一条主 Agent 会话**里，只允许派发一次。
+ *
+ * 为什么要有这个（用户实测发现）：
+ *   主 Agent 明明收到的是"跑一个用例"，却把它拆给**两个子 Agent** 去跑。
+ *   后果不只是浪费 —— 两个子 Agent 操作同一台设备，会产生
+ *   "起步就找错页面"这类假失败（见 device/lock.py 里的完整记录）。
+ *
+ * 为什么不能只靠技能卡写"派一次"：
+ *   提示词是**建议**，模型可以不听。用户的要求是"用代码约束住，
+ *   不要依赖模型自觉"。所以这里做成运行时的硬闸门。
+ *
+ * 判据分两种，别混：
+ *   · **在跑**时又来一次   -> 拒绝（这就是"一条用例派了多个子 Agent"）
+ *   · **跑完**了又来一次   -> 放行（可能是重跑；重跑是合法需求，
+ *                             比如换成 answer="autopilot" 验 YAML）
+ *
+ * 键用 `会话 + case + 设备`：不同会话之间互不影响（用户在别的窗口
+ * 手动重跑不该被这边挡住），不同设备的同名用例也互不影响。
+ */
+const inFlight = new Map();
+
+/** 给一个键占位；已在跑则返回 false。 */
+function claimSlot(key) {
+  if (inFlight.has(key)) return false;
+  inFlight.set(key, Date.now());
+  return true;
+}
+
+function releaseSlot(key) {
+  inFlight.delete(key);
+}
+
 /** 把报告压成模型能直接读的短文本 —— 不把整份 JSON 塞回上下文。 */
 function render(report) {
   const L = [];
@@ -505,7 +538,46 @@ const apply = (ctx) => {
               skill_root: SKILL_ROOT,
               diag: true,
             };
-        const report = await runCase(spec, exec?.signal);
+
+        // ★★ 一条用例只允许一个子 Agent 在跑。
+        //
+        // 这里必须拦在 runCase **之前** —— 一旦起了 run_case_json.py，
+        // 进程就在操作真机了，拦晚了等于没拦。
+        const caseKey = String(
+          args.case_name ?? args.case_id ?? args.title ?? "(未命名)",
+        ).trim();
+        const serialKey = String(args.serial ?? "").trim() || "(默认设备)";
+        const sessionKey =
+          exec?.agent?.session?.header?.id ??
+          exec?.agent?.session?.id ??
+          exec?.sessionId ??
+          "(无会话)";
+        const slot = `${sessionKey}|${caseKey}|${serialKey}`;
+
+        if (!claimSlot(slot)) {
+          return {
+            status: "BLOCKED",
+            engine: "",
+            report:
+              `🚫 用例 ${caseKey} 已经在跑，这次派发被拒绝了 —— 一步都没执行。\n` +
+              "\n" +
+              "**一个用例只需要一个子 Agent。**\n" +
+              "不要把它拆成几步分给几个子 Agent —— 它们会抢同一台设备，\n" +
+              "产生「起步就找错页面」这类看起来像产品 bug 的假失败。\n" +
+              "\n" +
+              "你现在该做的：等那个子 Agent 返回，然后如实转述它的报告。\n" +
+              "如果它已经返回了，直接用它的结论 —— 不要重派。",
+          };
+        }
+
+        let report;
+        try {
+          report = await runCase(spec, exec?.signal);
+        } finally {
+          // ★ 必须在 finally 里放开：执行器崩了也要放，
+          //   否则这条用例在本次会话里就永远跑不了了。
+          releaseSlot(slot);
+        }
         return {
           status: String(report.status ?? "BLOCKED"),
           engine: String(report.engine ?? ""),
