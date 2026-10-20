@@ -3,9 +3,11 @@
 > **这份规范以当前工具的代码为准，不从旧格式继承。**
 >
 > 依据三条，改这里之前先去核对它们：
-> 1. 数据模型 `child_agent.py` 的 `StepSpec` / `AssertSpec` / `Precondition`
-> 2. 判据白名单 `child_agent.py` 的 `KNOWN_CHECKS`
-> 3. 落点表达式 `child_agent.py` 的 `match_landing`
+> 1. 数据模型 `src/android_agent/agent/nodes.py` 的 `StepSpec` / `AssertSpec` / `Precondition`
+> 2. 判据白名单 `src/android_agent/agent/nodes.py` 的 `KNOWN_CHECKS`
+> 3. 落点表达式 `src/android_agent/agent/nodes.py` 的 `match_landing`
+>
+> ⚠️ 早先这里写的是 `child_agent.py` —— 那个文件早已不存在。
 
 ---
 
@@ -86,24 +88,30 @@ preconditions:
 
 ## steps
 
-字段：`id` / `desc` / `landing` / `pitfalls` / `locate` / `locate_seq`
+字段：`id` / `desc` / `target` / `landing` / `pitfalls` / `know` / `on_fail`
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` | ✅ | 不可重复 |
-| `desc` | ✅ | 做什么 |
-| `landing` | | **落点判据**，字符串表达式。不写 = 代码无法判断完成，交模型 |
-| `locate` | | 定位提示，表达式字符串 |
-| `locate_seq` | | 多个动作按顺序点（`[rid=a, text=b]`） |
+| `desc` | ✅ | 做什么，要具体（「点右上角更多打开菜单」，不是「点更多」） |
+| `target` | | **点哪个控件**：`rid=` / `xpath=` / `text=` / `key=`。唯一命中就代码直点 |
+| `landing` | | **落点判据**，字符串表达式。必须是**稳定终态**，不能是流程中途一闪而过 |
 | `pitfalls` | | **该步专属的坑**，`list[str]`，每条坑一个字符串 |
+| `know` | | 这一步为什么这么点（`where` / `why_this` / `locate`） |
+| `on_fail` | | 失败了怎么办 |
 
-> ⚠️ **不写 `do:` / `expect:`**。那是旧格式，靠 `case_yaml.py` 事后翻译。
-> 每多一层翻译就多一处静默丢失（`back: true` 被吞、`dialog_present` 没 rid 被丢）。
-> 直接写 `locate` / `landing` 是最短路径。
+> ⚠️ **不写 `do:` / `expect:` / `locate_seq`**。
+>
+> · `do:` / `expect:` 是旧格式，靠 `case_yaml.py` 事后翻译（该文件已不存在）。
+> · `locate_seq` 是**按序重放**的旧机制，已整体删除 —— 它把「第 1 个点这个、
+>   第 2 个点那个」写成剧本，本质还是回放，换个界面就废。
+>
+> 现在只有一条路：每步看当前屏，`target` 唯一命中就代码点，否则交模型。
+
 
 ### pitfalls：为什么值得认真写
 
-坑是**按步喂给模型**的（`child_agent.py:1588` 把 `step["pitfalls"]` 直接塞进
+坑是**按步喂给模型**的（`src/android_agent/agent/decide.py` 的 `pitfalls` 渲染进
 decide 的 payload）。所以**走到哪一步，就只看那一步的坑** —— 前面步骤的坑
 不会污染当前判断。
 
@@ -130,9 +138,11 @@ decide 的 payload）。所以**走到哪一步，就只看那一步的坑** —
 
 ### 知识卡内容可以内联进 pitfalls
 
-`knowledge_files` 是**按关键词检索**的（`child_agent.py: search_knowledge`）：
-第 1 步给全文，后续步拿 `desc`/`locate`/`landing` 里的词去 grep，
-每步最多带 3 组片段 —— **凑不上关键词就是空**。
+`knowledge_files` 是**按关键词检索**的
+（`src/android_agent/agent/nodes.py` 的 `search_knowledge`）：
+给它一个关键词，它只在指定文档里返回**命中行及其上下文**（带 `文件:行号` 出处），
+不把整份文档塞进上下文 —— 这样既查得到，又不会把上下文撑爆。
+**凑不上关键词就是空**，所以知识卡里该写的词得写清楚。
 
 所以"少查一次卡"的正确做法是：**把这一步真正要用的那几句，直接写成 pitfalls 字符串。**
 
@@ -168,16 +178,12 @@ package=com.x          前台包名
 例：
 
 ```yaml
-locate: rid=iv_more
+target: rid=iv_more
 landing: activity=.timetable.display.TimetableActivity
 ```
 
-```yaml
-locate_seq:
-  - rid=iv_more
-  - text=课程表
-landing: activity=.timetable.display.TimetableActivity
-```
+> ⚠️ 早先这里还举了 `locate_seq` 的例子（一步连点两下，按序重放）。
+> 那个机制已删除 —— 想连点两下就**拆成两步**，各自写自己的 `target` 和 `landing`。
 
 ⚠️ **activity 短名必须真的包含在完整名里**（子串匹配）。
 `activity=TimetableActivity` **不命中** `.timetable.widget.TimetableGuideActivity` ——

@@ -327,16 +327,16 @@ const apply = (ctx) => {
           description:
             "运行时权限策略；留空=默认同意（工具层自动点，抢 6 秒窗口）。只有测「拒绝分支」才填 deny。",
         },
-        replay: {
-          type: "boolean",
-          description: [
-            "纯回放模式（默认 false）。开了之后：YAML 说清了就**代码直接走，不问模型**",
-            "（省 token、提速）；只有走不通才落回模型 ——",
-            "① 目标找不到（rid 跨版本变了）② 落点不符且原地重试 1 次后仍不对。",
-            "报告里的 replay_stats 会给出自动化率（几步代码走 / 几步落回模型）。",
-            "⚠️ 只对有 locate 的步有效；现场拆的用例（没 locate）照旧走模型。",
-          ].join("\n"),
-        },
+        // ⚠️ 这里曾有一个 `replay` 参数（"纯回放模式"），已删除。
+        //
+        //    删除原因：回放机制在设计上就被否掉了 —— YAML 存坐标不可靠，
+        //    改成"每步看当前屏、唯一命中就代码点"。于是 replay 这个开关
+        //    传下去也没人认（run_case_json.py 不读它），schema 却还在教用户用，
+        //    还承诺"报告里的 replay_stats 会给出自动化率"—— 那个字段也不存在。
+        //
+        //    这正是项目明令禁止的"写了却不生效"。参数和描述一起删。
+        //    真要开纯代码模式，看的是报告里的 auto_rate（自动化率），
+        //    而它一直都会给，不需要开关。
         writeback: {
           type: "boolean",
           description: [
@@ -474,7 +474,7 @@ const apply = (ctx) => {
             "  2. 用 subagent 工具派发给执行子 Agent\n" +
             "\n" +
             "正确写法：\n" +
-            "  subagent(prompt: '执行用例 168，用 android_case(case_name=\"168\", replay=true)，" +
+            "  subagent(prompt: '执行用例 168，用 android_case(case_name=\"168\")，" +
             "把 status/engine/steps_done/issues 原样回报')\n" +
             "\n" +
             "为什么这样设计：执行节奏、坐标合法性、落点复核、死循环阻断都在子 Agent\n" +
@@ -494,7 +494,6 @@ const apply = (ctx) => {
               case_name: args.case_name,
               serial: args.serial ?? null,
               perm_action: args.perm_action ?? null,
-              replay: args.replay ?? false,
               answer: args.answer ?? "model",
               // 只有走 YAML 时才可能回写（有真实文件）。传 false 可只跑不改。
               writeback: args.writeback ?? true,
@@ -511,7 +510,6 @@ const apply = (ctx) => {
               knowledge_files: args.knowledge_files ?? [],
               serial: args.serial ?? null,
               perm_action: args.perm_action ?? null,
-              replay: args.replay ?? false,
               answer: args.answer ?? "model",
               skill_root: SKILL_ROOT,
               diag: true,

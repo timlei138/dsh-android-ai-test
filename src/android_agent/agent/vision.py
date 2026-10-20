@@ -1,4 +1,4 @@
-﻿"""图内视觉通道：让子 Agent 不依赖主模型的多模态能力。
+"""图内视觉通道：让子 Agent 不依赖主模型的多模态能力。
 
 为什么需要它：
   子 Agent 跑图时，"看一眼屏幕判断"这一步不能要求主模型能读图。
@@ -67,12 +67,20 @@ def screenshot_of(obs_nodes_evidence: dict[str, Any]) -> str | None:
 
 if __name__ == "__main__":
     # 自检：对最新截图问一句
+    #
+    # ⚠️ 这里以前直接用了 `skill_root()` / `runner_python()`，但它们从没被
+    #    import 过 —— 这个自检入口一跑就 NameError，等于坏的。
+    from glob import glob
+
+    from ..cases.paths import runner_python, skill_root
+
     root = skill_root()
     py = runner_python()
-    from glob import glob
-    shots = sorted(glob(root + r"\storage\evidence\**\shot.png", recursive=True))
+    shots = sorted(glob(str(Path(root) / "storage" / "evidence" / "**" / "shot.png"),
+                        recursive=True))
     if not shots:
         print("没有截图可测")
         sys.exit(1)
     print("用图:", shots[-1])
     print("答案:", ask_image(py, root, shots[-1], "这张截图最上方一行的文字是什么？"))
+

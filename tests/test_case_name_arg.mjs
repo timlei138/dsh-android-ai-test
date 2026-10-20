@@ -74,10 +74,10 @@ check("工具名是 android_case", registered?.name === "android_case", register
 try {
   const dshTools = req("@deepseek-ai/dsh-tools");
   const violations = dshTools.validateArgs(registered.parameters, {
-    case_name: "168", replay: true,
+    case_name: "168",
   });
   const ok = Array.isArray(violations) && violations.length === 0;
-  check("validateArgs({case_name,replay}) 无违规", ok,
+  check("validateArgs({case_name}) 无违规", ok,
     ok ? "干净" : JSON.stringify(violations));
 } catch (e) {
   // 拿不到校验器就退化成"根级 required 检查"（上面已测）
