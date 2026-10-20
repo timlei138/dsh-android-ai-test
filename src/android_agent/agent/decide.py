@@ -709,6 +709,24 @@ def decide_step(python: str, skill_root: str, payload: dict[str, Any],
         lines.append("你之前查到的知识卡内容：")
         lines.append(knowledge_text)
 
+    # ★★★ 你上一轮问的那张图，答案在这里 ★★★
+    #
+    # 167 空转 21 次的**真正病根**（比 max_tokens 更根本）：
+    #   vision 节点算出了答案，但 decide 的提示词里从来没有它，
+    #   模型只看得到自己问过什么，看不到答案 —— 于是以为没看到，再问一次。
+    #
+    # 注意措辞：明确说"这就是你问的那个问题的答案"，并**要求它直接据此
+    # 行动**。只贴一段"视觉模型说……"的话，模型可能还会想再确认一次；
+    # 明确禁掉重复提问，才能终止那个循环。
+    _vis = str(payload.get("vision") or "").strip()
+    if _vis:
+        lines.append("")
+        lines.append("【你上一轮问的问题，视觉模型已经看过了，答案如下】")
+        lines.append(_vis[:1500])
+        lines.append("⚠️ 这就是答案。**不要再问同一件事** —— 直接用这个信息"
+                     "决定下一步。如果这个答案里确实没有你要的信息，"
+                     "换别的手段（点一下试试、或按 back），而不是再问问过的内容。")
+
     lines.append("")
     lines.append("如果屏幕上有挡路的弹窗，先点掉它再继续。")
     lines.append("回答方式：**直接调用一个工具**（不要输出 JSON 文本）。"

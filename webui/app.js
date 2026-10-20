@@ -27,6 +27,23 @@ const fmtDur = (s) => {
 
 const fmtMs = (ms) => ms == null ? '' : `${Math.round(Number(ms))}ms`;
 
+/* 把总耗时拆成"模型 / 设备"两段。
+ *
+ * 为什么要拆：用户在报告里看到"耗时 79 秒"是没法优化的 ——
+ * 模型一次 5~20 秒，点击一次才 200 毫秒，这两件事的优化手段完全不同。
+ * 拆开后一眼就能看出这条用例到底是"模型太慢"还是"设备太慢"。
+ *
+ * model_s 是后加的列，老记录是 null —— 那就什么都不显示，
+ * 不要用 0 去假装"模型没花时间"（那是假数据，比空着误导性强）。
+ */
+const fmtSplit = (r) => {
+  const total = Number(r.elapsed_s), model = r.model_s == null ? null : Number(r.model_s);
+  if (model == null || !isFinite(model) || !isFinite(total) || total <= 0) return '';
+  const pct = Math.round(model / total * 100);
+  const dev = Math.max(total - model, 0);
+  return `（模型 ${fmtDur(model)} / ${pct}%，设备 ${fmtDur(dev)}）`;
+};
+
 /* 截图 URL：按 run_id + 动作序号取，不拼文件路径。
  *
  * 早先是把库里存的绝对路径尾巴拼成 /evidence/xxx —— 结果立刻踩坑：
@@ -405,7 +422,14 @@ function caseInfoHtml(run) {
       <div class="hint">这次运行没有记录用例来源（早于该功能加入）。</div>`;
   }
 
-  const lines = (snap || '').split('\n');
+  /* ⚠️ 这里**只用快照**，绝不拿当前文件顶替。
+   *
+   * 之前是这样写的：没有快照时去 /api/case/<文件名> 拉当前 YAML 显示。
+   * 看着"信息更全"，实际是在骗人 —— 用户要的是"这次跑的是哪个 case"，
+   * 拿现在的文件去回答，等于把两个版本混成一份。
+   * 老记录就老实说"没存快照"，要看当前版本去用例库点。
+   */
+  const lines = snap.split('\n');
   const body = lines.map((ln, i) => {
     const n = String(i + 1).padStart(4, ' ');
     let html = esc(ln);
@@ -416,20 +440,27 @@ function caseInfoHtml(run) {
     return `<span class="ln"><i>${n}</i>${html}</span>`;
   }).join('\n');
 
-  return `<h2>原始用例</h2>
-    <div class="casebar">
+  const head = `<div class="casebar">
       ${fname ? `<span class="mono">${esc(fname)}</span>` : ''}
       ${pkg ? `<span class="mono dim">${esc(pkg)}</span>` : ''}
-      ${snap
-        ? '<span class="tag ok">跑的时候那份</span>'
-        : '<span class="tag warn">当前文件（这次没存快照）</span>'}
-      ${fname ? `<a class="ghost-link" data-casefile="${esc(fname)}">在用例库打开</a>` : ''}
+      ${snap ? '<span class="tag ok">跑的时候那份</span>' : ''}
+      ${fname ? `<a class="ghost-link" data-casefile="${esc(fname)}">在用例库看当前版本</a>` : ''}
       <span style="flex:1"></span>
-      <span class="muted">${lines.length} 行${snap ? '' : ' · 显示的是现在的版本'}</span>
-    </div>
-    ${snap ? '' : `<div class="hint warn">⚠️ 这份运行早于"记录用例快照"功能，
-      下面是<b>当前</b>的 YAML，可能已经和你跑的时候不一样了。</div>`}
+      ${snap ? `<span class="muted">${lines.length} 行</span>` : ''}
+    </div>`;
+
+  if (!snap) {
+    return `<h2>原始用例</h2>
+      ${head}
+      <div class="hint warn">⚠️ 这次运行早于"记录用例快照"功能，库里有文件名但没有内容。<br>
+        为了不把<b>现在</b>的判据当<b>当时</b>的判据，这里不显示内容；
+        点上面的链接可以去用例库看当前版本。</div>`;
+  }
+
+  return `<h2>原始用例</h2>
+    ${head}
     <div class="codebox collapsed"><pre>${body}</pre></div>`;
+
 }
 
 /* ---------- 视图：运行记录列表 ---------- */
@@ -543,7 +574,7 @@ async function viewRun(runId) {
   }).join('');
 
   main.innerHTML = `<h1>运行 #${run.run_id} · 用例 <span class="mono">${esc(run.case_name)}</span></h1>
-    <div class="sub">${esc(run.started_at || '')} · 耗时 ${fmtDur(run.elapsed_s)} ·
+    <div class="sub">${esc(run.started_at || '')} · 耗时 ${fmtDur(run.elapsed_s)}${fmtSplit(run)} ·
       引擎 ${esc(run.engine || '—')}</div>
     <div class="cards">
       <div class="card ${(run.status || '').toLowerCase()}"><div class="n" style="font-size:20px">${badge(run.status)}</div><div class="l">运行结论</div></div>

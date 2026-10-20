@@ -47,9 +47,116 @@ from .nodes import (
     AssertSpec, AssertVerdict, ChildContext, StepAction, StepSpec,
     SubagentReport, SubagentTask, build_child_graph, match_landing,
     search_knowledge,
+    _MODEL_NODES,   # 算模型耗时的节点全集，只在 nodes 里定义一份
 )
 
 DEFAULT_SKILL = skill_root()
+
+
+# --------------------------------------------------------------------------
+# 节点执行统计（次数 + 耗时）
+# --------------------------------------------------------------------------
+#
+# 为什么不用 app.invoke() 而要 stream：invoke 只在结束时返回最终 state，
+# 中间跑了哪些节点、每个节点花多久，全看不见。
+#
+# 167 的教训：日志里的 `'vision': 0` 让我误判"视觉没跑过"，
+# 实际它跑了 6 次、每次都失败。差别在于那个 counts 只统计
+# **会 interrupt 的节点** —— vision 不 interrupt，所以永远是 0。
+#
+# 换成 stream 之后，"哪些节点真的执行了"和"各花多久"都可以直接从
+# 事件流里数出来，不再依赖人猜。
+#
+# 用户还提了「模型得时间也要统计在内」：模型调用（decide/assert）动辄
+# 5~20 秒，是整轮耗时的大头。如果只报总耗时，看不出"慢在模型还是慢在设备"，
+# 所以这里按节点分开记。
+
+# 这些节点的耗时主要是**等模型**，单独归一类。
+# ⚠️ 定义在 nodes 里（报告要用它算 model_s），这里**引用**而不是重新定义 ——
+#    两处各写一份，早晚会出现"日志说 8s、报告说 6s"这种对不上的情况。
+
+
+def _new_node_calls() -> dict[str, dict[str, float]]:
+    """节点统计表：{节点名: {"n": 次数, "ms": 累计毫秒}}"""
+    return {}
+
+
+def _bump(calls: dict[str, dict[str, float]],
+          name: str, ms: float) -> None:
+    rec = calls.setdefault(name, {"n": 0, "ms": 0.0})
+    rec["n"] = rec["n"] + 1
+    rec["ms"] = rec["ms"] + ms
+
+
+def _fmt_node_calls(calls: dict[str, dict[str, float]]) -> str:
+    """把统计表排成一行，次数多的在前。"""
+    items = sorted(calls.items(), key=lambda kv: -kv[1]["n"])
+    parts = [f"{k}×{int(v['n'])}/{v['ms'] / 1000:.1f}s"
+             for k, v in items if v["n"]]
+    return "  ".join(parts) if parts else "(无)"
+
+
+def _drive(app, inp, cfg, calls: dict[str, dict[str, float]],
+           log=None):
+    """跑一段图，把节点次数/耗时顺手统计下来，返回最终 state。
+
+    stream(stream_mode="updates") 每产出一个 {节点名: 增量} 就说明那个节点
+    刚执行完 —— 数它、记它花的时间，然后把最终结果从 get_state 取出来。
+
+    ⚠️ 为什么最终 state 用 app.get_state() 而不是自己合并增量：
+       增量里有 Annotated[..., operator.add] 的字段（findings / issues /
+       progress 等），手工合并等于把 LangGraph 的 reducer 重写一遍，
+       漏一个就会出现"结果少一块"的诡异现象。get_state 拿的是
+       checkpoint 里的权威 state，不重复造轮子。
+    """
+    import time as _t
+    prev = _t.perf_counter()
+    for chunk in app.stream(inp, cfg, stream_mode="updates"):
+        now = _t.perf_counter()
+        ms = (now - prev) * 1000
+        # 一次 chunk 可能带多个节点（并发分支），逐个记
+        for name in (chunk or {}):
+            if name.startswith("__"):
+                continue
+            _bump(calls, name, ms)
+        prev = now
+
+    snap = app.get_state(cfg)
+    values = dict(snap.values or {})
+
+    # ★★★ 必须把 __interrupt__ 补回去，否则主循环立刻退出 ★★★
+    #
+    # 这是踩过的坑：app.invoke() 返回的 state 里**带** __interrupt__，
+    # 主循环 `while state.get("__interrupt__")` 靠它判断"还没跑完"。
+    # 换成 stream 之后我天真地以为 get_state().values 也是一样的 ——
+    # 结果 values 里根本没有这个键（实测 stream_mode 的 updates/values
+    # 两种都拿不到），于是第一段跑完循环就以为结束了，
+    # 用例直接 BLOCKED、步数 0。7 个测试同时炸才把它揪出来。
+    #
+    # 中断信息实际在 snap.interrupts 里（StateSnapshot 的属性）。
+    if getattr(snap, "interrupts", None) or getattr(snap, "next", None):
+        values["__interrupt__"] = list(getattr(snap, "interrupts", ()) or ())
+
+    # 收尾：把统计塞进 state，report 才能带着它一起落盘。
+    try:
+        app.update_state(cfg, {"node_calls": {
+            k: {"n": int(v["n"]), "ms": round(v["ms"], 1)}
+            for k, v in calls.items()}})
+    except Exception:  # noqa: BLE001
+        # 统计失败绝不能影响跑用例本身
+        pass
+    # update_state 之后再取一次（node_calls 才在里面），同样补中断
+    snap2 = app.get_state(cfg)
+    out = dict(snap2.values or {})
+    if values.get("__interrupt__"):
+        out["__interrupt__"] = values["__interrupt__"]
+    return out
+
+
+def _model_ms(calls: dict[str, dict[str, float]]) -> float:
+    """模型相关节点的累计耗时（秒）。"""
+    return sum(calls.get(n, {}).get("ms", 0.0)
+               for n in _MODEL_NODES) / 1000.0
 
 
 def _make_logger(log_path: Path | None):
@@ -359,6 +466,10 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         package=spec.package)
     log(f"会话 {sid} 已开{el()}")
 
+    # 节点统计表：第一次 _drive 之前就要有，
+    # 否则 UnboundLocalError（第一次跑就是这个错）。
+    node_calls = _new_node_calls()
+
     ctx = ChildContext(device=dev, skill_root=skill_root, python=python,
                        report_path=str(report_path))
     conn = sqlite3.connect(db, check_same_thread=False)
@@ -367,7 +478,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     app = build_child_graph(ctx, SqliteSaver(conn))
     cfg = {"configurable": {"thread_id": f"child-{spec.case_id}-{sid}"}}
 
-    state = app.invoke({
+    state = _drive(app, {
         "task": task,
         "step_index": 0,
         "round_in_step": 0,
@@ -393,12 +504,39 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         "runtime_permissions": [],
         "runtime_permission_prompts": [],
         "session_id": sid,
-    }, cfg)
+    }, cfg, node_calls)
 
     from langgraph.types import Command
 
     answer_fn = answer or make_autopilot()
     loops = 0
+    # 模型真正被调用的累计耗时。
+    #
+    # ⚠️ 不能拿 node_calls["decide"]["ms"] 当模型耗时 —— 实测 27 次 decide
+    #    加起来才 353ms。因为 decide 节点本身**只负责发 interrupt**，
+    #    真正等模型的是主循环里的 answer_fn（外面那一层）。
+    #    所以模型耗时必须在这里掐表，不能在节点里算。
+    model_ms = 0.0
+
+    # 包一层，专门掐模型调用的表。写成闭包是为了只改这一处，
+    # 而不是在三个调用点上各写一遍 time.perf_counter()（漏一个就少算）。
+    _raw_answer = answer_fn
+
+    def answer_fn(payload):  # noqa: F811
+        nonlocal model_ms
+        _t0 = time.perf_counter()
+        try:
+            return _raw_answer(payload)
+        finally:
+            model_ms += (time.perf_counter() - _t0) * 1000
+    # ⚠️ 这个 counts 只能数**会 interrupt 的节点**（decide/assert），
+    #    vision / knowledge / observe / act 都不 interrupt，永远是 0。
+    #
+    #    167 排查时我被它坑了一整轮：日志写着 `'vision': 0`，
+    #    我据此判断"视觉节点压根没跑过"，于是去翻路由和图定义 ——
+    #    可它明明跑了 6 次。**看着像数据的东西，其实是个空集。**
+    #
+    #    真正的节点执行次数在 node_calls 里（由 _drive 从 stream 里统计）。
     counts = {"decide": 0, "assert": 0, "vision": 0, "knowledge": 0}
     # 循环检测：连续对同一目标做同类决定，说明卡住了
     recent: list[str] = []
@@ -623,7 +761,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                         # 前提错了，换多少坐标都没用。
                         # 所以这里把"最可能有效的另一类手段"直接摆出来：
                         # 按系统返回键离开当前页面，比在陌生 App 里猜图标可靠。
-                        state = app.invoke(Command(resume={
+                        state = _drive(app, Command(resume={
                             "step_done": False, "give_up": False,
                             "next_x": None, "next_y": None,
                             "why": f"代码作废：连续 3 次点 {key} 无效",
@@ -633,7 +771,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                                      "或这些控件里根本没有离开当前页的入口），"
                                      "请改用 key=\"back\" 退回上一层，"
                                      "而不是继续在本屏找别的图标。"),
-                        }), cfg)
+                        }), cfg, node_calls)
                         continue
                 if ans.get("give_up"):
                     log(f"           -> 放弃：{ans.get('give_up_reason')}")
@@ -661,17 +799,29 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                                 f"「{ans.get('dialog_text') or '(未说明)'}」")
                     recent.append(key)
             else:
-                # ⚠️ 这里以前一律打 "无动作"，把三种完全不同的情况混成一句，
-                #    排查时会被带偏（176 就是：模型明明给了 input_rid，
-                #    日志却说"无动作"，看着像模型没说，其实是路由吞了）。
+                # ⚠️ 这里以前一律打 "无动作"，把**五种完全不同的情况**混成一句。
+                #
+                # 每一次都付出了代价：
+                #   · 176：模型明明给了 input_rid，日志却说"无动作"，
+                #     看着像模型没说，其实是路由吞了。
+                #   · 167：模型连续 16 轮说 vision_question，
+                #     全被记成"无动作"。排查时我一直以为模型在乱点，
+                #     实际是它在**反复求图**——日志把最重要的信号藏了。
+                #
+                # 教训：这一行是排查的第一现场，**它说什么模型就会以为是什么**。
+                #       凡是"模型给了合法信号、但不是坐标"的分支，都必须单独说。
                 if str(ans.get("input_rid") or "").strip():
                     log(f"           -> 输入 {ans.get('input_rid')}"
                         f" ⇐「{ans.get('input_text')}」")
                 elif ans.get("key"):
                     log(f"           -> 按 {ans.get('key')} 键")
+                elif ans.get("need_knowledge"):
+                    log(f"           -> 要查知识：{ans.get('need_knowledge')}")
+                elif ans.get("vision_question"):
+                    log(f"           -> 要看图：{ans.get('vision_question')}")
                 else:
                     log(f"           -> 无动作（模型既没给坐标、也没给"
-                        f"输入/按键/完成）：{ans}")
+                        f"输入/按键/知识/看图/完成）：{ans}")
         elif kind == "assert":
             # ★ unknown 不能打成 FAIL —— 那是替产品下结论。
             # 日志是主 Agent/人第一时间看的，写错方向会把"没验成"
@@ -681,7 +831,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
             else:
                 log(f"           -> {'PASS' if ans.get('passed') else 'FAIL'}")
 
-        state = app.invoke(Command(resume=ans), cfg)
+        state = _drive(app, Command(resume=ans), cfg, node_calls)
 
     if loops >= max_loops:
         log(f"⚠️ 达到轮次上限 {max_loops}，强制收尾")
@@ -788,7 +938,26 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         log("")
         log(f"结论：{report.status}  步骤 {report.steps_done}/{len(spec.steps)}  "
             f"预期 {len(report.findings)}/{len(spec.asserts)}")
-        log(f"轮次：{loops}  依次 {counts}")
+        # ⚠️ 原来这行打的是 counts（只统计会 interrupt 的节点），
+        #    vision/knowledge 永远是 0 —— 而它们其实跑过。
+        #    167 排查时我照着这个 0 去翻路由和图定义，白花一轮。
+        #    现在主轴换成 node_calls（stream 里数出来的真实执行），
+        #    counts 退成括号里的补充信息，并且明确标注它的口径。
+        log(f"轮次：{loops}")
+        log(f"节点执行：{_fmt_node_calls(node_calls)}")
+        # model_s 在这里**才**能算准：report 里的值来自 decide 节点，
+        # 而 decide 节点只发 interrupt（实测 27 次共 353ms）。
+        # 真正等模型的时长是 model_ms（主循环里掐的），所以以它为准回填。
+        report.model_s = round(model_ms / 1000.0, 1)
+        _mm = report.model_s
+        _total_s = report.elapsed_s or 0.0
+        if _total_s > 0:
+            log(f"⏱️  耗时：总计 {_total_s:.1f}s，其中模型 {_mm:.1f}s"
+                f"（{_mm / _total_s:.0%}），设备/其他 {_total_s - _mm:.1f}s")
+        else:
+            log(f"⏱️  模型耗时：{_mm:.1f}s")
+        log(f"    （括号：会 interrupt 的节点计数 "
+            f"{counts}，不含 observe/act/vision 等不 interrupt 的节点）")
 
         # ★ 强证据直点到底生效没有 —— 必须**正面说清**，不能靠"日志里没看到 [model]"
         #   去反推。
@@ -858,6 +1027,18 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         log(f"报告：{report_path}")
         log(f"日志：{log_path}")
     log.close()
+
+    # ★ 重新落一次报告文件。
+    #
+    # 报告是 finish_child_node 写的，那时还不知道 model_s；
+    # 这里回填之后必须再写一遍，否则 run_case_json.py 从文件读到的还是 0.0，
+    # 库里 model_s 就永远是 0 —— "统计了但没人看到"，等于没做。
+    try:
+        Path(report_path).write_text(
+            json.dumps(report.model_dump(), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except OSError:
+        pass
 
     report_path_attr = report_path
     try:

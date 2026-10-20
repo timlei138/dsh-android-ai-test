@@ -29,7 +29,15 @@ def main() -> None:
     p = argparse.ArgumentParser(description="vision：视觉模型问图（OpenAI 兼容）")
     p.add_argument("--image", required=True, help="图片路径（png/jpg）")
     p.add_argument("--prompt", required=True, help="问题/断言指令")
-    p.add_argument("--max-tokens", type=int, default=500)
+    # ⚠️ 默认值原来是 500，小到离谱。
+    #
+    # 推理模型会把额度先花在 reasoning_tokens 上，剩多少才给答案。
+    # 500 的后果是：截图一张都读不透，返回空文本（ok 仍是 true），
+    # 上层以为"看过了但没内容"，于是反复重问 —— 167 就这么空转 16 轮。
+    #
+    # 168 的真实 usage 是 completion=2000 & reasoning=2000（仍全被吃光），
+    # 所以这里给 6000。调用方显式传 --max-tokens 时以调用方为准。
+    p.add_argument("--max-tokens", type=int, default=6000)
     args = p.parse_args()
 
     conf_fp = STORAGE_DIR / "vision.json"

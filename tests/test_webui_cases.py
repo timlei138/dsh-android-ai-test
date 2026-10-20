@@ -264,7 +264,45 @@ ck("★ 仪表盘口径写明「按用例最近一次」", "按用例最近一�
 ck("★ 不引图表库（自己画 SVG）",
    "echarts.init" not in app and "echarts" not in html.lower()
    and not (ROOT / "webui" / "echarts.min.js").exists())
-ck("★ 老记录明确标「这次没存快照」", "这次没存快照" in app)
+ck("★ 老记录明确说明没有快照",
+   "没有内容" in app or "这次没存快照" in app)
+
+
+def _func_body(src: str, name: str) -> str:
+    """按大括号配平切出一个函数的**代码**（去掉注释行）。
+
+    ⚠️ 不能用 `split("\\nfunction ")` 那种切法 —— 切出来的范围会
+       一路吃到下一个函数里，于是我第一次把 viewRuns 的 await api()
+       当成了 caseInfoHtml 的问题，误判成"没修"。
+       也不能留注释：这条规则我是**写在注释里**解释为什么改的，
+       而注释里正好就提到了 /api/case/，不剔掉永远过不了。
+    """
+    i = src.find(f"function {name}")
+    assert i >= 0, name
+    j = src.find("{", i)
+    depth, end = 0, len(src)
+    for k in range(j, len(src)):
+        if src[k] == "{":
+            depth += 1
+        elif src[k] == "}":
+            depth -= 1
+            if depth == 0:
+                end = k + 1
+                break
+    body = src[i:end]
+    # 去注释（行注释 + 块注释）
+    import re as _re
+    body = _re.sub(r"/\*.*?\*/", "", body, flags=_re.S)
+    body = "\n".join(ln for ln in body.splitlines()
+                     if not ln.strip().startswith(("*", "//")))
+    return body
+
+
+_ci = _func_body(app, "caseInfoHtml")
+ck("★ 详情页不拿当前文件冒充快照",
+   "/api/case/" not in _ci and "await api(" not in _ci,
+   "caseInfoHtml 里不该有任何 fetch")
+ck("详情页只用 run.case_yaml 渲染", "run.case_yaml" in _ci)
 ck("★ key 留空的语义写在界面上", "留空保存 = 保留原值" in app)
 
 print()

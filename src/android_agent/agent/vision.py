@@ -8,6 +8,22 @@
   max_tokens 给小了（如 500）时，推理模型把额度全花在 reasoning_tokens 上，
   最终 text 返回**空字符串**（ok 仍为 true）—— 看着成功其实什么都没答。
   ⇒ 默认给 2000，并在 text 为空时明确报错，不静默当成功。
+
+⚠️⚠️ 2000 还是不够（2026-10-20，167 真机实测）：
+  168 的报错里 usage 写得很清楚 ——
+      completion_tokens=2000, reasoning_tokens=2000
+  也就是**一个 token 都没留给答案**，全被推理吃了。
+
+  1x1 的测试图只要 265 个 reasoning token，所以"测试连接"是通的；
+  但真实截图要看一个 4 项菜单、还要读中文，推理量翻好几倍。
+  **小图能通不代表真图能通** —— 这个误判让我多花了一轮才找到原因。
+
+  更严重的是它引出的连锁反应（167）：
+      视觉答不上来 → 模型以为"还没看到" → 再问一次 → 又空 → ...
+  连续空转 16 轮、白烧 100 多秒，最后靠模型自己猜对一个坐标才走出来。
+
+  ⇒ 默认提到 6000。推理模型在截图这种任务上，2000 是明显偏小的。
+     另外：空返回时**必须让上层的动作彻底失败**，见 nodes.vision_node 的说明。
 """
 
 from __future__ import annotations
@@ -18,8 +34,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# 视觉问答默认额度：够推理 + 出答案。低于 1000 极易空返回。
-DEFAULT_MAX_TOKENS = 2000
+# 视觉问答默认额度：够推理 + 出答案。
+#
+# 2000 → 6000（167 实测 2000 会被 reasoning 吃光，一个 token 都不剩）。
+# 这个数不是拍脑袋：168 那次 usage 报的就是 completion=2000 且
+# reasoning=2000，说明推理本身能长到上限；给 6000 留出足够余量。
+DEFAULT_MAX_TOKENS = 6000
 
 
 class VisionError(RuntimeError):

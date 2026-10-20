@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS runs (
     steps_total INTEGER,
     auto_rate   REAL,              -- 代码直点占比
     elapsed_s   REAL,
+    -- 模型耗时（秒）。和 elapsed_s 的差就是设备/截图花掉的时间。
+    -- 分开存是为了回答"这条用例慢在哪"：模型一次 5~20s，点击才 200ms。
+    model_s     REAL,
     by_model    INTEGER,           -- 交给模型判定的步数
     by_code     INTEGER,           -- 代码直点的步数
     engine      TEXT,
@@ -166,6 +169,7 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 _ADDED_COLUMNS = (
     ("runs", "case_yaml_path", "TEXT"),
     ("runs", "case_yaml", "TEXT"),
+    ("runs", "model_s", "REAL"),
 )
 
 
@@ -248,12 +252,12 @@ def save_run(
         cur = con.execute(
             """INSERT INTO runs(
                 case_name, case_id, case_title, status, summary,
-                steps_done, steps_total, auto_rate, elapsed_s,
+                steps_done, steps_total, auto_rate, elapsed_s, model_s,
                 by_model, by_code, engine,
                 started_at, started_ts, finished_at,
                 ledger_path, log_path, llm_path, report_path,
                 case_yaml_path, case_yaml, report_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 case_name,
                 str(report.get("case_id") or ""),
@@ -264,6 +268,7 @@ def save_run(
                 _steps_total(report),
                 strong.get("auto_rate"),
                 elapsed,
+                report.get("model_s"),
                 strong.get("by_model"),
                 strong.get("by_code"),
                 report.get("engine"),
@@ -366,7 +371,8 @@ def list_runs(*, case_name: str = "", limit: int = 100,
     con = connect(db)
     try:
         sql = ("SELECT run_id, case_name, case_id, case_title, status, summary,"
-               " steps_done, steps_total, auto_rate, elapsed_s, by_model, by_code,"
+               " steps_done, steps_total, auto_rate, elapsed_s, model_s,"
+               " by_model, by_code,"
                " engine, started_at, finished_at, ledger_path, log_path, llm_path,"
                " case_yaml_path,"
                " (case_yaml IS NOT NULL) AS has_yaml"

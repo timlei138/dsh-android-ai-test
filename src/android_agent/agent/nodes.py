@@ -50,6 +50,22 @@ LANDING_MAX_TRIES = 3
 # 176 实测：这个值设成无穷大时点了 37 次，白花 70 秒且毫无进展。
 STRONG_MAX_SAME_TARGET = 2
 
+
+# 视觉通道连续失败几次后，**禁止再问**，强制模型用现有信息决定。
+#
+# 为什么需要这个闸门（167 真机，2026-10-20）：
+#   视觉后端把 max_tokens 全花在 reasoning 上，返回空文本。
+#   模型不知道"没看成"，下一轮换个说法再问，又空 —— 连续 16 轮、
+#   白烧 100 多秒，最后靠瞎猜一个坐标才走出来。
+#
+# 光是"报错"没用（原有的 issues 就是这么做的，模型看不见）。
+# 必须**把 vision_question 从 action 里摘掉**，路由才会回到 decide，
+# 模型手上没了那个合法动作，才可能去想别的办法。
+#
+# 为什么是 2：第一次失败可能是网络抖动，给一次重试；
+# 同一个问题失败两次就不是偶发了，再问也不会有新答案。
+VISION_MAX_FAILURES = 2
+
 # --------------------------------------------------------------------------
 # 主 Agent -> 子 Agent 的任务包
 # --------------------------------------------------------------------------
@@ -220,6 +236,15 @@ class SubagentReport(BaseModel):
     # 卡在哪 —— 直接给出"最后成功的一步"和"卡住的步骤"，供主 Agent 快速定位
     stalled_at: str = Field(default="", description="卡住的位置（空=没卡）")
     elapsed_s: float = Field(default=0.0, description="总耗时（秒）")
+    # 模型相关节点（decide/assert/knowledge）的累计耗时。
+    # 和 elapsed_s 的差就是设备/截图/IO 花掉的时间。
+    #
+    # 为什么要分开：模型一次 5~20 秒，一次点击才 200ms。
+    # 只报总耗时，看报告的人会以为"设备慢"，实际大头在等模型。
+    model_s: float = Field(default=0.0,
+                           description="模型耗时（秒，decide/assert/knowledge）")
+    # 节点执行次数与耗时 {节点名: {"n": 次数, "ms": 毫秒}}
+    node_calls: dict[str, Any] = Field(default_factory=dict)
     # 这条用例的历史可信度（用例 YAML 的 confidence，**不参与判定**）。
     # 只做提示：level != verified 时，这次 PASS 不代表它稳定。
     case_confidence: dict[str, Any] = Field(default_factory=dict)
@@ -312,6 +337,17 @@ class ChildState(TypedDict, total=False):
     # 工作集：观测与动作分开存，避免互相覆盖（曾经因此静默丢动作）
     last_activity: str
     last_shot: str
+    # 视觉通道连续失败次数。达到 VISION_MAX_FAILURES 后禁止再问（见 vision_node）。
+    # 没有这个计数，模型会一直以为"还没看到"而无脑重问 —— 167 空转 16 轮。
+    vision_failures: int
+    vision_error: str
+    # 最近一次看图的答案。vision 节点写，decide 节点读并塞进提示词。
+    # 没有它，模型"问了图但永远看不到答案"—— 167 连问 21 次的根本原因。
+    last_vision: str
+    # 节点执行统计 {节点名: {"n": 次数, "ms": 累计毫秒}}。
+    # 由 runner._drive 从 stream 事件里数出来，是"谁真的执行了、花了多久"的
+    # 唯一真实来源。注意别拿它和 counts 混用 —— 那个只统计会 interrupt 的节点。
+    node_calls: dict[str, Any]
     last_event_ids: list[str]
     obs_clickable: list[dict[str, Any]]
     # 当前屏的**全部**文案（不只可点项）。
@@ -1432,6 +1468,28 @@ def _elapsed_s(state: ChildState) -> float:
         return 0.0
 
 
+# 这些节点的时间基本全花在**等模型**上（网络往返 + 推理）。
+# observe/act/vision 不算：它们等的是设备。
+_MODEL_NODES = ("decide", "assert", "knowledge")
+
+
+def _model_seconds(state: ChildState) -> float:
+    """模型相关节点的累计耗时（秒）。
+
+    数据来自 runner._drive 从 stream 里数出来的 node_calls。
+    没有它时返回 0，不去猜 —— 猜出来的数字比没有更糟。
+    """
+    calls = state.get("node_calls") or {}
+    ms = 0.0
+    for name in _MODEL_NODES:
+        rec = calls.get(name) or {}
+        try:
+            ms += float(rec.get("ms") or 0)
+        except (TypeError, ValueError):
+            continue
+    return round(ms / 1000.0, 1)
+
+
 def _step_id(state: ChildState) -> str:
     """当前步骤号（越界时返回最后一步）—— 只用于进度上报。"""
     steps = (state.get("task") or {}).get("steps") or []
@@ -1820,6 +1878,19 @@ def decide_node(state: ChildState) -> dict[str, Any]:
         # 一次都没触发（knowledge: 0）。凡是"用例已声明"的东西都该由代码给出，
         # 不能指望模型主动索取。后续步骤仍可 need_knowledge 按需再查。
         "knowledge": _step_knowledge(state, task, step),
+        # ★★★ 上一轮看图的结果，必须在这一轮告诉模型 ★★★
+        #
+        # 这是 167 空转的真正病根（比 max_tokens 更根本）：
+        #   vision 节点把答案写进 action["vision"]，然后路由去 observe
+        #   → 重新 decide。可 decide 的 payload 里**从来就没有 vision**，
+        #   模型只看得到自己上一轮问的问题，看不到答案。
+        #
+        #   于是它以为"还没看到"，换个说法再问一次 —— 21 次、95 秒。
+        #   而我加的那个"失败 2 次就停"的闸门根本没触发，
+        #   因为视觉是**成功**的，只是没人把结果递给它。
+        #
+        #   这就是"加了个刹车但没接上油管"：修的是失败路径，坏的是成功路径。
+        "vision": state.get("last_vision") or "",
         "round": state.get("round_in_step", 0),
         # ★ 代码没能直点时，**明确告诉模型"代码卡在哪了"**。
         #
@@ -2431,18 +2502,97 @@ def knowledge_node(state: ChildState) -> dict[str, Any]:
 
 
 def vision_node(state: ChildState) -> dict[str, Any]:
-    """看图（可选）。子 Agent 需要视觉判据时调它，不依赖主模型多模态。"""
+    """看图（可选）。子 Agent 需要视觉判据时调它，不依赖主模型多模态。
+
+    ## ★ 为什么"看不成"必须真的失败，不能静默
+
+    167 真机（2026-10-20）踩到的：视觉后端因为 max_tokens 被 reasoning
+    吃光而返回空文本，vision 节点把错误写进 issues 就完事了。
+    结果模型**根本不知道没看成**，下一轮又问同一个问题，又空。
+    连续 16 轮、白烧 100 多秒，最后靠模型瞎猜对一个坐标才走出来。
+
+    日志上是这样的（注意它连失败都看不出来）：
+
+        -> 无动作（模型既没给坐标、也没给输入/按键/完成）：
+           {'step_done': False, 'vision_question': '菜单里四项是什么？'}
+
+    机制上的病根：**"问了"和"看到了"之间没有反馈闭环**。
+    模型只能靠自己猜"是不是图里没信息"，而它猜不出来 ——
+    它连"我这次看图失败了"都不知道。
+
+    所以这里做两件事：
+
+      ① 失败次数记进 state，用 `vision_failures` 累计
+      ② 达到上限后，**把 vision_question 从 action 里摘掉**，
+         并明确告诉模型"别再看图了，用现有信息决定"
+
+    ② 是关键：光是再次失败没用，必须让路由不再回到 vision。
+    否则任你怎么报错，它下一轮照样问 —— 因为它手上有个合法动作。
+    """
     action = state.get("action") or {}
     q = (action.get("vision_question") or "").strip()
     shot = state.get("last_shot") or ""
-    if not q or not shot:
+
+    if not q:
         return {}
+
+    # ── 看图失败太多次：强制停止这条路 ────────────────────────────
+    #
+    # 阈值 2：第一次失败可能是偶发（网络抖动），给一次重试机会；
+    # 同一个问题失败两次，就不是偶发了，再问也不会有新答案。
+    _fails = int(state.get("vision_failures") or 0)
+    if _fails >= VISION_MAX_FAILURES:
+        _clean = {k: v for k, v in action.items()
+                  if k not in ("vision_question", "vision", "vision_error")}
+        return {
+            "action": _clean,
+            "issues": [
+                f"视觉通道连续失败 {_fails} 次，已强制停止看图，"
+                f"要求模型用现有信息判断（最后一次原因："
+                f"{state.get('vision_error') or '未知'}）"],
+            "progress": [_tick("vision",
+                               f"视觉已连续失败 {_fails} 次，禁止再看图")],
+        }
+
+    if not shot:
+        # 没有截图 ≠ 模型问错了。这是环境的锅，但**必须让模型知道**，
+        # 否则它会以为"图里没有这个信息"，然后一直换着法子问。
+        return _vision_failed(
+            state, action,
+            "拿不到截图（last_shot 为空），这次没看成")
+
     try:
         answer = ask_image(_ctx().python, _ctx().skill_root, shot, q)
     except VisionError as exc:
-        return {"issues": [f"vision 失败：{exc}"],
-                "action": {**action, "vision": None, "vision_error": str(exc)}}
-    return {"action": {**action, "vision": answer}}
+        return _vision_failed(state, action, str(exc))
+
+    # 成功：失败计数清零，答案同时挂回 action（本轮用）和 last_vision（下一轮 decide 用）
+    #
+    # ⚠️ last_vision 是必需的，不是冗余：
+    #    vision 之后路由去 observe → 重新 decide，而 action 会被新的
+    #    observe/decide 覆盖。只写 action 的话，模型下一轮就看不到答案了 ——
+    #    这正是 167 连问 21 次的**真正原因**（比 max_tokens 更根本）。
+    return {"action": {**action, "vision": answer},
+            "last_vision": answer,
+            "vision_failures": 0,
+            "vision_error": ""}
+
+
+def _vision_failed(state: ChildState, action: dict[str, Any],
+                   why: str) -> dict[str, Any]:
+    """视觉失败的统一出口：计数 + 把"失败"这件事说给模型听。
+
+    ⚠️ 保留 vision_question 是有意的：让它再试一次（网络抖动很常见）。
+       但**计数**在涨，达到 VISION_MAX_FAILURES 就会被上面摘掉。
+    """
+    n = int(state.get("vision_failures") or 0) + 1
+    return {
+        "action": {**action, "vision": None, "vision_error": why},
+        "vision_failures": n,
+        "vision_error": why,
+        "issues": [f"vision 失败（第 {n}/{VISION_MAX_FAILURES} 次）：{why}"],
+        "progress": [_tick("vision", f"看图失败 {n} 次：{why[:60]}")],
+    }
 
 
 def is_deterministic_landing(expr: str) -> tuple[bool, str]:
@@ -3724,6 +3874,11 @@ def finish_child_node(state: ChildState) -> dict[str, Any]:
         progress=list(state.get("progress") or []),
         stalled_at=_stalled_at(state, steps_done, len(steps)),
         elapsed_s=_elapsed_s(state),
+        # ★ 模型耗时单独算一份（用户要求"模型得时间也要统计在内"）。
+        #   只报总耗时看不出"慢在模型还是慢在设备"：decide 一次 5~20s，
+        #   而一次点击只有 200ms。分开记才知道该优化哪头。
+        model_s=_model_seconds(state),
+        node_calls=dict(state.get("node_calls") or {}),
         case_confidence=dict(task.get("case_confidence") or {}),
         strong_stats=_strong_stats(state),
         # ★ 每步实际走的路径 —— 按步归并，回写 YAML 与人工核对都用它
