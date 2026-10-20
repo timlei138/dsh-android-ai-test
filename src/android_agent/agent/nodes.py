@@ -2994,7 +2994,20 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
     #
     # ⚠️ 这个判断必须放在 `if done:` **之前** ——
     #    放后面的话 done 分支已经 return 了，永远走不到（写完测试才发现的）。
-    if done and issues and not state.get("fallback_reason"):
+    #
+    # ★★★ 这里原本还挂着 `and not state.get("fallback_reason")`，是错的 ★★★
+    #
+    # 167 实测：s0 判完成后停在课程表引导页（要求 AllInOneActivity），
+    # 日志里**一次都没重试**就进了 s1。直接问代码，两种情况的区别很清楚：
+    #
+    #     fallback_reason 为空  -> step_index=None, retry_landing=1  （重试）
+    #     fallback_reason 非空  -> step_index=1,    retry_landing=None（跳过）
+    #
+    # fallback_reason 的语义是「代码定不准，交给模型」—— 说的是**谁来点**，
+    # 跟**点完到没到**是两件事。挂在它上面等于：越是代码没把握的步骤，
+    # 越不做落点核对。而这类步骤恰恰最容易走偏（167 就是点完权限框
+    # 闪出引导页），最该核对。守卫写反了方向。
+    if done and issues:
         tried = state.get("retry_landing", 0)
 
         if tried + 1 < LANDING_MAX_TRIES:

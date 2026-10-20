@@ -17,12 +17,24 @@ preconditions:
 
 steps:
   - id: s0
-    desc: 点掉 pm clear 后的「同意」权限说明框（日历自己的框，按钮 android:id/button1），落回日历首页
+    desc: 点掉 pm clear 后的「同意」权限说明框（日历自己的框，按钮 android:id/button1），让日历走完首次启动的授权流程
     target: rid=button1
-    landing: activity=.AllInOneActivity
+    # ⚠️ 落点允许两个，因为**这条路径本来就分岔**（2026-10 三次真机实测）：
+    #
+    #     日历权限说明框 --点同意--> 系统权限框 --点允许--> 课程表引导页 / 日历首页
+    #
+    # 「同意」之后系统还会弹一个权限框，处理完它落到哪屏取决于还有几个权限
+    # 要问：问完就落首页，没问完就落引导页（引导页本来就是首页上的浮层）。
+    #
+    # 原来这里只写 .AllInOneActivity，于是落到引导页就被判"落点不符"，
+    # 试满 3 次 BLOCKED —— 可引导页是**正常的中间态**，不是失败。
+    # 本步 pitfalls 里其实早就写了"此时可能还会看到课程表引导框"，
+    # 只是 landing 没跟着放宽，判据和描述自相矛盾。
+    landing: activity=.AllInOneActivity|TimetableGuideActivity
     pitfalls:
       - "一命中就点会点空（入场动画未结束）—— 等约 1.5s 再点，点完核对框已消失。"
       - "这是日历自己的权限说明框（包名仍是 com.zui.calendar），点「同意」不要点「退出」。"
+      - "点「同意」后还会弹**系统权限框**（com.android.permissioncontroller），那不是本步目标，执行器会自动点「允许」。"
       - "此时可能还会看到课程表引导框「课程表上新了！」—— 本用例要验的就是它，先不要点掉（下一屏描述里验），但若已点掉，s1 landing 仍应满足。"
 
   - id: s1
