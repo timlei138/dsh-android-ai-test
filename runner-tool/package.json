@@ -1,0 +1,17 @@
+﻿{
+  "name": "dsh-tool-android-case",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model-facing android_case tool: runs one Android GUI test case through the LangGraph runner and returns a structured report",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}

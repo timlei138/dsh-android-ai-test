@@ -1,0 +1,55 @@
+# ── 运行产物（不进版本控制）──────────────────────────────────
+# tmp/ 是临时脚本与跑批输出，随时可删
+tmp/
+
+# 证据：每次执行落盘的 dump.xml / shot.png / meta.json
+# 单次跑就给几十 MB，几百次就是几百 GB —— 绝不入仓
+assets/storage/evidence/
+
+# 调用记录 / 时序 / 视觉缓存
+assets/storage/calls/
+assets/storage/timing/
+assets/storage/recording_errors/
+assets/storage/vision.json
+assets/storage/current_session
+assets/storage/.evidence_seq
+assets/storage/.crash_seen_*
+
+# 会话库（SQLite，机器相关）
+assets/storage/sessions.db
+assets/storage/sessions.db-*
+
+# 自动删除用例的回写备份：留有版本控制就够了
+assets/storage/cases/_deleted/
+
+# 设备锁（运行时产物，机器相关）
+.locks/
+**/.locks/
+*.lock
+
+# 手工备份（有版本控制之后不再需要）
+*.bak
+*.bak_*
+*.orig
+
+# ── 依赖与缓存 ──────────────────────────────────────────────
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 本地环境 ────────────────────────────────────────────────
+.env
+.env.*
