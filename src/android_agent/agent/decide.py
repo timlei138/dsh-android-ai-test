@@ -70,13 +70,84 @@ def _load_config(skill_root: str) -> dict[str, str]:
     return {"base_url": base.rstrip("/"), "model": model, "api_key": key}
 
 
+def _llm_trace(title: str, body: str) -> None:
+    """把提示词/回复原文打到日志（同时可落文件）。
+
+    开关：环境变量 LLM_TRACE=0 可关掉（默认开）—— 排查手册就是靠这个。
+    落文件：环境变量 LLM_TRACE_FILE=路径，追加写 markdown。
+
+    为什么要**默认开**：这次的教训是"日志里只有结论，看不到问和答"，
+    于是我们花了很久猜模型为什么不给 input_rid。原文有用。
+    体积不用担心：一轮决定约 3-6KB，二三十轮也就百来 KB。
+    """
+    import os
+
+    if os.environ.get("LLM_TRACE", "1") in ("0", "false", "False"):
+        return
+    # flush=True 是必须的：输出重定向到文件/管道时 Python 会块缓冲，
+    # 不刷的话一次运行要跑完才看得见提示词，排查时等于没有。
+    print(f"╭─ {title} " + "─" * max(0, 66 - len(title)), flush=True)
+    for ln in body.rstrip("\n").splitlines():
+        print(f"│ {ln}", flush=True)
+    print("╰" + "─" * 70, flush=True)
+
+    path = os.environ.get("LLM_TRACE_FILE")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"\n## {title}\n\n```\n{body.rstrip()}\n```\n")
+        except OSError:
+            pass
+
+
+def _chat_msg(cfg: dict[str, str], messages: list[dict[str, Any]],
+              max_tokens: int, timeout: int,
+              tools: list[dict[str, Any]] | None = None,
+              image: str | None = None, _retry: int = 2,
+              trace: str = "") -> dict[str, Any]:
+    """发一次 chat/completions，返回**完整的 message 对象**（含 tool_calls）。
+
+    这是改造后的主入口：走 function calling，模型直接"调工具"而不是
+    自己拼 JSON 字符串（见 tools.py 的说明）。
+
+    返回 message dict，调用方用 tools.first_tool_call() 取 (name, args)。
+    没有 tool_calls 时（某些模型/网关不保证），退回读 content 里的 JSON ——
+    **两条路都留着**，不能因为服务端行为变化就让整条用例废掉。
+    """
+    return _chat_req(cfg, messages, max_tokens, timeout,
+                     tools=tools, image=image, _retry=_retry, trace=trace)
+
+
 def _chat(cfg: dict[str, str], messages: list[dict[str, Any]],
           max_tokens: int, timeout: int,
-          image: str | None = None, _retry: int = 2) -> str:
-    """发一次 chat/completions，返回正文。支持可选附图（多模态）。
+          image: str | None = None, _retry: int = 2,
+          trace: str = "") -> str:
+    """旧的"只要正文"入口。保留给还没改成 tools 的调用方。"""
+    msg = _chat_req(cfg, messages, max_tokens, timeout, tools=None,
+                    image=image, _retry=_retry, trace=trace)
+    return str(msg.get("content") or "")
 
-    _retry 是**剩余重试次数**（不是 bool）：空正文时逐级退避。
+
+def _chat_req(cfg: dict[str, str], messages: list[dict[str, Any]],
+              max_tokens: int, timeout: int,
+              tools: list[dict[str, Any]] | None = None,
+              image: str | None = None, _retry: int = 2,
+              trace: str = "") -> dict[str, Any]:
+    """发一次 chat/completions，返回**完整的 message 对象**。
+
+    传了 tools 就走 function calling（模型回 tool_calls）；
+    没传就退回 json_object 正文模式。
+
+    _retry 是**剩余重试次数**（不是 bool）：空回复时逐级退避。
     0 表示不再重试，直接抛错。
+
+    ★ 这里打印**完整提示词和完整回复**（用户要求）。
+      在此之前日志里只有"模型决定点 (1520,375)：xxx"这一句结论，
+      看不到我们到底问了什么、它到底答了什么 —— 排查"为什么不用 type_text"
+      这种问题只能靠猜。现在两边原文都留。
+
+      写去哪：默认打到 stdout（和进度日志一起），设了 LLM_TRACE_FILE
+      就**追加写到那个文件**（一次运行一个 .md，排查时直接读）。
     """
     if image:
         # 把图塞进最后一条 user 消息
@@ -98,45 +169,53 @@ def _chat(cfg: dict[str, str], messages: list[dict[str, Any]],
             ]
         messages = messages[:-1] + [last]
 
-    # ★ 服务端会**硬性校验**：prompt 里不含 "json" 就直接 HTTP 400：
-    #   "Prompt must contain the word 'json' in some form to use
-    #    'response_format' of type 'json_object'."
-    #   —— 这不是文档里的软建议，是实测撞出来的 400。
-    #
-    # 所以不能无条件开这个开关：哪天有人改了提示词、把 "json" 字样删了，
-    # 整条用例会因为 400 挂掉，而错误信息在模型服务端，排查起来很绕。
-    # 这里发送前自己先判一次：不满足就**不开** json_object（退回旧行为，
-    # 仍能跑，只是少了服务端保证），而不是发出去撞 400。
-    _all_text = "\n".join(
-        str(m.get("content") or "") for m in messages).lower()
-    _want_json_mode = "json" in _all_text
-
     _payload: dict[str, Any] = {
         "model": cfg["model"],
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0,
     }
-    # ★ 结构化输出约束（服务端强制，不是"请模型自觉"）。
+
+    # ★ 走 tools（function calling）时**不要**开 json_object。
     #
-    # 用户的诉求：能不能要求子 Agent 严格返回 JSON。
-    # 光在提示词里写"只输出 JSON"那是**请求**，模型可以不遵守 ——
-    # 实测就踩到 reason 里带裸双引号、把整轮用例打成 BLOCKED。
-    # DeepSeek 支持和 OpenAI 一致的 json_object 模式，由服务端保证
-    # 产出是合法 JSON 字符串。
-    #
-    # 官方给的三个前提，本模块都已满足：
-    #   1. prompt 含 "json" 字样 ✓（上面已校验）
-    #   2. 给出期望的 JSON 形状示例 ✓（_step_schema_doc / assert 字段说明）
-    #   3. max_tokens 给够，避免截断 ✓（4000，空正文重试时翻倍到 ≥8000）
-    #
-    # ⚠️ 官方同时写明：json_object 模式下**偶发返回空正文**。
-    #    这和本模块已有的"空正文退避重试"是互补的，不冲突 ——
-    #    空正文仍走 _retry 那条路，不会被误当成"解析失败"。
-    if _want_json_mode:
-        _payload["response_format"] = {"type": "json_object"}
+    # 两者是互斥的两条结构化输出路线：
+    #   tools        -> 模型输出 tool_calls，参数由 schema 约束
+    #   json_object  -> 模型输出纯 JSON 正文，形状靠提示词描述
+    # 同时开会让模型在"该写工具调用"和"该写 JSON 正文"之间摇摆，
+    # 实测出过 content 空 + tool_calls 也空的诡异回复。
+    if tools:
+        _payload["tools"] = tools
+        _payload["tool_choice"] = "auto"
+    else:
+        # ★ 服务端会**硬性校验**：prompt 里不含 "json" 就直接 HTTP 400：
+        #   "Prompt must contain the word 'json' in some form to use
+        #    'response_format' of type 'json_object'."
+        #   —— 这不是文档里的软建议，是实测撞出来的 400。
+        #
+        # 所以不能无条件开这个开关：哪天有人改了提示词、把 "json" 字样删了，
+        # 整条用例会因为 400 挂掉，而错误信息在模型服务端，排查起来很绕。
+        # 这里发送前自己先判一次：不满足就**不开** json_object（退回旧行为，
+        # 仍能跑，只是少了服务端保证），而不是发出去撞 400。
+        _all_text = "\n".join(
+            str(m.get("content") or "") for m in messages).lower()
+        if "json" in _all_text:
+            _payload["response_format"] = {"type": "json_object"}
 
     body = json.dumps(_payload).encode("utf-8")
+
+    # ★ 打印完整提示词（提问前）
+    _msg_text = "\n\n".join(
+        f"[{m.get('role')}]\n"
+        + (m.get("content") if isinstance(m.get("content"), str)
+           else json.dumps(m.get("content"), ensure_ascii=False))
+        for m in messages)
+    if tools:
+        _msg_text += ("\n\n[可用的工具]\n"
+                      + ", ".join(t["function"]["name"] for t in tools))
+    _llm_trace(
+        f"提示词 · {trace or 'decide'} · max_tokens={max_tokens}"
+        + (f" · 重试剩余{_retry}" if _retry < 2 else ""),
+        _msg_text)
 
     req = urllib.request.Request(
         f"{cfg['base_url']}/chat/completions",
@@ -155,39 +234,62 @@ def _chat(cfg: dict[str, str], messages: list[dict[str, Any]],
         raise DecisionError(f"LLM 请求失败：{exc}") from exc
 
     try:
-        text = (data["choices"][0]["message"].get("content") or "").strip()
+        msg = data["choices"][0]["message"] or {}
     except (KeyError, IndexError, TypeError) as exc:
         raise DecisionError(f"LLM 返回结构异常：{str(data)[:300]}") from exc
 
-    if not text:
-        usage = data.get("usage") or {}
-        # 空正文 = reasoning 把额度吃光了。
-        #
-        # 实测：真机跑到第 7 轮偶发一次（completion=8000 全是 reasoning），
-        # 单独复现 3 次却是 0/3 —— 是模型侧的**瞬时抖动**，不是 prompt 缺陷。
-        #
-        # 关键在于：这种抖动**不该让整条用例挂掉**。一次 OOM 式的空正文
-        # 就把已经走了 7 轮的用例判死，代价完全不成比例。
-        #
-        # 所以退避策略要有**变化**，不能只是加倍：
-        # temperature=0 下同 prompt 同额度，重试大概率还是空。
-        #   第 1 次重试：加倍额度 + 明确催它直接给结论（压 reasoning）
-        #   第 2 次重试：换成极简 prompt（去掉长上下文，只留问题和 JSON 形状）
-        if _retry >= 1:
-            hard = messages + [{
-                "role": "user",
-                "content": ("直接给出 JSON 结果，不要展开分析。"
-                            "你现在只需要回答：点哪个坐标、以及是不是权限/弹窗按钮。"
-                            "立即输出 JSON，不要任何解释。")}]
-            # ⚠️ 额度必须**至少**翻倍且不低于 8000 —— 压 reasoning 的同时
-            # 还得留够写完整 JSON 的空间。实测踩到：额度被 reasoning 吃光后
-            # JSON 只写了一半（"next_y": 就断了），整条用例因此挂掉。
-            return _chat(cfg, hard, max(max_tokens * 2, 8000), timeout,
-                         image=image, _retry=_retry - 1)
-        raise DecisionError(
-            "LLM 返回空正文（通常是 max_tokens 被 reasoning 吃光）。"
-            f"usage={usage}，当前 max_tokens={max_tokens}，建议调大。")
-    return text
+    text = str(msg.get("content") or "").strip()
+    _calls = msg.get("tool_calls") or []
+
+    # ★ 打印模型回复原文（拿到后）。
+    #   有 tool_calls 就把调用**展开成人话**一起打 —— 排查时最想看的是
+    #   "它这次选了哪个工具、参数是什么"，而不是一坨 JSON 转义。
+    _usage = data.get("usage") or {}
+    _shown = text
+    if _calls:
+        _lines = []
+        for c in _calls:
+            fn = (c or {}).get("function") or {}
+            _lines.append(f"→ 调用工具 {fn.get('name')}"
+                          f"({fn.get('arguments')})")
+        _shown = (_shown + "\n" if _shown else "") + "\n".join(_lines)
+    _llm_trace(
+        f"模型回复 · {trace or 'decide'}"
+        f" · tokens={_usage.get('total_tokens', '?')}"
+        f"（推理 {_usage.get('completion_tokens_details', {}).get('reasoning_tokens', 0)}）",
+        _shown or "(空回复)")
+
+    # tool_calls 也是有效回复：正文为空不代表失败。
+    if text or _calls:
+        return msg
+
+    usage = data.get("usage") or {}
+    # 空回复 = reasoning 把额度吃光了。
+    #
+    # 实测：真机跑到第 7 轮偶发一次（completion=8000 全是 reasoning），
+    # 单独复现 3 次却是 0/3 —— 是模型侧的**瞬时抖动**，不是 prompt 缺陷。
+    #
+    # 关键在于：这种抖动**不该让整条用例挂掉**。一次 OOM 式的空回复
+    # 就把已经走了 7 轮的用例判死，代价完全不成比例。
+    #
+    # 所以退避策略要有**变化**，不能只是加倍：
+    # temperature=0 下同 prompt 同额度，重试大概率还是空。
+    #   第 1 次重试：加倍额度 + 明确催它直接给结论（压 reasoning）
+    #   第 2 次重试：换成极简 prompt（去掉长上下文）
+    if _retry >= 1:
+        hard = messages + [{
+            "role": "user",
+            "content": ("直接调用工具回答，不要展开分析。"
+                        "立即给出工具调用，不要任何解释。")}]
+        # ⚠️ 额度必须**至少**翻倍且不低于 8000 —— 压 reasoning 的同时
+        # 还得留够写完整参数的空间。实测踩到：额度被 reasoning 吃光后
+        # JSON 只写了一半（"next_y": 就断了），整条用例因此挂掉。
+        return _chat_req(cfg, hard, max(max_tokens * 2, 8000), timeout,
+                         tools=tools, image=image, _retry=_retry - 1,
+                         trace=trace)
+    raise DecisionError(
+        "LLM 返回空回复（通常是 max_tokens 被 reasoning 吃光）。"
+        f"usage={usage}，当前 max_tokens={max_tokens}，建议调大。")
 
 
 def _escape_inner_quotes(s: str) -> str:
@@ -609,15 +711,63 @@ def decide_step(python: str, skill_root: str, payload: dict[str, Any],
 
     lines.append("")
     lines.append("如果屏幕上有挡路的弹窗，先点掉它再继续。")
-    lines.append("只输出 JSON，字段如下：")
-    lines.append(_step_schema_doc())
+    lines.append("回答方式：**直接调用一个工具**（不要输出 JSON 文本）。"
+                 "点控件用 tap；填必填输入框用 type_text；"
+                 "做完了用 done；走不通用 give_up。")
+    _km = _payload_norm = None
+    if payload.get("retry_hint"):
+        lines.append(f"注意：{str(payload['retry_hint'])[:200]}")
+    return _step_via_tools(skill_root, payload, "\n".join(lines),
+                           max_tokens=max_tokens, timeout=timeout,
+                           image=image, mode="decide_step")
 
-    reply = _chat(_load_config(skill_root),
-                  [{"role": "system", "content": _SYSTEM},
-                   {"role": "user", "content": "\n".join(lines)}],
-                  max_tokens=max_tokens, timeout=timeout, image=image)
-    action = _extract_json(reply)
-    return _validate_action(action, clickable)
+
+def _step_via_tools(skill_root: str, payload: dict[str, Any],
+                    prompt_text: str, *, max_tokens: int, timeout: int,
+                    image: str | None, mode: str) -> dict[str, Any]:
+    """把提示词发给模型，取回它调用的**工具**，翻译成 action dict。
+
+    两条路并存（有意为之）：
+      ① 模型回了 tool_calls  -> 用 tools.tool_call_to_action() 翻译
+      ② 模型没回工具而是回了 JSON 正文 -> 退回 _extract_json()
+
+    ② 不是冗余：不同网关/模型对 tools 的支持度不一致，某些会把
+    tool_calls 折叠成正文。留着这条路，换模型时不用改代码。
+
+    校验一条都不放松：翻译出来的坐标照样过 _validate_action。
+    """
+    from . import tools as _tools
+
+    cfg = _load_config(skill_root)
+    # trace 标签：fix_start 模式没有 step_index，别把 None+1 打出个 "第1步"
+    _si = payload.get("step_index")
+    _tag = (f"{mode} · 第{_si + 1}步 {payload.get('step_id') or ''}"
+            if isinstance(_si, int) else
+            f"{mode} · 轮{payload.get('round', 0)} "
+            f"{payload.get('want_activity') or ''}")
+    msg = _chat_msg(cfg, [{"role": "system", "content": _SYSTEM},
+                          {"role": "user", "content": prompt_text}],
+                    max_tokens=max_tokens, timeout=timeout,
+                    tools=_tools.decide_tools(), image=image, trace=_tag)
+
+    got = _tools.first_tool_call(msg)
+    if got is None:
+        # ② 退回 JSON 正文
+        reply = str(msg.get("content") or "")
+        action = _extract_json(reply)
+        return _validate_action(action, payload.get("clickable") or [])
+
+    name, args = got
+    try:
+        action = _tools.tool_call_to_action(name, args)
+    except ValueError as exc:
+        # 未知工具名 = 格式错误，抛出去让 runner 走"可重试"那条路
+        raise DecisionError(str(exc)) from exc
+
+    # need_knowledge / ask_vision / give_up / done 不带坐标，不用过坐标校验
+    if name in ("need_knowledge", "ask_vision", "give_up", "done"):
+        return action
+    return _validate_action(action, payload.get("clickable") or [])
 
 
 def decide_fix_start(python: str, skill_root: str, payload: dict[str, Any],
@@ -649,16 +799,11 @@ def decide_fix_start(python: str, skill_root: str, payload: dict[str, Any],
         lines.append(knowledge_text)
 
     lines.append("")
-    lines.append("回到起点后置 step_done=true。实在回不去才 give_up=true。")
-    lines.append("只输出 JSON，字段如下：")
-    lines.append(_step_schema_doc())
-
-    reply = _chat(_load_config(skill_root),
-                  [{"role": "system", "content": _SYSTEM},
-                   {"role": "user", "content": "\n".join(lines)}],
-                  max_tokens=max_tokens, timeout=timeout, image=image)
-    action = _extract_json(reply)
-    return _validate_action(action, clickable)
+    lines.append("回到起点后调用 done；实在回不去才 give_up。")
+    lines.append("回答方式：**直接调用一个工具**（不要输出 JSON 文本）。")
+    return _step_via_tools(skill_root, payload, "\n".join(lines),
+                           max_tokens=max_tokens, timeout=timeout,
+                           image=image, mode="decide_fix_start")
 
 
 def assert_step(python: str, skill_root: str, payload: dict[str, Any],
@@ -732,7 +877,8 @@ def assert_step(python: str, skill_root: str, payload: dict[str, Any],
     reply = _chat(_load_config(skill_root),
                   [{"role": "system", "content": _SYSTEM},
                    {"role": "user", "content": "\n".join(lines)}],
-                  max_tokens=max_tokens, timeout=timeout, image=image)
+                  max_tokens=max_tokens, timeout=timeout, image=image,
+                  trace=f"assert · {payload.get('assert_id') or ''}")
     verdict = _extract_json(reply)
     if "passed" not in verdict:
         raise DecisionError(f"断言回复缺少 passed 字段：{verdict}")
@@ -782,6 +928,30 @@ def _parse_coord(item: Any) -> tuple[int, int] | None:
         return None
 
 
+def _parse_rid(item: Any) -> tuple[str, str] | None:
+    """从可点项里取 (占位, rid)。没有 rid 返回 None。
+
+    返回二元组是为了和 _parse_coord 保持同样"返回元组或 None"的形状，
+    调用处用 `c[1]` 取 rid 就行。
+
+    dict 形态是主路径（真机传的就是 dict）：
+        {'r': 'et_schedule_name', 't': '课程表名称（必填）', 'c': [...]}
+    字符串形态是单测/日志里可能出现的紧凑写法：
+        "rid=et_schedule_name text='…' c=[x,y]"
+    """
+    if isinstance(item, dict):
+        rid = str(item.get("r") or item.get("rid") or "").strip()
+        return (rid, rid) if rid else None
+    if not isinstance(item, str):
+        return None
+    # 兼容 "rid=xxx ..." 与 "text='xxx' ..." 两种紧凑写法
+    m = re.search(r"\brid=([^\s,]+)", item)
+    if not m:
+        return None
+    rid = m.group(1).strip()
+    return (rid, rid) if rid else None
+
+
 def _validate_action(action: dict[str, Any],
                      clickable: list[str]) -> dict[str, Any]:
     """守住最关键的一条纪律：坐标必须来自当前可点项。
@@ -793,6 +963,12 @@ def _validate_action(action: dict[str, Any],
         "step_done": bool(action.get("step_done")),
         "next_x": action.get("next_x"),
         "next_y": action.get("next_y"),
+        # ★ 输入动作（tools 的 type_text / 老的 input_rid）。
+        #   必须在这里透传，否则下面"既没坐标也没完成"那条会把它当格式错误。
+        "input_rid": str(action.get("input_rid") or ""),
+        "input_text": action.get("input_text"),
+        # ★ 系统键（tools 的 press_key）
+        "key": str(action.get("key") or ""),
         "why": str(action.get("why") or ""),
         "expect": str(action.get("expect") or ""),
         "need_knowledge": str(action.get("need_knowledge") or ""),
@@ -810,6 +986,26 @@ def _validate_action(action: dict[str, Any],
     if out["step_done"] or out["give_up"] or out["need_knowledge"] \
             or out["vision_question"]:
         return out  # 这些情况不需要坐标
+
+    # ★ 输入动作：不需要坐标，但 **input_rid 必须在当前可点项里**。
+    #
+    # 和坐标校验同一条纪律：模型不能对着一个当前界面上不存在的控件写字。
+    # 只是把"坐标必须在列表里"换成"rid 必须在列表里"。
+    if out["input_rid"]:
+        allowed_rids = {c[1] for item in clickable
+                        if (c := _parse_rid(item))}
+        if allowed_rids and out["input_rid"] not in allowed_rids:
+            raise DecisionError(
+                f"要输入的控件 {out['input_rid']} 不在当前可点项里"
+                f"（现有：{', '.join(sorted(allowed_rids)) or '无'}）。"
+                "请从列表里选一个真正的输入框。")
+        return out
+
+    # ★ 系统键：back/home 不需要坐标，白名单校验
+    if out["key"]:
+        if out["key"] not in ("back", "home"):
+            raise DecisionError(f"不认识的系统键：{out['key']}")
+        return out
 
     if out["next_x"] is None or out["next_y"] is None:
         raise DecisionError(f"既没说完成/放弃，也没给坐标：{action}")

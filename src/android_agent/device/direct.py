@@ -38,6 +38,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -45,23 +46,139 @@ from pathlib import Path
 from typing import Any
 
 from .bridge import ActResult
+from .ledger import ClickLedger, target_from_screen
+
+
+_ADB_CACHE: list[str] = []
+
+# ── 设备层调试日志 ────────────────────────────────────────────────
+#
+# 为什么要有（用户明确要求过："要增加 log 机制，我们得知道每个子 Agent 的执行情况"）：
+#
+#   踩坑现场：日志停在 "判定本步完成" 之后再没增长，设备不动、进程还活着。
+#   人只能看到"最后一次点击的效果"，于是一口咬定"它在一直点这个按钮"。
+#   实际是卡在点击**之后**的 observe 里，一次都没再点。
+#
+#   ⇏ 结论：**动作和观察都必须有日志**。只记"点了什么"不够，
+#     必须记"点完之后到拿回画面花了多久、卡在哪条 adb 上"。
+#
+# 用环境变量 `ANDROID_DEVICE_LOG=1` 打开（默认静默，不污染正常输出）。
+_DEBUG_SINK: list[Any] = []
+
+
+def _debug_log():
+    """返回调试日志函数；没开就返回 None。"""
+    import os
+
+    if _DEBUG_SINK:
+        return _DEBUG_SINK[0]
+    if os.environ.get("ANDROID_DEVICE_LOG", "").strip() in ("1", "true", "yes"):
+        import time as _t
+
+        t0 = _t.time()
+
+        def _emit(msg: str) -> None:
+            print(f"  [dev {_t.time() - t0:6.1f}s] {msg}", flush=True)
+
+        _DEBUG_SINK.append(_emit)
+        return _emit
+    _DEBUG_SINK.append(None)  # type: ignore[arg-type]
+    return None
 
 
 def _adb_exe() -> str:
     """adb 可执行文件路径。
 
-    优先环境变量（换机器/CI 不用改代码），其次 PATH，最后退回 Windows 常见安装位置。
+    ⚠️ 设备操作**一律走 uiautomator2**，不再自己拼 adb 命令（用户定的规矩）——
+    唯一的例外是 `adb logcat`：它是查崩溃/日志的旁路手段，
+    而且 u2 没有等价能力，所以保留。这个函数现在只服务于那条路径。
     """
     import os
+    import shutil as _sh
 
     env = os.environ.get("ANDROID_ADB")
     if env and Path(env).exists():
         return env
-    found = shutil.which("adb")
+    found = _sh.which("adb")
     if found:
         return found
     fallback = Path(r"D:\AndroidSdk\platform-tools\adb.exe")
     return str(fallback) if fallback.exists() else "adb"
+
+
+def _parse_top_activity(dumpsys_text: str) -> dict:
+    """从 `dumpsys activity activities` 的输出里取当前前台。
+
+    返回 {"package": ..., "activity": ...}，取不到返回 {}。
+
+    ## 三级回退（和 AiAgentTest 的做法一致）
+
+      1. `topResumedActivity=ActivityRecord{... u0 pkg/.Act ...}`
+         最精准 —— 就是栈顶正在 resume 的那个。
+      2. `mResumedActivity: ActivityRecord{... u0 pkg/.Act ...}`
+         老 ROM 只有这个字段。
+      3. `ResumedActivity: ActivityRecord{...}` 后面再出现包名
+         某些定制 ROM 的写法。
+
+    ## 为什么 activity 要补全成全名
+
+    dumpsys 里常写成 `.timetable.display.TimetableActivity`（省略包名前缀），
+    而落点判据里写的是全名。这里统一拼成 `包名 + 短名`，
+    免得下游拿 `endswith` 去猜。
+
+    ## 为什么不用 u2 的 app_current
+
+    见 `_app_current` 的 docstring：它在页面过渡期会返回**旧页面**，
+    这正是 176 s5 连点 15 格全部"看不到变化"的根因。
+    """
+    import re as _re
+
+    if not dumpsys_text:
+        return {}
+
+    # 真实格式（设备实测）：
+    #   topResumedActivity=ActivityRecord{205796433 u0 com.zui.calendar/
+    #       .timetable.display.TimetableActivity t455, isEmbedded= false}
+    # 注意 activity 常以 `.` 开头（省略包名前缀）。
+    _REC = r"ActivityRecord\{[^}]*\s+u\d+\s+([\w.]+)/([\w.$]+)[^}]*\}"
+    for pat in (r"topResumedActivity=" + _REC,
+                r"mResumedActivity:\s*" + _REC,
+                r"ResumedActivity:\s*" + _REC):
+        m = _re.search(pat, dumpsys_text)
+        if not m:
+            continue
+        pkg, act = m.group(1), m.group(2)
+        if act.startswith("."):
+            act = pkg + act
+        elif "." not in act:
+            act = f"{pkg}.{act}"
+        return {"package": pkg, "activity": act}
+    return {}
+
+
+def _clickable_sig(scr: Any) -> str:
+
+    """把一屏的**可点控件**压成一个短指纹，用来判断"点了有没有进展"。
+
+    为什么不用整个 XML 比对：XML 里常有时间戳、滚动位置这类噪声，
+    一变就判"有变化"，反而看不出真·无反应。
+
+    只取可点控件的 `rid|文字`，排序后拼起来：
+        `iv_more|,save_view|完成,toolbar_title|测试课程表`
+    这个串变了，说明界面上"能点的东西"确实变了 —— 那才算进展。
+    """
+    if scr is None:
+        return ""
+    try:
+        items = []
+        for n in (getattr(scr, "clickable", None) or []):
+            r = str(n.get("r") or n.get("rid") or "")
+            t = str(n.get("t") or n.get("text") or "")
+            if r or t:
+                items.append(f"{r}|{t}")
+        return ",".join(sorted(items))
+    except Exception:  # noqa: BLE001  指纹算不出来不能影响执行
+        return ""
 
 
 def _load_perm():
@@ -251,7 +368,8 @@ class DirectDevice:
     _ocr_engine: Any = None
 
     def __init__(self, serial: str | None = None,
-                 evidence_dir: str | Path | None = None) -> None:
+                 evidence_dir: str | Path | None = None,
+                 ledger_path: str | Path | None = None) -> None:
         import uiautomator2 as u2
         self.serial = serial
         self._d = u2.connect(serial) if serial else u2.connect()
@@ -263,72 +381,167 @@ class DirectDevice:
         # 上一轮看到的"非权限框"前台包 = 权限申请方。
         # 多权限申请时同一个框里连点几次，申请方不变，靠它记住。
         self._last_perm_owner = ""
+        # ★ 点击账本：每次点击一条完整记录（点了哪个控件、前后页面、耗时）。
+        #   排查"一直点某个按钮"这类问题的唯一可靠依据 —— 见 ledger.py。
+        self._ledger = ClickLedger(ledger_path) if ledger_path else None
+        # 上一次观察到的屏 —— act 里用它反查坐标落在哪个控件上。
+        self._last_screen: Screen | None = None
+
+    @property
+    def ledger(self) -> ClickLedger | None:
+        return self._ledger
 
     # -- 观察 ---------------------------------------------------------------
-    def _app_current(self) -> dict:
-        """当前前台应用。**绝不许把整条用例卡死在这里。**
+    def _call_with_timeout(self, fn: Any, *, timeout: float,
+                           label: str) -> Any:
+        """用线程包住一次 u2 调用，超时就抛 TimeoutError。
 
-        ⚠️ 为什么不能直接用 `u2.app_current()`：
+        ## 为什么需要这层（用户定的规矩：设备操作一律走 uiautomator2）
 
-        uiautomator2 的 app_current 走 adbutils 的 `shell()`，而那个函数
-        挂着 `@retry`（`retry.api`，IndexError/BrokenPipeError 无限重试）。
-        实测踩到：一次 adb socket 异常后，`close (adbutils/_adb.py:98)`
-        → `shell (adbutils/_device_base.py:262)` → `app_current` 无限转圈，
-        进程 CPU 一直涨、日志一个字没有、用例卡死 20 分钟无从判断。
+        规矩很清爽：**不许绕开 u2 直接调 adb**。理由也站得住 ——
+        u2 已经把"点、滑、输入、取界面、取前台"都做全了，
+        自己再拼 adb 命令等于维护两套通道，两边行为还不一致。
 
-        这里改成**直接发一条带超时的 adb 命令**：拿不到就返回空 dict，
-        让上层按"不知道当前在哪"处理（落点判不了 → 交给模型），
-        而不是让整个执行器停摆。
+        但 u2 有个老毛病：底层 adbutils 的 `shell()` 挂着 `@retry`
+        （`retry.api`，BrokenPipeError/IndexError 无限重试）。socket 一旦僵住，
+        调用就永远不返回 —— 实测卡死 20 分钟，日志一个字没有。
+
+        `try/except` 挡不住它（**根本没有异常抛出**，它只是在重试）。
+        所以这里起一个 daemon 线程去调，主线程只等 timeout：
+        超时就抛，让上层按"这次没拿到"降级，而不是整条用例停摆。
+
+        为什么线程可以被丢掉不管：u2 的 socket 调用一旦僵住，
+        重开连接也救不回来；daemon 线程不会阻止进程退出。
         """
-        # 两条命令都试：不同 Android 版本、不同 ROM 给出的字段不一样。
-        # 实测这台（TB323FU / Android 15）`dumpsys window windows` 里**没有**
-        # mCurrentFocus，只有 `dumpsys activity activities` 有 topResumedActivity。
-        for cmd, pat in (
-            (["dumpsys", "activity", "activities"],
-             r"(?:topResumedActivity|mResumedActivity)\s*=\s*ActivityRecord\{\S+\s+\S+\s+"
-             r"(?P<pkg>[^\s/]+)/(?P<act>[^\s,}]+)"),
-            (["dumpsys", "window", "windows"],
-             r"mCurrentFocus=Window\{\S+\s+\S+\s+(?P<pkg>[^\s/]+)/(?P<act>[^\s}]+)\}"),
-        ):
+        box: list[Any] = []
+        err: list[BaseException] = []
+
+        def _run() -> None:
             try:
-                out = self._shell_text(cmd, timeout=8)
-            except Exception:  # noqa: BLE001  拿不到就换下一条，不许升级成卡死
-                continue
-            m = re.search(pat, out)
-            if m:
-                return {"package": m.group("pkg").strip(),
-                        "activity": m.group("act").strip()}
-        return {}
+                box.append(fn())
+            except BaseException as exc:  # noqa: BLE001
+                err.append(exc)
 
-    def _shell_text(self, cmd: list[str], *, timeout: float = 8.0) -> str:
-        """执行一条 adb shell 命令，**硬超时**。超时就抛，由调用方决定怎么降级。
+        th = threading.Thread(target=_run, daemon=True,
+                              name=f"u2-{label}")
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            raise TimeoutError(
+                f"{label} 超过 {timeout:.0f}s 未返回（u2 在无限重试）")
+        if err:
+            raise err[0]
+        return box[0] if box else None
 
-        直接走 `adb -s <serial> shell ...`，不经过 adbutils/uiautomator2 ——
-        那两层要么无限重试、要么没有超时参数，都不适合"必须能在有限时间内返回"的场景。
-        """
-        exe = _adb_exe()
-        args = [exe, "-s", self.serial, "shell", *cmd] if self.serial else \
-               [exe, "shell", *cmd]
-        proc = subprocess.run(args, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=timeout)
-        return proc.stdout or ""
+    def _app_current(self) -> dict:
+        """当前前台应用。**走 dumpsys，不用 u2.app_current。**
 
-    def _window_size(self) -> tuple[int, int]:
-        """屏幕宽高。拿不到返回 (0, 0)，绝不允许卡住。
+        ## 为什么不用 `d.app_current()`（这是 u2 的已知 bug）
 
-        与 _app_current 同样的理由：`u2.window_size()` 底层是 adbutils 的
-        `shell()`，带无限重试装饰器。包一层 try/except 挡不住它 ——
-        因为异常永远不会被抛出，它只是不停地重试。
+        `app_current` 在界面上还有动画/过渡时会**返回上一个页面**。
+        176 的 s5 就是被它坑的：点周视图空格子，界面 1.1 秒后才跳到
+        EditCourseActivity，而点击后立刻读 app_current 拿到的还是
+        TimetableActivity —— 记账 changed=False、模型以为没反应、换格子再点，
+        连点 15 格全判无效，最后 BLOCKED。
+        同一个坐标手动点能进，所以不是控件点不动，是**读前台读早了**。
+
+        `dumpsys activity activities` 的 `topResumedActivity`
+        是系统解析栈里真实的栈顶，比 u2 的实现稳。
+        （参考 D:\\Project\\python\\AiAgentTest\\device\\controller.py：
+          它也是绕过 app_current 直接读 dumpsys，并优先匹配 topResumedActivity。）
+
+        ## 仍然要兜底
+
+        拿不到就返回空 dict，让上层按"不知道当前在哪"处理
+        （落点判不了 -> 交给模型），而不是让执行器停摆。
         """
         try:
-            out = self._shell_text(["wm", "size"], timeout=6)
+            out = self._call_with_timeout(
+                lambda: self._d.shell("dumpsys activity activities"),
+                timeout=8.0, label="dumpsys activity")
+        except Exception:  # noqa: BLE001
+            return {}
+        # ⚠️ u2 的 shell() 返回 ShellResponse 对象，不是 str！
+        #    直接 isinstance(out, str) 判断会永远 False，于是这里静默返回 {}，
+        #    表现为"读不到前台"——比报错更难查。所以两种形态都收。
+        text = getattr(out, "output", None)
+        if text is None and isinstance(out, str):
+            text = out
+        if not isinstance(text, str):
+            return {}
+        return _parse_top_activity(text)
+
+    def _window_size(self) -> tuple[int, int]:
+        """屏幕宽高 (width, height)。拿不到返回 (0, 0)，绝不允许卡住。
+
+        ★⚠️ `u2.window_size()` 返回的是 **(height, width)**，不是 (width, height)！
+             实测：设备 1904x3040，它返回 (3040, 1904)。
+             早先直接拿它当宽高用，于是"屏幕宽度"变成 3040 —— 落在屏幕外侧的
+             x=2913 被判成合法坐标，点下去毫无反应，落点判据永远不满足，
+             表现就是"一直点同一个按钮"。这里以**短的当宽**。
+        """
+        try:
+            size = self._call_with_timeout(
+                self._d.window_size, timeout=6.0, label="window_size")
         except Exception:  # noqa: BLE001
             return 0, 0
-        m = re.search(r"Override size:\s*(\d+)x(\d+)", out) or \
-            re.search(r"Physical size:\s*(\d+)x(\d+)", out)
-        if not m:
+        try:
+            a, b = int(size[0]), int(size[1])
+        except Exception:  # noqa: BLE001
             return 0, 0
-        return int(m.group(1)), int(m.group(2))
+        # 取短的作宽：手机竖屏时宽一定小于高，横屏时同理
+        return (a, b)
+
+    def _dump_hierarchy(self, timeout: float = 20.0) -> str:
+        """dump 界面 XML。**必须有上限**，不许无限重试。
+
+        ⚠️ 与 _app_current / _window_size 同一个坑，这是第三处：
+
+            _do_dump_hierarchy (uiautomator2/__init__.py:136)
+            __retry_internal (retry/api.py:35)      ← 无限重试
+            dump_hierarchy (uiautomator2/__init__.py:120)
+            observe (direct.py:349)
+
+        实测卡死：用例跑到 s3 的第一次观察就停住，进程活着、
+        设备停在原页不动、日志不再增长 —— 看起来像"一直在点完成"，
+        实际是**一次都没点**，全卡在观察里。
+
+        做法：放到有超时的线程里跑。超时就抛，由 observe 的调用方处理。
+        uiautomator2 的 jsonrpc 有自己的 HTTP 超时，但 retry 装饰器会把
+        超时当"可重试"继续打，所以只能在**外面**再加一道硬墙。
+        """
+        result: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                result["xml"] = self._d.dump_hierarchy()
+            except BaseException as exc:  # noqa: BLE001
+                result["err"] = exc
+
+        th = threading.Thread(target=work, daemon=True, name="dump_hierarchy")
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            raise TimeoutError(f"dump_hierarchy 超过 {timeout:.0f}s 未返回（uiautomator2 在无限重试）")
+        if "err" in result:
+            raise result["err"]
+        return str(result.get("xml") or "")
+
+    def _screenshot(self, path: str, timeout: float = 15.0) -> bool:
+        """截图。同样加硬超时 —— 截图失败不该中断执行，但也不该卡死。"""
+        done: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                self._d.screenshot(path)
+                done["ok"] = True
+            except BaseException:  # noqa: BLE001
+                done["ok"] = False
+
+        th = threading.Thread(target=work, daemon=True, name="screenshot")
+        th.start()
+        th.join(timeout)
+        return bool(done.get("ok")) and not th.is_alive()
 
     def observe(self, *, name: str | None = None, with_shot: bool = True) -> Screen:
         """看一眼：XML + 截图落盘，返回可点清单。
@@ -346,22 +559,58 @@ class DirectDevice:
         meta_path = outdir / "meta.json"
 
         t0 = time.time()
-        xml = self._d.dump_hierarchy()
+        _dbg = _debug_log()
+        if _dbg:
+            _dbg(f"observe[{tag}] 开始")
+        # ★ dump 超时 -> 重试一次再放弃。
+        #   为什么重试：u2 卡住多半是那条 jsonrpc 连接僵了，重开通常就好了。
+        #   为什么只重试一次：两次都拿不到，说明设备/uiautomator 服务真有问题，
+        #   再多试只是把"卡死"换成"慢慢卡死"。
+        last: Exception | None = None
+        xml = ""
+        for attempt in (1, 2):
+            try:
+                t_dump = time.time()
+                xml = self._dump_hierarchy(timeout=20.0)
+                if _dbg:
+                    _dbg(f"observe[{tag}] dump 成功 "
+                         f"{(time.time() - t_dump) * 1000:.0f}ms")
+                last = None
+                break
+            except TimeoutError as exc:
+                last = exc
+                if _dbg:
+                    _dbg(f"observe[{tag}] dump 超时（第 {attempt} 次）：{exc}")
+                if attempt == 1:
+                    time.sleep(1.0)
+        if last is not None:
+            # 抛给调用方（runner 会把它变成 BLOCKED 并写明原因），
+            # 绝不能返回一个空界面让上层误以为"屏幕上什么都没有"。
+            raise TimeoutError(
+                f"observe 拿不到界面（dump_hierarchy 连续两次超时）：{last}"
+            ) from last
         xml_path.write_text(xml, encoding="utf-8")
 
+        t_cur = time.time()
         cur = self._app_current() or {}
+        if _dbg:
+            _dbg(f"observe[{tag}] app_current {(time.time() - t_cur) * 1000:.0f}ms "
+                 f"-> {cur.get('activity')}")
         try:
+            t_ws = time.time()
             w, h = self._window_size()
+            if _dbg:
+                _dbg(f"observe[{tag}] window_size {(time.time() - t_ws) * 1000:.0f}ms "
+                     f"-> {w}x{h}")
         except Exception:  # noqa: BLE001
             w = h = 0
 
         shot: str | None = None
         if with_shot:
-            try:
-                self._d.screenshot(str(shot_path))
+            # ★ 只有真截到了才把路径记下来。
+            #   之前无条件写 shot=路径，截图失败时下游会去读一个不存在的文件。
+            if self._screenshot(str(shot_path)):
                 shot = str(shot_path)
-            except Exception:  # noqa: BLE001  截图失败不该中断执行
-                shot = None
 
         clickable, rotation = parse_clickable(xml_path, fg_package=cur.get("package", ""))
 
@@ -374,10 +623,13 @@ class DirectDevice:
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
                              encoding="utf-8")
 
-        return Screen(xml_path=str(xml_path), activity=cur.get("activity", ""),
-                      package=cur.get("package", ""), width=w, height=h,
-                      rotation=rotation, shot_path=shot, clickable=clickable,
-                      ts=time.time())
+        scr = Screen(xml_path=str(xml_path), activity=cur.get("activity", ""),
+                     package=cur.get("package", ""), width=w, height=h,
+                     rotation=rotation, shot_path=shot, clickable=clickable,
+                     ts=time.time())
+        # 记住这一屏：act 里要用它把坐标反查成控件（账本的可读性靠它）
+        self._last_screen = scr
+        return scr
 
     # -- 权限 ---------------------------------------------------------------
     def _perm_owner(self) -> str:
@@ -440,7 +692,47 @@ class DirectDevice:
         # ★ 归属包名：此刻前台还是**发起申请的那个 App**（权限框还没弹）
         owner = self._perm_owner()
 
-        self._d.click(int(x), int(y))
+        _dbg = _debug_log()
+        _t_all = time.time()
+
+        # 点之前先把"要点的控件"查出来 —— 坐标对人是无意义的，
+        # 账本里必须写清那是「同意」还是「完成」（见 ledger.py 的说明）。
+        _pre = None
+        try:
+            _pre = self._last_screen
+        except Exception:  # noqa: BLE001
+            _pre = None
+        _tgt = (target_from_screen(_pre, x, y) if _pre is not None
+                else {"c": [int(x), int(y)]})
+        _act_before = getattr(_pre, "activity", "") if _pre else ""
+        # ★ 没有上一屏时（会话第一次动作）用 dumpsys 补一个"点击前".
+        #
+        # 不补的话 `_act_before` 是空串，账本里 changed 就是 None，
+        # 于是"这次点击有没有进展"完全没法判断 —— 后面所有基于
+        # changed 的机制（强证据熔断、死循环检测）在这一条上都失灵。
+        # 而"会话第一次动作"恰恰是最容易失败的（冷启动、首屏还没稳）。
+        if not _act_before:
+            _act_before = self._app_current().get("activity", "")
+        # _pre 为空时，控件的语义（这是「完成」还是「允许」）也没法从旧屏拿，
+        # 账本里就只能记坐标 —— 由 _tgt 已经处理（只有 c）。
+
+        if _dbg:
+            _dbg(f"act 点击 ({x},{y}) "
+                 f"{_tgt.get('text') or _tgt.get('rid') or '?'} {why[:50]}")
+
+        t_click = time.time()
+        try:
+            self._d.click(int(x), int(y))
+        except Exception as exc:  # noqa: BLE001
+            if self._ledger is not None:
+                self._ledger.record(
+                    step=str(_.get("step") or ""), action="click", target=_tgt,
+                    before=_act_before, after="", ms=(time.time() - t_click) * 1000,
+                    changed=None, why=why, extra={"error": str(exc)[:200]})
+            raise
+        _ms_click = (time.time() - t_click) * 1000
+        if _dbg:
+            _dbg(f"act 点击完成 {_ms_click:.0f}ms")
 
         # ★ 抢在 6 秒窗口内处理权限框
         perm_result = None
@@ -453,7 +745,62 @@ class DirectDevice:
                 # 记下来让上层知道"这次没看清权限框"，而不是假装没发生。
                 perm_result = {"error": str(exc)[:200]}
 
+        t_obs = time.time()
+        # ★ 点击后**等 1 秒**再截图/dump，否则会把有效点击误判成"没反应"。
+        #
+        # 用户原话：「每个操作等 1s 再截图和 dump xml 就比较稳定了」。
+        # 这是踩出来的经验，不是拍脑袋的缓冲：
+        #
+        #   176 s5：点周视图空格子 -> **1.1 秒后**才跳到 EditCourseActivity。
+        #   原来 click 完立刻 observe，dump 到的是旧页面，记账 changed=False，
+        #   模型以为没反应就换个格子再点，连点 15 格全判无效 -> BLOCKED。
+        #   而同一个坐标手动点**能进** —— 所以不是控件点不动，是**看得太早**。
+        #
+        # 我也试过"轮询 activity 一变就返回"（更省时间），实测不可靠：
+        # 界面在过渡期时 activity 的读数本身就跳，轮询拿到的值不足以判断
+        # "已经稳定"。固等一秒简单、可预测，代价是每次点击 +1s ——
+        # 一条二三十次点击的用例多 20 秒，但换来的是不再误判，
+        # 这个交换是划算的（比 BLOCKED 后人工重跑便宜得多）。
+        time.sleep(1.0)
+
         scr = self.observe()
+        _ms_obs = (time.time() - t_obs) * 1000
+        if _dbg:
+            _dbg(f"act 点击后 等1s+observe {_ms_obs:.0f}ms -> {scr.activity}")
+
+        # ★ 记账：一次点击一条，含前后页面和"有没有进展"
+        #
+        # `changed` 的语义是**有没有进展**，不只是"跳没跳页"：
+        #   · activity 变了              -> 有进展
+        #   · 可点控件清单变了            -> 有进展（弹了对话框、键盘收起、多出个按钮）
+        #   · 可点控件的文字变了          -> 有进展（按钮从「保存」变「已完成」）
+        #
+        # 为什么不能只看 activity：176 的 `save_view` 点了 37 次，
+        # activity 一次都没变 —— 但中间也不能排除"多了个错误提示"这种情况。
+        # 只看 activity 会把它当成"完全没反应"，可能会误判成因。
+        # 反过来，只有**全都没变**才是真·无效动作，那才是该叫模型的时候。
+        if self._ledger is not None:
+            _sig_before = _clickable_sig(_pre)
+            _sig_after = _clickable_sig(scr)
+            self._ledger.record(
+                step=str(_.get("step") or ""),
+                action="click",
+                target=_tgt,
+                before=_act_before,
+                after=scr.activity,
+                ms=(time.time() - _t_all) * 1000,
+                changed=(
+                    None if not _act_before
+                    else (_act_before != scr.activity or _sig_before != _sig_after)
+                ),
+                why=why,
+                extra={"ms_click": round(_ms_click, 1),
+                       "ms_observe": round(_ms_obs, 1),
+                       "sig": _sig_after,
+                       "perm": (perm_result or {}).get("result")
+                       if isinstance(perm_result, dict) else None},
+            )
+
         return ActResult(ok=True, activity=scr.activity, next=scr.clickable,
                          event_ids=[], checkpoint=None, executed=True,
                          error=None, permission=perm_result,
@@ -466,6 +813,64 @@ class DirectDevice:
         if not n:
             return None
         return self.act(n["c"][0], n["c"][1], why=f"rid={rid}")
+
+    def input_text(self, rid: str, text: str, *,
+                   scr: Screen | None = None) -> ActResult | None:
+        """在 rid 那个输入框里填入 text。找不到控件返回 None。
+
+        为什么要这个（实测踩到）：
+            日历「新建课程表」的名称是必填项。执行器只有"点"没有"输入"，
+            于是点了「完成」被校验拦住、页面不动，落点判据永远不满足，
+            看起来就是"一直在点完成"。根子不是执行器笨，是它**没有输入这个动作**。
+
+        ⚠️ 中文怎么填 —— 这里踩过两次坑，别再改回去：
+
+          ① `adb shell input text 中文` **无效**。Android 的 input text 只送
+             ASCII，中文会被静默丢弃（实测：英文 HelloTest 进去了，中文没有，
+             不报错）。所以不能靠 shell 灌字。
+
+          ② uiautomator2 的 `setText`（jsonrpc）**可以**。它走 uiautomator
+             服务的 AccessibilityNodeInfo.setText，不经过 ADB 的文本输入通道，
+             所以 Unicode 没问题。
+
+        做法：先点进输入框拿焦点，再用 u2 的 setText 覆盖写入。
+        """
+        s = scr or self.observe()
+        n = s.find_rid(rid)
+        if not n:
+            return None
+
+        cx, cy = int(n["c"][0]), int(n["c"][1])
+
+        # 1) 点进输入框（有些输入框不获得焦点就不接受 setText）
+        self._call_with_timeout(
+            lambda: self._d.click(cx, cy), timeout=10.0, label="input 点击")
+        time.sleep(0.3)
+
+        # 2) 用 uiautomator 服务写入（支持中文）。
+        #    找不到元素时退回"当前聚焦的输入框" —— 点了之后通常就是它。
+        full = n.get("rid_full") or ""
+        if not full and "." in rid:
+            full = rid
+        sel = {"resourceId": full} if full else {"focused": True}
+        try:
+            self._call_with_timeout(
+                lambda: self._d(**sel).set_text(str(text)),
+                timeout=15.0, label="input set_text")
+        except Exception:  # noqa: BLE001  退回聚焦控件再试一次
+            self._call_with_timeout(
+                lambda: self._d(focused=True).set_text(str(text)),
+                timeout=15.0, label="input set_text(focused)")
+        # ★ 输入完同样等 1 秒再看 —— 和点击一个道理：
+        #   键盘收起、正文上屏都有动画，立刻 dump 拿到的可能还是旧内容，
+        #   后续判断就会以为"没填进去"。
+        time.sleep(1.0)
+
+        scr2 = self.observe()
+        return ActResult(ok=True, activity=scr2.activity, next=scr2.clickable,
+                         event_ids=[], checkpoint=None, executed=True,
+                         error=None, permission=None,
+                         package=scr2.package, xml_path=scr2.xml_path)
 
     def click_xpath(self, expr: str, *, scr: Screen | None = None) -> ActResult | None:
         """按 XPath 点。**必须命中唯一一个**，否则返回 None。
@@ -529,7 +934,8 @@ class DirectDevice:
             outdir = self.evidence_dir / f"ocr{self._n + 1:02d}"
             outdir.mkdir(parents=True, exist_ok=True)
             img = str(outdir / "shot.png")
-            self._d.screenshot(img)
+            if not self._screenshot(img):
+                return []   # 截不到图就没得 OCR —— 返回空，由上层按"没识别到字"处理
 
         out = self._engine()(str(img))
         res: list[dict[str, Any]] = []
@@ -577,9 +983,22 @@ class DirectDevice:
         return self._n
 
     def shell(self, command: str, timeout: int = 60) -> str:
-        """跑一条 adb shell 命令（仅用于前提准备/恢复，不用于测试动作）。"""
-        import adbutils
-        return adbutils.adb.device(self.serial).shell(command)
+        """跑一条 shell 命令 —— **经 uiautomator2 转发**，不自己起 adb。
+
+        仅用于前提准备/恢复（清数据、拉起 App、改设置），**不用于测试动作**。
+        测试动作一律走 act / input_text / key / swipe，那些有坐标校验、
+        有落点复核、有账本记录，走 shell 就把这些保障全绕过去了。
+
+        ⚠️ 不许换成 `adbutils.adb.device().shell()`：
+          那是另一条通道，且不带超时（底层 @retry 无限重试，实测能卡 20 分钟）。
+          u2 的 `d.shell()` 是同一条通道但能包超时，用户定的规矩也是走 u2。
+
+        ⚠️ 这里**不是** "允许调 adb" 的例外口子。真需要 adb logcat
+          就单独说明，别拿 shell 塞任意命令进来。
+        """
+        return self._call_with_timeout(
+            lambda: self._d.shell(str(command)),
+            timeout=float(timeout), label=f"shell {str(command)[:40]}")
 
     def connected(self) -> tuple[bool, str]:
         try:

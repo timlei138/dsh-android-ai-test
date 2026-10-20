@@ -57,11 +57,20 @@ def _make_logger(log_path: Path | None):
 
     落盘是为了后台跑的时候能随时 tail 看进度；
     之前没有日志，出问题只能靠猜（实测卡在点击循环里看不出来）。
+
+    ⚠️ 用追加模式，**不是覆盖**。
+    踩过：`open("w")` 下同一条用例跑第二次，第一次的日志就被清掉了 ——
+    而"第一次跑挂了、第二次跑好了"恰恰是最需要对比两次日志的时候。
+    现在每条用例的日志都留着，靠开头的分隔行区分是哪一次。
     """
     fh = None
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = log_path.open("w", encoding="utf-8", buffering=1)
+        fh = log_path.open("a", encoding="utf-8", buffering=1)
+        # 每次运行都打一条明显的分隔，否则连续跑两次分不清哪段是哪次
+        fh.write(f"\n{'=' * 70}\n"
+                 f"运行开始 {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                 f"{'=' * 70}\n")
 
     def log(msg: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {msg}"
@@ -323,9 +332,17 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     # ★ 默认用 DirectDevice：in-process 直调库，不起 subprocess。
     #   老 RealDevice（每步 subprocess 调 run.py）仍保留在 device/bridge.py，
     #   需要会话台账/审计时可用 device=RealDevice(...) 显式注入。
+    # ★ 点击账本：每次点击一条完整记录（控件 / 前后页面 / 耗时 / 画面变没变）。
+    #   用户明确要求过"每一步点击了啥都要增加记录，好方便排查" ——
+    #   只写坐标对人是没意义的，必须记清点到的是什么控件、点完变成了什么。
+    ledger_path = root / f"clicks_{spec.case_id}.jsonl"
+    if ledger_path.exists():
+        ledger_path.unlink()      # 每次运行重新记，别把上次的混进来
+
     dev = device if device is not None else DirectDevice(
         serial=serial,
-        evidence_dir=Path(report_path).parent / "shots" if report_path else None)
+        evidence_dir=Path(report_path).parent / "shots" if report_path else None,
+        ledger_path=ledger_path)
 
     if device is None:
         ok, why = dev.connected()
@@ -644,7 +661,17 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                                 f"「{ans.get('dialog_text') or '(未说明)'}」")
                     recent.append(key)
             else:
-                log(f"           -> 无动作：{ans}")
+                # ⚠️ 这里以前一律打 "无动作"，把三种完全不同的情况混成一句，
+                #    排查时会被带偏（176 就是：模型明明给了 input_rid，
+                #    日志却说"无动作"，看着像模型没说，其实是路由吞了）。
+                if str(ans.get("input_rid") or "").strip():
+                    log(f"           -> 输入 {ans.get('input_rid')}"
+                        f" ⇐「{ans.get('input_text')}」")
+                elif ans.get("key"):
+                    log(f"           -> 按 {ans.get('key')} 键")
+                else:
+                    log(f"           -> 无动作（模型既没给坐标、也没给"
+                        f"输入/按键/完成）：{ans}")
         elif kind == "assert":
             # ★ unknown 不能打成 FAIL —— 那是替产品下结论。
             # 日志是主 Agent/人第一时间看的，写错方向会把"没验成"
@@ -815,6 +842,19 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
             for d in report.dialogs_dismissed:
                 log(f"     - {d.get('text') or '(未说明)'}"
                     f"  坐标({d.get('x')},{d.get('y')})")
+
+        # ★ 点击账本 —— 排查问题时先看这一段。
+        #
+        # 为什么值得打进日志：用户排障时最常问的就是"它到底点了什么、
+        # 为什么点这个、点完有没有反应"。光看 `-> 点 (1795,1583)`
+        # 是答不出来的 —— 那是像素，不是控件。
+        _lg = getattr(dev, "ledger", None)
+        if _lg is not None and _lg.rows():
+            log("")
+            log(f"🖱️ 点击账本（共 {len(_lg.rows())} 次）：")
+            for _ln in _lg.render().splitlines():
+                log("   " + _ln)
+            log(f"   完整记录：{ledger_path}")
         log(f"报告：{report_path}")
         log(f"日志：{log_path}")
     log.close()

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -65,25 +66,50 @@ except Exception:  # noqa: BLE001
 
 
 def _pick_device() -> str | None:
-    """与 run_168_model.py 一致：环境变量优先，否则用唯一在线设备。"""
-    import os
-    import subprocess
+    """环境变量优先，否则用唯一在线且**u2 真能连上**的设备。
 
+    ★ 不再 `adb devices`。
+
+    规矩：设备操作一律走 uiautomator2，只有 adb logcat 例外。
+    何况 `adb devices` 列得出设备**不代表 u2 连得上** —— 授权了但
+    uiautomator 服务没起来很常见。这里选出来的设备要交给 DirectDevice 用，
+    那就该用同一条通道验它真能用。
+
+    ## 怎么枚举
+
+    `uiautomator2` 没有公开的 list_devices，枚举这件事交给 adbutils
+    的 `adbd.list()`。⚠️ 这一步**只读设备列表，不执行任何设备操作**，
+    拿到 serial 之后一律 `u2.connect(serial)` 用 u2 去验。
+    """
     env = os.environ.get("ANDROID_SERIAL")
     if env:
         return env
-    adb = os.environ.get("ADB") or r"D:\AndroidSdk\platform-tools\adb.exe"
+
+    serials: list[str] = []
     try:
-        out = subprocess.run([adb, "devices"], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=30).stdout
-    except Exception:
+        import adbutils
+
+        for info in adbutils.adb.list():
+            s = getattr(info, "serial", None) or str(info)
+            if not s or s == "None":
+                continue
+            # 这些是状态字，不是设备
+            if s in ("adb", "devices", "List", "of", "attached"):
+                continue
+            serials.append(s)
+    except Exception:  # noqa: BLE001
         return None
-    online = []
-    for line in (out or "").splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == "device":
-            online.append(parts[0])
-    return online[0] if len(online) == 1 else None
+
+    usable: list[str] = []
+    for s in serials:
+        try:
+            import uiautomator2 as u2
+            d = u2.connect(s)
+            d.window_size()          # 真探一下，连不上就抛
+            usable.append(s)
+        except Exception:  # noqa: BLE001  连不上/未授权 -> 跳过
+            continue
+    return usable[0] if len(usable) == 1 else None
 
 
 def _run_locked(*, spec, answer, serial, skill_root, spec_in,

@@ -87,16 +87,29 @@ ck("unknown 不被打成 FAIL", "判不了（模型回复无法解析" in _src)
 
 print()
 print("=" * 66)
-print("问题4：严格 JSON 必须是**服务端强制**，不是靠提示词自觉")
+print("问题4：结构化输出必须是**服务端强制**，不是靠提示词自觉")
 print("=" * 66)
 _src = io.open(str(Path(__file__).resolve().parents[1] / "src" / "android_agent" / "agent" / "decide.py"), encoding="utf-8").read()
-ck("请求里带 response_format=json_object", '"response_format"' in _src
-   and '"json_object"' in _src)
-ck("发送前校验 prompt 含 json（否则不发，避免 400）",
-   '_want_json_mode' in _src)
-ck("json_object 值写死在代码里（不受 prompt 内容影响）",
-   '_payload["response_format"] = {"type": "json_object"}' in _src)
+# ★ 现在有两条结构化路线，测试要覆盖两条：
+#   · 传了 tools  -> function calling，参数形状由服务端按 schema 约束
+#   · 没传 tools  -> 退回 json_object 正文模式
+# 任一条丢了都会退化回"模型自由发挥、我们拿正则去解析"的老路。
+ck("走 tools 时下发 tools + tool_choice",
+   '_payload["tools"] = tools' in _src and '"tool_choice"' in _src)
+ck("tools 与 json_object 互斥（不同时开）",
+   "if tools:" in _src
+   and '_payload["response_format"] = {"type": "json_object"}' in _src)
+ck("不发 tools 时：发送前校验 prompt 含 json（否则不发，避免 400）",
+   '"json" in _all_text' in _src)
 ck("提示词要求字符串内双引号必须转义", "必须转义成" in _src)
+
+_tools_src = io.open(str(Path(__file__).resolve().parents[1] / "src" / "android_agent" / "agent" / "tools.py"), encoding="utf-8").read()
+ck("工具清单含 type_text（填必填框的正解）",
+   '"name": "type_text"' in _tools_src)
+ck("type_text 说明里明确写了不要用 tap 点输入框",
+   "不要用 tap 点输入框" in _tools_src)
+ck("未知工具名报错而不是猜",
+   "模型调用了不存在的工具" in _tools_src)
 
 print()
 print("=" * 66)

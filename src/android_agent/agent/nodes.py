@@ -42,6 +42,14 @@ MAX_KNOWLEDGE_LOOKUPS = 8
 # 继续试只是在烧时间，而且会让"关键路径没找到"这个结论变模糊。
 LANDING_MAX_TRIES = 3
 
+# 同一个强证据目标连续点几次没效果，就不再直点、改问模型。
+#
+# 为什么是 2 而不是 3：点击本身约 200ms，观察约 800ms，一次往返 1 秒多。
+# 两次都没反应（2 秒过去了，屏幕连 activity 都没换）已经足够说明
+# "不是页面没加载完"，第三种可能只剩"有前置条件没满足" —— 那正是模型该介入的场景。
+# 176 实测：这个值设成无穷大时点了 37 次，白花 70 秒且毫无进展。
+STRONG_MAX_SAME_TARGET = 2
+
 # --------------------------------------------------------------------------
 # 主 Agent -> 子 Agent 的任务包
 # --------------------------------------------------------------------------
@@ -1866,7 +1874,19 @@ def decide_node(state: ChildState) -> dict[str, Any]:
             "这一步完成了吗？"
             "① 完成了 -> step_done=true；"
             "② 需要点屏幕 -> 给 next_x/next_y（必须取自 clickable[].c）与 why；"
-            "③ **当前页面走不通/已经偏离到别的 App** -> "
+            # ★ 输入文字：必填项的正解。缺了它模型只能一直点输入框。
+            #
+            # 176 实测（两轮都是这个病）：模型每次都把原因说得完全正确 ——
+            #   「名称是必填项，先点进输入框让键盘弹出，才能输入文字」
+            # 然后它的动作是 `点 (1520,375)`。因为**动作清单里没有"输入"这一项**。
+            # 点输入框界面不会变 -> 被当成无效动作 -> 连点 3 次被熔断 -> BLOCKED。
+            #
+            # 教训：模型想到了要做什么，还得有对应的**手段**交给它。
+            #      只把话写在 schema 的 description 里不够 —— 模型读的是这段 question。
+            "③ 需要**往输入框里填文字** -> 给 input_rid（输入框的 rid，取自 "
+            "clickable[].r）和 input_text（要填的内容），**不要给 next_x/next_y**。"
+            "这一步只负责填，填完下一轮再决定要不要点保存；"
+            "④ **当前页面走不通/已经偏离到别的 App** -> "
             "不要死点语义不明的图标，直接给 key=\"back\" 退回上一层，"
             "必要时 key=\"home\" 回桌面再重新进入 App。"
             # ★ 弹窗的定位（用户定的分工）：
@@ -1886,6 +1906,37 @@ def decide_node(state: ChildState) -> dict[str, Any]:
     answer = interrupt(payload, response_schema=StepAction)
     if isinstance(answer, StepAction):
         answer = answer.model_dump()
+
+    # ★★★ 代码兜底：模型只说"要输入"却给了坐标 -> 由代码改成输入动作 ★★★
+    #
+    # ## 为什么需要这条（不是模型不够聪明）
+    #
+    # 176 两轮实测，模型**每次判断都对**，原话：
+    #   「名称是必填项，先点进 et_schedule_name 输入框让键盘弹出，才能输入文字」
+    # 然后它给的动作是 `点 (1520,375)`。
+    #
+    # 它想干的事（输入）和能表达的动作（点坐标）对不上。
+    # 我在 question 里加了 ③ 输入分支之后它可能就会用了，但**不能只靠它自觉**——
+    # 用户在这一点上说得非常清楚：规则要用代码约束，不靠模型自觉。
+    #
+    # 所以这里做一层翻译：**意图已经明确要输入，就给输入**。
+    #
+    # ## 判据（必须保守，不能瞎猜）
+    #
+    # 三条同时成立才转换：
+    #   ① 模型没给 input_rid（给了说明它自己会用，不用管）
+    #   ② 模型给了坐标，且那个坐标上的控件**是个输入框**（class 含 EditText）
+    #   ③ 模型的 why 里明确出现了"输入/填写/键入"这类意图词
+    #
+    # ②是关键：只有点到的是真输入框才转换。点普通按钮时坐标不是输入框，
+    #      这条自然不生效，不会把"点保存"错改成"往保存按钮里写字"。
+    #
+    # ## 填什么内容
+    #
+    # 模型在 why 里通常写了要填的值（引导语也教了）。这里从 why 的反引号
+    # /「」里取，取不到就用占位符文字反推。
+    # 取不到内容就**不转换**（宁可让模型下一轮自己说清楚，也不瞎填）。
+    answer = _coerce_input_intent(answer, state)
     return {"action": answer}
 
 
@@ -1907,6 +1958,23 @@ class StepAction(BaseModel):
         description=("系统级按键动作，不点屏幕：back（返回，离开当前页最可靠）、"
                      "home（回桌面）。当屏幕上找不到合适的控件、或需要退出"
                      "当前 App/页面时**优先用它**，不要去点语义不明的图标。"),
+    )
+    # ★ 输入文字：遇到输入框（必填项）必须能填内容，否则永远过不去。
+    #
+    # 为什么必须有（176 卡住的直接原因）：日历「新建课程表」的名称是必填项，
+    # 执行器当时只有"点"没有"输入"，于是点了「完成」被校验拦住、页面不动，
+    # 落点判据永远不满足，看起来就是"一直在点完成"。
+    # 加了这个字段，模型可以像人一样"先填名称再点完成"。
+    input_rid: str | None = Field(
+        default=None,
+        description=("要输入文字的控件 rid（如 et_schedule_name）。"
+                     "和 input_text 一起用；设了它就不要再给 next_x/next_y。"),
+    )
+    input_text: str | None = Field(
+        default=None,
+        description=("要填进去的文字（如「测试课程表」）。"
+                     "遇到必填输入框就**先把内容填上再继续**，"
+                     "不要反复点提交按钮硬试 —— 点了也不会通过校验。"),
     )
     why: str = ""
     expect: str | None = Field(default=None, description="落点判据")
@@ -1999,6 +2067,33 @@ def act_node(state: ChildState) -> dict[str, Any]:
     """
     dev = _ctx().device
     action = state.get("action") or {}
+
+    # ★ 输入文字动作：填必填输入框。
+    #
+    # 顺序上放在最高优先级 —— 模型说"先填名称"时，这一轮就只做填，不要又去点。
+    # 填完之后**不清 action.step_done**，下一轮照常由模型决定点不点提交。
+    _irid = str(action.get("input_rid") or "").strip()
+    _itext = action.get("input_text")
+    if _irid and _itext is not None and not action.get("step_done"):
+        try:
+            res = dev.input_text(_irid, str(_itext))
+        except (ToolError, AttributeError, TypeError) as exc:
+            return {"issues": [f"输入 {_irid} 失败：{exc}"],
+                    "action": {**action, "acted": False, "error": str(exc)}}
+        if res is None:
+            return {"issues": [f"输入 {_irid} 失败：当前屏找不到这个控件"],
+                    "action": {**action, "acted": False,
+                               "error": f"找不到 {_irid}"}}
+        return {
+            "action": {**action, "acted": True,
+                       "event_ids": res.event_ids,
+                       "checkpoint": res.checkpoint},
+            "last_activity": res.activity,
+            "last_event_ids": res.event_ids,
+            "last_package": getattr(res, "package", "") or "",
+            "obs_clickable": res.next or state.get("obs_clickable", []),
+            # 不写 action_trace：输入不是"点"，回写 YAML 时不该被当成点击动作
+        }
 
     # 系统键动作（back/home）：没有坐标，走 dev.key 而不是 dev.act。
     #
@@ -2729,6 +2824,7 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
     #    放后面的话 done 分支已经 return 了，永远走不到（写完测试才发现的）。
     if done and issues and not state.get("fallback_reason"):
         tried = state.get("retry_landing", 0)
+
         if tried + 1 < LANDING_MAX_TRIES:
             return {
                 "retry_landing": tried + 1,
@@ -3702,18 +3798,45 @@ def route_after_start_check(state: ChildState) -> Literal["prep_apply", "decide"
     return "plan"
 
 
-def route_after_decide(state: ChildState) -> Literal["knowledge", "act", "check"]:
+def route_after_decide(
+        state: ChildState) -> Literal["knowledge", "vision", "act", "check"]:
     # ⚠️ 读 action，不是 pending —— 字段重命名后这里漏改过，
     # 导致三个路由全部落到 check、act 永远不被调用（真机表现为"只观察不动作"）。
     a = state.get("action") or {}
     if a.get("need_knowledge"):
         return "knowledge"
+    # ★ 模型要看图 -> 去 vision 节点，让它真的看到。
+    #
+    # 这个坑和 key / input_rid **是第三个同一个坑**：
+    # 模型给了一个"不需要坐标的合法动作"，而路由只认坐标，于是判成
+    # "没动作"，日志打 `-> 无动作：{'vision_question': '屏幕右侧弹出的菜单…'}`。
+    # 模型连着 4 轮都在请求看图（176 轮 05~08），一次都没看到，
+    # 只能反复猜菜单里有什么，白烧 20 秒。
+    #
+    # 教训已经写在这条路由里三次了，这次说清楚：
+    #   **action 里任何一个"能单独构成动作"的字段，都必须在这条路由里有分支。**
+    #   现在的全集：need_knowledge / vision_question / step_done /
+    #               key / input_rid / next_x
+    if a.get("vision_question"):
+        return "vision"
     if a.get("step_done"):
         return "check"
     # ★ 系统键动作没有坐标，但**必须去 act 执行**。
     # 只判 next_x 的话，模型说"按返回"会被当成"没动作"直接送 check，
     # 于是动作静默丢失 —— 这正是 169 里"模型想退出相机却退不出去"的另一半原因。
     if a.get("key") or a.get("_key"):
+        return "act"
+    # ★ 输入动作同理：type_text 没有坐标，但必须是 act 去执行。
+    #
+    # 这个坑和上面 169 那个**一模一样**，我又犯了一次：
+    # 176 跑下来模型正确调用了 type_text(rid=et_schedule_name)，
+    # 而路由只判 next_x -> 判成"没动作" -> 送 check -> 输入从未发生。
+    # 日志里表现为 `-> 无动作：{... 'input_rid': 'et_schedule_name' ...}`，
+    # 看起来像模型什么都没说，实际上它说得完全正确，是路由把话吞了。
+    #
+    # 教训：**每加一种新的动作类型，必须同时加它的路由判据。**
+    #       动作有字段、路由不认，等于这个能力不存在。
+    if str(a.get("input_rid") or "").strip():
         return "act"
     if a.get("next_x") is None:
         return "check"
@@ -3861,6 +3984,47 @@ def strong_target_node(state: ChildState) -> dict[str, Any]:
     if x is None:
         return _ask_model(state, f"{sid} {how}")
 
+    # ★★★ 强证据直点的**退出条件** ★★★
+    #
+    # 用户原话：「强证据是为了减少 LLM 的调用。第一次的时候 YAML 应该能明白
+    #            要写课程名才能保存。这应该是坑。那就需要增加个机制。
+    #            如果强证据不能到预计那就让大模型介入。而不是一直无用的点。」
+    #
+    # 这段话把机制的目的说透了，值得单独写清楚，因为它极易被写歪：
+    #
+    #   强证据 = **省一次模型调用**，不是"永远不叫模型"。
+    #   一旦代码发现自己到不了预期（点完还是原样），就必须让模型接手。
+    #
+    # 我第一版就写歪了：加了"命中唯一就点"却没有任何退出条件，
+    # 结果 176 死点「完成」37 次、白跑 70 秒。点完页面纹丝不动，
+    # 代码仍然认为"这次命中的是唯一的，那就再点一次"—— 它不知道
+    # **"点得中"和"点了有用"是两件事**。
+    #
+    # ## 退出判据：连续 N 次**没有进展**
+    #
+    # "进展"不只指跳页。以下任一都算进展，计数归零：
+    #   · activity 变了
+    #   · 可点控件清单变了（弹了个对话框、键盘收起也算）
+    #   · 落点判据更接近满足（这里简化为上面两条）
+    #
+    # 什么都不变 = 这个动作在**当前这个界面状态下**无效。
+    # 无效只有两种原因：① 有前置条件没满足（必填项、开关没开、要先选类型）
+    # ② 控件被挡住/不可点。
+    # **两种都不是"再点一次就好"** —— 继续点等于拿设备陪跑。
+    #
+    # 所以第三次之前必须交出去。阈值取 2：
+    # 一次往返约 1 秒，两次（2 秒）都没变化，已经足够排除"页面还没加载完"。
+    _tries = _strong_tries(state, sid, target)
+    if _tries >= STRONG_MAX_SAME_TARGET:
+        _now = state.get("last_activity") or "(未知)"
+        return _ask_model(
+            state,
+            f"{sid} 代码已经把这个目标点了 {_tries + 1} 次，"
+            f"**每次点完界面都毫无变化**（一直停在 {_now}）。"
+            f"说明「点它」这个动作在当前状态下根本不起作用 —— "
+            f"不是坐标错了，也不是没点中，而是缺了前置条件。"
+            f"代码不知道缺什么，这一步交给你判断。")
+
     return {
         "action": {
             "step_done": False, "next_x": x, "next_y": y,
@@ -3913,7 +4077,7 @@ def _resolve_strong_target(target: str, state: ChildState) -> tuple[int | None, 
         c = scr.xpath_center(want)
         if not c:
             return None, None, "xpath 命中的节点没有有效坐标"
-        return c[0], c[1], "xpath 命中唯一"
+        return _check_in_screen(scr, c[0], c[1], "xpath 命中唯一")
 
     # -- rid / text / desc：从可点清单找，必须唯一 ----------------------
     if key in ("rid", "r"):
@@ -3938,7 +4102,300 @@ def _resolve_strong_target(target: str, state: ChildState) -> tuple[int | None, 
     c = hits[0].get("c") or []
     if len(c) < 2:
         return None, None, f"{label}={want} 没有有效坐标"
-    return int(c[0]), int(c[1]), f"{label} 命中唯一"
+    return _check_in_screen(state, int(c[0]), int(c[1]), f"{label} 命中唯一")
+
+
+def _check_in_screen(state: ChildState | Any, x: int, y: int,
+                     how: str) -> tuple[int | None, int | None, str]:
+    """坐标必须落在屏幕内，否则拒绝直点。
+
+    ## 这一条不是 176 的解法，别搞错
+
+    176 点 37 次「完成」**不是**坐标越界 —— 实测 `save_view` 中心
+    就是 (2913,202)，屏幕 3040x1904（横屏），坐标完全正确、点击也确实送达
+    （每次 click 约 200ms 正常返回）。真正原因是**必填项没填**。
+
+    那为什么还要留这一条？
+
+    因为 `u2.window_size()` 返回的是 **(高, 宽)**：实测设备 1904x3040，
+    它给 (3040, 1904)。这是个真实存在的顺序陷阱 —— 一旦有人当 (宽, 高) 用，
+    "屏幕宽度"就成了 3040，屏幕外几十像素的坐标会被判成合法，
+    点了没反应还查不出原因。设备横竖屏切换时尤其容易踩。
+
+    所以这里是**防守性检查**，守的不是 176，而是将来不要重犯同一个错。
+    "找得到"（唯一性）和"点得中"（坐标合法）是两条独立的保证。
+
+    屏幕尺寸从落盘 XML 的 bounds 推（根节点没有 display_width/height，
+    实测过），推不出来就放行 —— 不因量不到屏幕让所有步骤瘫掉。
+    """
+    sw, sh = _screen_size_from_state(state)
+    if sw <= 0 or sh <= 0:
+        # 拿不到尺寸就不挡：宁可放行，也不因"量不到屏幕"让所有步骤瘫掉
+        return x, y, how
+    if 0 <= x < sw and 0 <= y < sh:
+        return x, y, how
+    return None, None, (
+        f"目标坐标 ({x},{y}) 在屏幕外（屏幕 {sw}x{sh}），拒绝直点 —— "
+        f"控件坐标不可信，需要模型换一种定位方式")
+
+
+def _screen_size_from_state(state: ChildState | Any) -> tuple[int, int]:
+    """从落盘 XML 推算屏幕尺寸。取不到返回 (0, 0)。
+
+    ⚠️ 不用 `u2.window_size()` —— 它返回的是 **(高, 宽)**，实测设备 1904x3040
+    它给 (3040, 1904)。这个顺序陷阱真实存在（横竖屏切换时必踩），
+    所以宁可自己从 XML 推，也不碰它一次。
+
+    ⚠️ XML 根节点**没有** display_width/display_height（实测这台设备的
+    dump 里根本没有这两个属性），所以退一步：**用所有节点的 bounds 推**。
+
+    可行性依据（实测）：这份 XML 有 89 个 bounds，最大右下角正好是
+    3040x1904 —— 也就是与控件坐标同一个坐标系下的屏幕尺寸。
+    根布局一定是满屏的，所以最大值可靠。
+
+    取不到就返回 (0,0)，调用方会放行（宁可放行，也不因量不到屏幕让全部步骤瘫掉）。
+
+    参数既可以是 state dict，也可以直接是 Screen 对象
+    （xpath 分支手上只有 Screen）。
+    """
+    xml_path = getattr(state, "xml_path", None) \
+        if not isinstance(state, dict) else state.get("obs_xml_path")
+    if not xml_path:
+        return 0, 0
+    try:
+        import re as _re
+        from pathlib import Path as _P
+
+        text = _P(xml_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return 0, 0
+    mx = my = 0
+    for m in _re.finditer(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', text):
+        mx = max(mx, int(m.group(3)))
+        my = max(my, int(m.group(4)))
+    if mx > 0 and my > 0:
+        return mx, my
+    return 0, 0
+
+
+def _strong_tries(state: ChildState, sid: str, target: str) -> int:
+    """这一步的这个目标，**连续几次点了都没有进展**？
+
+    强证据直点的退出判据就是它。返回值 >= STRONG_MAX_SAME_TARGET 时
+    必须把这一步交给模型（见 strong_target_node 里的说明）。
+
+    ## 数据来源：点击账本，不是 state 里的计数
+
+    这是踩过坑之后的决定。state 里那个 `retry_landing` 计数只在
+    "本步判定完成但落点不符"时累加 —— 而 176 每轮都是重新决策、
+    压根谈不上完成，于是它**一次都没涨**，37 次点击它全程是 0。
+    计数器的正确性取决于"每条路径都记得加"，这靠不住。
+
+    账本不一样：`act()` 里点一次写一条，没有旁路可绕。
+
+    ## 怎么算"一次都没进展"
+
+    看账本的 `changed` 字段。它的语义是"界面有没有实质变化"：
+
+        有的进展：activity 变了 / 可点控件清单变了 / 控件文字变了
+        没进展：  以上全都没变
+
+    从最后一条往前数，**连续没进展**的条数就是答案。中途有任何一条
+    有进展，或点的是别的控件，就停 —— 说明执行路径已经不在原地打转了。
+
+    ⚠️ 只数"这个目标"。点输入框、点别的按钮都不算进这个目标的账。
+    """
+    want = target.partition("=")[2].strip().strip('"\'')
+    want_tail = want.split("/")[-1]
+
+    try:
+        dev = getattr(_ctx(), "device", None)
+    except Exception:  # noqa: BLE001  没注入上下文（单测/离线）就当不知道
+        return 0
+    lg = getattr(dev, "ledger", None) if dev is not None else None
+    if lg is None:
+        return 0
+
+    n = 0
+    for row in reversed(lg.rows()):
+        tgt = row.get("target") or {}
+        rid = str(tgt.get("rid") or "")
+        if rid != want_tail and rid != want:
+            break          # 不是同一个目标 -> 连续性断了，停止计数
+        if row.get("changed"):
+            break          # 这一下有效果 -> 之前的不算"原地打转"
+        n += 1
+    return n
+
+
+def _coerce_input_intent(answer: dict[str, Any],
+                         state: ChildState) -> dict[str, Any]:
+    """模型说了"要输入"却只给坐标 -> 翻译成真正的输入动作。
+
+    见 decide 里调用处的说明。这里是**保守翻译**，条件不满足就原样返回。
+
+    ## 为什么要翻译而不是让模型重来
+
+    模型重来一轮要 8 秒左右，而它想表达的事情已经写在 `why` 里了 ——
+    只是动作字段对不上。既然意图明确、目标也明确（就是那个输入框），
+    代码代劳比让它再说一遍划算得多。这也是"用代码约束，不靠模型自觉"。
+
+    ## 什么情况下**不**翻译（宁可不做，不可做错）
+
+      · 模型已经给了 input_rid        -> 它自己会用，不插手
+      · 没有坐标                       -> 不是点击动作，不插手
+      · 坐标上不是输入框               -> 点的是普通按钮，绝不改写
+      · why 里没有输入意图             -> 意图不明，交回模型
+      · why 里取不到要填的内容         -> 不知道填什么，交回模型
+    """
+    if not isinstance(answer, dict):
+        return answer
+    if str(answer.get("input_rid") or "").strip():
+        return answer            # 模型自己会用，不动
+    x, y = answer.get("next_x"), answer.get("next_y")
+    if x is None or y is None:
+        return answer            # 不是点击
+    if answer.get("step_done") or answer.get("key"):
+        return answer
+
+    why = str(answer.get("why") or "")
+
+    # 意图词：模型说"要输入/填写/键入/填入"才算
+    INTENT = ("输入", "填写", "填入", "键入", "录入", "填上", "写入")
+    if not any(w in why for w in INTENT):
+        return answer
+
+    # 坐标上必须真的是输入框
+    rid, hint = _input_at(state, int(x), int(y))
+    if not rid:
+        return answer
+
+    # 要填什么：先从 why 里找，找不到就看输入框里的占位文字
+    text = _extract_fill_text(why, hint)
+    if not text:
+        return answer
+
+    out = dict(answer)
+    out["input_rid"] = rid
+    out["input_text"] = text
+    # ⚠️ 必须清掉坐标，否则 act 会先走输入分支、这一轮不点 ——
+    #    但下一轮坐标还在状态里容易被误当成"还没执行"。
+    out["next_x"] = None
+    out["next_y"] = None
+    out["why"] = (f"{why}｜（代码转换：这其实是往 {rid} 里输入「{text}」，"
+                  f"已改成 input_rid/input_text）")
+    out["_coerced_input"] = True
+    return out
+
+
+def _input_at(state: ChildState, x: int, y: int) -> tuple[str, str]:
+    """(x,y) 落在哪个输入框里？返回 (rid, 占位文字)，不是输入框返回 ("", "")。
+
+    用落盘 XML 的 bounds 判包含关系 —— 和控件坐标是同一个坐标系。
+    """
+    xml_path = state.get("obs_xml_path") or ""
+    if not xml_path:
+        return "", ""
+    try:
+        from pathlib import Path as _P
+
+        text = _P(xml_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+    import re as _re
+
+    for m in _re.finditer(r"<node\b[^>]*>", text):
+        tag = m.group(0)
+        c = _re.search(r'class="([^"]*)"', tag)
+        cls = c.group(1) if c else ""
+        if not any(k in cls for k in ("EditText", "AutoCompleteTextView",
+                                      "TextInputEditText")):
+            continue
+        b = _re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', tag)
+        if not b:
+            continue
+        x1, y1, x2, y2 = (int(b.group(i)) for i in (1, 2, 3, 4))
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            continue
+        r = _re.search(r'resource-id="([^"]*)"', tag)
+        rid = (r.group(1) if r else "").split("/")[-1]
+        if not rid:
+            continue
+        t = _re.search(r'\btext="([^"]*)"', tag)
+        return rid, (t.group(1) if t else "")
+    return "", ""
+
+
+def _extract_fill_text(why: str, hint: str) -> str:
+    """从模型的 why 里取出"要填什么"。取不到返回空串。
+
+    模型通常会把值放在反引号、引号或「」里，比如：
+        「…向其中输入文字「测试课程表」」
+        「…input_text 填 '测试课程表'」
+    优先取这些显式标出来的；没有标点什么就返回空 —— 不猜。
+    """
+    import re as _re
+
+    for pat in (r"「([^」]{1,40})」", r"`([^`]{1,40})`",
+                r"\"([^\"]{1,40})\"", r"‘([^’]{1,40})’",
+                r"'([^']{1,40})'"):
+        for mm in _re.finditer(pat, why):
+            v = mm.group(1).strip()
+            # 过滤掉明显不是"要填的值"的片段
+            if not v or v in ("必填", "课程表名称（必填）"):
+                continue
+            if any(k in v for k in ("输入框", "rid=", "点击", "保存", "完成")):
+                continue
+            if len(v) >= 1:
+                return v
+    return ""
+
+
+def _list_empty_inputs(state: ChildState) -> list[str]:
+    """列出当前屏上**空的输入框**，附带它们自己的占位文字。
+
+    只做"告知"，不做"替模型决定填什么"——
+    填什么是业务判断（该填课程名还是教室？），那是模型的事。
+    代码的责任是让模型**知道这里有输入框、而且它现在可以输入**。
+
+    返回形如：
+        ["rid=et_schedule_name class=EditText 当前文字「课程表名称（必填）」"]
+
+    判据：
+      · class 含 EditText / AutoCompleteTextView / TextInputEditText
+      · text 有内容（占位符也算内容，因为那正是"还没填"的证据）
+    """
+    from pathlib import Path as _P
+
+    xml_path = state.get("obs_xml_path") or ""
+    if not xml_path:
+        return []
+    try:
+        text = _P(xml_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return []
+
+    import re as _re
+
+    out: list[str] = []
+    for m in _re.finditer(r"<node\b[^>]*>", text):
+        tag = m.group(0)
+        c = _re.search(r'class="([^"]*)"', tag)
+        cls = c.group(1) if c else ""
+        if not any(k in cls for k in ("EditText", "AutoCompleteTextView",
+                                      "TextInputEditText")):
+            continue
+        r = _re.search(r'resource-id="([^"]*)"', tag)
+        rid = (r.group(1) if r else "").split("/")[-1]
+        if not rid:
+            continue
+        t = _re.search(r'\btext="([^"]*)"', tag)
+        txt = t.group(1) if t else ""
+        out.append(f"rid={rid} 现在显示「{txt or '(空)'}」")
+        if len(out) >= 6:
+            break
+    return out
 
 
 def _ask_model(state: ChildState, reason: str) -> dict[str, Any]:
@@ -3977,7 +4434,21 @@ def _ask_model(state: ChildState, reason: str) -> dict[str, Any]:
         lines.extend(f"  · {p}" for p in pits[:6])
 
     lines.append("【你可以用的手段】点屏幕上的控件（给 next_x/next_y）、"
+                 "**在输入框里填文字**（给 input_rid + input_text，"
+                 "不要同时给坐标）、"
                  "按返回键（key=\"back\"）、回桌面（key=\"home\"）。")
+
+    # ★ 如果屏幕上就摆着一个空的必填输入框，直接点出来。
+    #
+    # 为什么值得单独说：176 里模型三轮都在点输入框 —— 它知道要填名称，
+    # 但没意识到"点输入框"和"往输入框里写字"是两种不同的动作。
+    # 屏幕上明明写着「课程表名称（必填）」，那就把话挑明。
+    _req = _list_empty_inputs(state)
+    if _req:
+        lines.append("【屏幕上这些输入框是空的（可能是必填）】")
+        lines.extend(f"  · {r}" for r in _req[:4])
+        lines.append("  要填就用 input_rid（上面那个 rid）+ input_text。"
+                     "只点输入框不会改变界面，也不会有任何效果。")
 
     return {
         "action": None,
@@ -4131,7 +4602,8 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
                             {"strong_target": "strong_target", "decide": "decide",
                              "finish": "finish"})
     b.add_conditional_edges("decide", route_after_decide,
-                            {"knowledge": "knowledge", "act": "act", "check": "check"})
+                            {"knowledge": "knowledge", "vision": "vision",
+                             "act": "act", "check": "check"})
     b.add_conditional_edges("knowledge", route_after_knowledge,
                             {"decide": "decide", "vision": "vision",
                              "act": "act", "check": "check"})

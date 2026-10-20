@@ -70,9 +70,17 @@ print("=" * 70)
 ck("插件不直连 adb（否则主 Agent 能绕过子 Agent 碰设备）",
    '"adb"' not in JS and "'adb'" not in JS)
 ck("插件只有一个工具入口", JS.count("ctx.tools.register(tool)") == 1)
-ck("run_case_json 只用 adb devices 选设备，不做实际操作",
-   'subprocess.run([adb, "devices"]' in RC
-   and ".click(" not in RC and "screencap" not in RC)
+# 规矩：设备操作一律走 uiautomator2，只有 adb logcat 例外。
+# 选设备也不例外 —— 枚举交给 adbutils（只读列表），
+# "能不能用"用 u2.connect + window_size 真探一次。
+ck("★ run_case_json 不用 adb 命令选设备",
+   "subprocess.run([adb" not in RC
+   and "subprocess.Popen([adb" not in RC
+   and "subprocess.run(['adb" not in RC
+   and "subprocess.Popen(['adb" not in RC)
+ck("★ 选设备用 u2 真探活", "u2.connect(" in RC and "window_size()" in RC)
+ck("★ 选设备不点不截屏不改状态",
+   ".click(" not in RC and "screencap" not in RC and "shell(" not in RC)
 ck("设备动作统一交给 run_case()", "run_case(" in RC)
 ck("整个执行期持有设备锁",
    "DeviceLock" in RC and "_lock.acquire()" in RC and "_lock.release()" in RC)

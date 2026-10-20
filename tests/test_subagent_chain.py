@@ -95,13 +95,23 @@ ck("插件不直接调 adb（否则主 Agent 能绕过子 Agent 碰设备）",
 runner = (ROOT / "src" / "android_agent" / "agent" / "runner.py").read_text(encoding="utf-8-sig")
 ck("runner.py 里构造设备", "DirectDevice(" in runner or "RealDevice(" in runner)
 rc = (ROOT / "run_case_json.py").read_text(encoding="utf-8-sig")
-# ⚠️ run_case_json.py 里**有** adb —— 但它只做一件事：`adb devices`
-#    挑出唯一在线设备当 serial，不点、不观察、不改设备状态。
-#    这段只在子 Agent 进程里跑（主 Agent 只有 android_case 工具），所以不算越界。
-#    真正的设备操作全部在 run_case() 内部。
-ck("★ run_case_json.py 只用 adb 选设备，不做实际操作",
-   'subprocess.run([adb, "devices"]' in rc
-   and ".click(" not in rc and "screencap" not in rc and "uiautomator" not in rc)
+# ⚠️ 选设备这一步**不许再跑 adb**（用户定的规矩：设备操作一律走 uiautomator2，
+#    只有 adb logcat 例外）。
+#
+#    枚举设备用 adbutils 的 list()，那只是读列表、不碰设备状态；
+#    "这台能不能用"一律 `u2.connect()` + `window_size()` 真探一次。
+#    只允许列出来、探活，**不许**在这里点、截屏、改设置 ——
+#    那些全部在 run_case() 内部。
+ck("★ run_case_json.py 不用 adb 命令选设备",
+   "subprocess.run([adb" not in rc
+   and "subprocess.Popen([adb" not in rc
+   and "subprocess.run(['adb" not in rc
+   and "subprocess.Popen(['adb" not in rc)
+ck("★ 选设备时用 u2 真探活（不是只看列表）",
+   "u2.connect(" in rc and "window_size()" in rc)
+ck("★ 选设备时不点不截屏不改状态",
+   ".click(" not in rc and "screencap" not in rc
+   and "shell(" not in rc)
 ck("★ 设备动作统一走 run_case()",
    "run_case(" in rc)
 

@@ -584,19 +584,43 @@ class RealDevice:
         前提分两类：
           data 类（pm clear）——清了没问题，测试数据是执行者自己造的
           env  类（关 WiFi）——**用完必须恢复**，否则污染下一个 case
+
+        ★ 走 uiautomator2 的 shell，**不自己起 adb 进程**。
+          用户定的规矩：所有设备操作都经 uiautomator2，只有 adb logcat 例外。
+          自己拼 `["adb", "shell", ...]` 等于维护第二条通道：
+          行为不一致、没有统一超时、出问题要查两处。
         """
-        cmd = ["adb"]
-        if self.serial:
-            cmd += ["-s", self.serial]
-        cmd += ["shell", command]
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
-                              timeout=timeout)
-        if proc.returncode != 0:
-            raise ToolError(f"shell 失败({proc.returncode})：{command} -> "
-                            f"{proc.stderr.strip() or proc.stdout.strip()}",
-                            executed=True, returncode=proc.returncode)
-        return proc.stdout.strip()
+        return self._u2().shell(command)
+
+    def _u2(self):
+        """lazily 拿一个 uiautomator2 客户端（前提准备/恢复专用）。
+
+        ## 为什么要单独有一个，而不是复用别的
+
+        `RealDevice` 的主链路是 subprocess 调 `run.py`（那是工具层的事）。
+        但前提准备（pm clear 之类）不该再起一个 subprocess —— 那样就是
+        **第二条 adb 通道**，正是用户明确禁止的。
+
+        这里直接持有 u2 对象，前提准备走 u2 的 shell。
+        只在真正用到时才连（lazily）—— 绝大多数用例不需要它，
+        不该为"可能用不到的前提"先付一次连接代价。
+        """
+        d = getattr(self, "_u2_client", None)
+        if d is not None:
+            return d
+        try:
+            import uiautomator2 as u2
+        except ImportError as exc:  # pragma: no cover
+            raise ToolError(
+                f"前提准备需要 uiautomator2，但没装：{exc}。"
+                f"设备操作一律走 u2（用户定的规矩），装到 assets 那个 venv 里。",
+                executed=False) from exc
+        try:
+            d = u2.connect(self.serial) if self.serial else u2.connect()
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"前提准备连不上设备：{exc}", executed=False) from exc
+        self._u2_client = d
+        return d
 
     def ocr(self, region: str | None = None) -> list[dict[str, Any]]:
         """OCR 读屏幕文字，返回 [{"text", "center", "bounds", "score"}, …]。
@@ -642,19 +666,24 @@ class RealDevice:
         return out
 
     def connected(self) -> tuple[bool, str]:
-        """检查设备是否连上。返回 (是否可用, 说明)。"""
+        """检查设备是否连上。返回 (是否可用, 说明)。
+
+        ★ 用 u2 探活，**不再 `adb devices`**。
+
+        为什么不跑 `adb devices`：
+          ① 规矩：设备操作一律走 uiautomator2，只有 adb logcat 例外。
+          ② `adb devices` 能列出设备**不代表 u2 能用** —— 设备可能已授权
+             但 uiautomator 服务没起来。真要用设备的是 u2，
+             那就直接用 u2 探活，验的是"我接下来要用的那条路"通不通。
+        """
         try:
-            proc = subprocess.run(["adb", "devices"], capture_output=True,
-                                  text=True, timeout=20)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, f"adb 不可用：{exc}"
-        lines = [l.strip() for l in proc.stdout.splitlines()[1:] if l.strip()]
-        if not lines:
-            return False, "没有设备连接（adb devices 为空）"
-        ready = [l for l in lines if l.endswith("device")]
-        if not ready:
-            return False, f"设备未授权或离线：{lines}"
-        return True, f"已连接：{ready}"
+            d = self._u2()
+            w, h = d.window_size()
+            return True, f"已连接：{w}x{h}"
+        except ToolError as exc:
+            return False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"设备不可用：{exc}"
 
 
 if __name__ == "__main__":
