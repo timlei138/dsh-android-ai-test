@@ -42,6 +42,23 @@ try:
 except AttributeError:
     pass
 
+# 库的位置必须和 run_case_json.py 写库时完全一致，否则会出现
+# "跑完了但页面是空的"。这个 bug 真的发生过：启动脚本把
+# ANDROID_SKILL_ROOT 设成了仓库根，库就落到 storage/runs.db，
+# 而写库那边用的是 assets/storage/runs.db。
+#
+# 兜底规则：没设就补成 assets；设了但明显指错（仓库根而不是 assets）
+# 也纠正过来，并说一句 —— 静默用错路径比报错更难查。
+_REPO = _HERE
+if not os.environ.get("ANDROID_SKILL_ROOT"):
+    os.environ["ANDROID_SKILL_ROOT"] = str(_REPO / "assets")
+else:
+    _root = Path(os.environ["ANDROID_SKILL_ROOT"])
+    if not (_root / "storage").is_dir() and (_root / "assets" / "storage").is_dir():
+        os.environ["ANDROID_SKILL_ROOT"] = str(_root / "assets")
+        print(f"⚠️ ANDROID_SKILL_ROOT 指向了仓库根（{_root}），"
+              f"已自动改用 {_root / 'assets'}", file=sys.stderr)
+
 from android_agent.reporting import store as st  # noqa: E402
 
 STATIC = _HERE / "webui"
@@ -248,6 +265,30 @@ class Handler(BaseHTTPRequestHandler):
                    _MIME.get(p.suffix.lower(), "application/octet-stream"))
 
 
+def _already_running(host: str, port: int) -> bool:
+    """这个端口上是不是已经有我们自己的服务在跑。
+
+    为什么需要：用户会连着发好几次"打开 webui"。第二次启动如果直接
+    报 "address already in use" 退出，体验就很差 —— 明明已经开着了。
+    这里先探一下，是旧实例就直接打开浏览器，不再起第二个。
+    """
+    import socket
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/stats",
+                                    timeout=1.5) as r:
+            body = r.read(200)
+            return b'"total"' in body
+    except Exception:  # noqa: BLE001
+        # 探不通不代表端口空着 —— 可能是别的程序占着。
+        # 用一条 TCP 连接判"有没有人监听"。
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return False   # 有监听，但不是我们的服务
+        except OSError:
+            return False       # 没人监听，端口是空的
+
+
 def _evidence_roots() -> list[Path]:
     """截图可能落的地方。见 Handler._serve_shot 的说明。
 
@@ -272,15 +313,50 @@ def main() -> int:
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
 
-    db = st.db_path()
-    print(f"数据库: {db}")
-    if not db.exists():
-        print("  ⚠️ 还没有任何运行记录（先跑一个用例："
-              "echo '{\"case_name\":\"168\"}' | python run_case_json.py）")
+    # ★ 启动信息必须立刻可见。
+    #
+    # 输出被重定向时（启动脚本、管道、任务管理器）python 默认是块缓冲，
+    # 那几行提示会一直压在缓冲区里 —— 用户只看到"什么都没打印"，
+    # 会误以为服务没起来，然后重复启动。
+    def say(msg: str = "") -> None:
+        print(msg, flush=True)
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    db = st.db_path()
+    # 直接说"库里有多少条"比只报路径有用 —— 页面空的时候
+    # 一眼就能分清是"没跑过"还是"跑过没落库"。
+    try:
+        _n = st.stats().get("total", 0)
+    except Exception:  # noqa: BLE001
+        _n = None
+    say(f"数据库: {db}")
+    if _n is None:
+        say("  ⚠️ 库打不开（文件坏了或没权限）")
+    elif not _n:
+        say("  库里还没有运行记录。先跑一个用例："
+            "  echo '{\"case_name\":\"168\"}' | python run_case_json.py")
+    else:
+        say(f"  已有 {_n} 条运行记录")
+
     url = f"http://{args.host}:{args.port}/"
-    print(f"打开: {url}")
+
+    # 已经开着了就不再起第二个 —— 直接把浏览器指过去。
+    # 用户会连着发命令，第二次报 "address already in use" 是最糟的回应。
+    if _already_running(args.host, args.port):
+        say(f"服务已经在跑：{url}")
+        if not args.no_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
+
+    try:
+        srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        say(f"⚠️ 端口 {args.port} 起不来：{exc}")
+        say(f"   可能是别的程序占着。换个端口：python webui.py --port 8771")
+        return 1
+    say(f"打开: {url}")
     if not args.no_browser:
         try:
             webbrowser.open(url)
@@ -289,7 +365,7 @@ def main() -> int:
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\n停止。")
+        say("\n停止。")
     finally:
         srv.server_close()
     return 0
