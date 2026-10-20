@@ -1,4 +1,4 @@
-﻿"""结构化判据（直接复用用例 YAML 的 check 形状）。
+"""结构化判据（直接复用用例 YAML 的 check 形状）。
 
 用例 YAML 的 check 是**结构化的**：
     check:

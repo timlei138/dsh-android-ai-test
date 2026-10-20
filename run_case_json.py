@@ -1,4 +1,4 @@
-﻿"""用例执行的 JSON 入口 —— 给 DSH 工具插件（android_case）调用。
+"""用例执行的 JSON 入口 —— 给 DSH 工具插件（android_case）调用。
 
 为什么单独开一个薄 CLI：
   · Node 插件不该懂 Python，也不该解析自由文本 —— 读 stdin 的 JSON、写 stdout 的 JSON

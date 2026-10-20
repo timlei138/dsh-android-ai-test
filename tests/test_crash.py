@@ -1,4 +1,4 @@
-﻿"""崩溃硬终止路径的单测（不碰设备）。
+"""崩溃硬终止路径的单测（不碰设备）。
 
 对应 observe.py 的真实行为：检测到被测包崩溃时会 terminate_session，
 此后 observe/act 全部被拒。图必须认这个信号并直接 BLOCKED，

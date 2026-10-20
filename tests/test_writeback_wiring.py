@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """端到端验证：run_case 的 writeback 参数真的通到了 YAML 文件。
 
 前面的 test_yaml_writeback.py 只测了 yaml_writeback 模块本身。

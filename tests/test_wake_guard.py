@@ -1,4 +1,4 @@
-﻿"""冷启动必须自己唤醒屏幕 —— 锁屏会让一切点击静默失效。
+"""冷启动必须自己唤醒屏幕 —— 锁屏会让一切点击静默失效。
 
 实测踩过（168 用例）：
     设备自己休眠了（`mWakefulness=Dozing`，`mCurrentFocus=NotificationShade`），

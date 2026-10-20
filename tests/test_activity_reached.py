@@ -1,4 +1,4 @@
-﻿"""回归：activity= 判据必须按"到达过"判，不是"当前还在"。
+"""回归：activity= 判据必须按"到达过"判，不是"当前还在"。
 
 真机踩到（168 实跑）：a1 判据是
     activity=.timetable.display.TimetableActivity

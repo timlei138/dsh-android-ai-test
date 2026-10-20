@@ -1,4 +1,4 @@
-﻿"""测 need_knowledge 闭环 —— 这是 168 实跑里 knowledge: 0 的那个分支。
+"""测 need_knowledge 闭环 —— 这是 168 实跑里 knowledge: 0 的那个分支。
 
 要证明的链路：
     decide 要知识 -> knowledge 查 -> **回到 decide** 带着命中重新判断 -> act

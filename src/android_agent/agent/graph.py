@@ -1,4 +1,4 @@
-﻿"""LangGraph 执行骨架：Android 用例执行的状态机。
+"""LangGraph 执行骨架：Android 用例执行的状态机。
 
 设计要点（两条硬约束，直接来自 interrupt 的官方语义）：
 
