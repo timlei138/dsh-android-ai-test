@@ -1,4 +1,4 @@
-﻿# android-runner —— 主 Agent 用来派发 Android 用例执行的 preset。
+# android-runner —— 主 Agent 用来派发 Android 用例执行的 preset。
 #
 # 解决的问题（用户原话）：
 #   "子 Agent 默认继承父方的工具集 这个需要限制下。让其能够只用我们提供的方法"
@@ -211,11 +211,6 @@
       调完就把报告里的 status / engine / steps_done / issues 原样转述，
       不要润色、不要下"功能正常/不正常"的结论。
       steps_done=0 就直说"一步都没跑"。
-
-      ⚠️ 这里以前写的是 `android_case(case_name="168", replay=true)`，
-      并要求汇报 `replay_stats` —— 那两个东西现在都不存在了：
-      回放机制整体删除（YAML 存坐标不可靠），参数和报告字段也一并去掉。
-      自动化率看报告里一直有的 auto_rate。
 
     # ★ 核心：子 Agent 只能用这些工具。
     # 名单必须是**子 Agent 继承到的**工具名，否则 restrict() 会抛 unknown tool。

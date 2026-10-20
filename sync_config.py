@@ -6,8 +6,8 @@
       · ~/.dsh/.agent-presets/android-runner/agent.cordis.yml  → 工具面
       · ~/.agents/skills/android-case-*/SKILL.md              → 技能卡
     它们决定"子 Agent 能干什么、被教成什么样"，但不在 git 里，
-    改了没记录、坏了没法回退。实测就是这么腐化的：
-    代码里 replay 早删了，技能卡还在教子 Agent 传 replay=true。
+    改了没记录、坏了没法回退。而且它们是**独立演化**的 ——
+    代码改了没人会想起同步它们，于是会慢慢教出错误的用法。
 
     config/ 下是**镜像**（可读、可 diff、可回退），
     真正生效的永远是原路径。改完原文件跑一次本脚本同步。
@@ -25,7 +25,8 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-ROOT = Path(r"D:\dsh\langgraph-poc")
+# 仓库根从本文件位置推，不写死盘符 —— 换机器/换目录都能跑
+ROOT = Path(__file__).resolve().parent
 SNAP = ROOT / "config"
 HOME = Path.home()
 

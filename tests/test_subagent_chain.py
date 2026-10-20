@@ -49,8 +49,8 @@ ck("★ 有深度守卫：主 Agent(depth=0) 被拒",
 ck("depth 取自持久化 header，模型改不了",
    "session?.header?.delegationDepth" in js or
    "delegationDepth" in js)
-ck("★ replay 参数已删除（曾静默失效）",
-   "replay: args.replay" not in js)
+ck("★ 插件 schema 里只剩真实生效的参数",
+   "replay" not in js)
 ck("render 自检存在（防漏写 render 到运行时才炸）",
    "output?.render" in js and "__selfcheck__" in js)
 

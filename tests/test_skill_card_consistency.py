@@ -2,11 +2,8 @@
 """技能卡与代码一致性：防止技能卡教模型用不存在的东西。
 
 为什么单独有这个测试：
-    技能卡在 `~/.agents/skills/` 下，**不在仓库里**。
-    改代码时没人会想起它，于是它会慢慢腐化 ——
-    实测就是这么发现的：代码里 `replay` 参数早删了，
-    两份技能卡却还在教子 Agent 写 `android_case(replay=true)`、
-    还在要求汇报不存在的 `replay_stats`。
+    技能卡在 `~/.agents/skills/` 下，**不在仓库里**，而且和代码独立演化 ——
+    代码改了没人会想起同步它们，于是技能卡会慢慢教出已经不存在的用法。
 
     子 Agent 读的是技能卡、跑的是代码。两边不一致，
     它就会按技能卡写参数 —— 被 schema 拒绝，或者更糟：静默无效。
@@ -66,40 +63,32 @@ planner = read_skill("android-case-planner") or ""
 
 print()
 print("=" * 70)
-print("2) ★ 不许教 replay（参数已删除）")
+print("2) ★ 技能卡与 preset 里不许出现已废弃的词")
 print("=" * 70)
 
-
-def bad_replay_calls(txt: str) -> list[str]:
-    """挑出真正在教「传 replay 参数」的调用，跳过说明性文字。"""
-    out = []
-    for ln in txt.splitlines():
-        s = ln.strip()
-        # 说明"已删除/以前/不要传"的行不算
-        if any(w in s for w in ("已删除", "以前", "不要", "没有 `replay`", "早已", "删除")):
-            continue
-        # 只认调用形态：android_case(...replay...)
-        for call in re.findall(r"android_case\([^)]*\)", s):
-            if re.search(r"\breplay\s*=", call):
-                out.append(call)
-    return out
-
+# 这些词对应的机制已经从架构里彻底去掉：回放、按序重放、YAML 存坐标。
+# 技能卡只要还提到它们（哪怕是"以前有过"），就会让读者以为它还活着，
+# 而一个已经彻底删掉的概念，最干净的处理方式是**一个字都不留**。
+RETIRED = {
+    "replay": "回放机制已整体删除（坐标不可靠，改为每屏唯一命中直点）",
+    "replay_stats": "报告无此字段，自动化率看 auto_rate",
+    "locate_seq": "按序重放机制已删除",
+}
 
 for name, txt in (("runner", runner), ("planner", planner)):
-    bad = bad_replay_calls(txt)
-    ck(f"{name} 没教 replay= 参数", not bad, f"违规 {bad}")
+    for word, why in RETIRED.items():
+        hits = [ln.strip()[:60] for ln in txt.splitlines() if word in ln]
+        ck(f"{name} 不含「{word}」", not hits, why if hits else "")
 
 print()
 print("=" * 70)
-print("3) ★ 不许提 replay_stats（报告字段不存在）")
+print("3) ★ preset 里也不许出现已废弃的词")
 print("=" * 70)
-for name, txt in (("runner", runner), ("planner", planner)):
-    hits = [
-        ln.strip() for ln in txt.splitlines()
-        if "replay_stats" in ln
-        and not any(w in ln for w in ("不存在", "已删除", "以前", "删掉"))
-    ]
-    ck(f"{name} 没提 replay_stats", not hits, f"违规 {hits}")
+preset_path = Path.home() / ".dsh" / ".agent-presets" / "android-runner" / "agent.cordis.yml"
+preset_txt = preset_path.read_text(encoding="utf-8-sig") if preset_path.exists() else ""
+for word in RETIRED:
+    hits = [ln.strip()[:60] for ln in preset_txt.splitlines() if word in ln]
+    ck(f"preset 不含「{word}」", not hits, f"违规 {hits}")
 
 print()
 print("=" * 70)

@@ -1,4 +1,4 @@
-﻿---
+---
 name: android-case-runner
 description: 执行子 Agent 专用。用代码控制的执行器在 Android 真机上跑 GUI 用例：接收主 Agent 拆好的用例结构或现成 YAML，执行节奏、落点判定、坐标合法性、死循环处理全由执行器代码控制，不依赖模型自觉。主 Agent 请改用 android-case-planner。
 ---
@@ -116,10 +116,8 @@ android_case(
 | `writeback` | 是否回写 YAML，默认 `true` |
 | `answer` | `model`（默认）/ `autopilot`，见下 |
 
-> ⚠️ **没有 `replay` 参数了。**
-> 早先有个"纯回放模式"开关，已整体删除 —— 它依赖 YAML 存坐标/按序重放，
-> 而坐标不可靠、换个界面就废。现在不需要开关：**每步都先由代码找唯一命中**，
-> 找到就直点、找不到才叫你。报告里的 `auto_rate` 就是自动化率。
+不需要"纯代码模式"这类开关 —— **每一步都先由代码在当前屏找唯一命中**，
+找到就直点、找不到才叫模型。报告里的 `auto_rate` 就是自动化率。
 
 #### `answer` —— 谁来做判断（默认 `model`）
 

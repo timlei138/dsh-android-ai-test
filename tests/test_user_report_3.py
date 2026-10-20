@@ -5,7 +5,7 @@
    -> 裸双引号可修复；真解析不了时记 BLOCKED 不崩进程、不猜成 PASS/FAIL
 2. YAML 的 assert 类型前提被静默跳过
    -> 转成 Precondition.assert_start，并真的接到 start_check
-3. replay 生效与否看不出来
+3. 代码直点和交给模型分不清
    -> 日志必须正面报告 代码走几步 / 落回模型几步
 """
 import io
@@ -78,10 +78,8 @@ print()
 print("=" * 66)
 print("问题3：代码直点 vs 交给模型，必须自报家门")
 print("=" * 66)
-# ★ 原来是验"纯回放：代码走 N 步 / 落回模型 M 步"。回放机制已删除，
-#   换成了强证据直点（target 命中唯一就代码点，否则交模型）。
-#   **要守的东西没变**：一次跑下来，"多少是代码定的、多少是模型定的"
-#   必须能一眼看出来 —— 否则无从判断到底省了多少 LLM。
+# **要守的东西**：一次跑下来，"多少是代码定的、多少是模型定的"
+# 必须能一眼看出来 —— 否则无从判断到底省了多少 LLM。
 _src = io.open(str(Path(__file__).resolve().parents[1] / "src" / "android_agent" / "agent" / "runner.py"), encoding="utf-8").read()
 ck("日志里有强证据汇总", "强证据：代码直点" in _src)
 ck("汇总里带自动化率", "自动化率" in _src)

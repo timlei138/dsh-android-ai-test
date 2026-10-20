@@ -321,11 +321,8 @@ asserts:
 ~/.agents/skills/android-case-planner/SKILL.md          主 Agent 读的技能卡
 ```
 
-它们不在 git 里，但**决定子 Agent 被教成什么样**。实测就是这么腐化的：
-代码里 `replay` 参数早就删了，两份技能卡却还在教子 Agent 写
-`android_case(replay=true)`、还在要求汇报不存在的 `replay_stats` ——
-子 Agent 读技能卡、跑代码，两边不一致它就会照着错的写。
-
+它们不在 git 里，但**决定子 Agent 被教成什么样** ——
+子 Agent 读技能卡、跑代码，两边说法不一致，它就会照着错的写。
 所以 `config/` 下存了它们的**镜像快照**（可 diff、可回退）：
 
 ```powershell
@@ -385,7 +382,7 @@ cd tests && for f in test_*.mjs; do node "$f"; done
 |---|---|
 | `test_subagent_chain.py` | 子 Agent 执行链完整：插件 → 执行器 → 设备层，导入不断、stdout 干净 |
 | `test_subagent_contract.py` | 三层闸门都在：主 Agent 被拒、工具面收窄、报告字段齐 |
-| `test_skill_card_consistency.py` | 技能卡不提代码里不存在的东西（`replay`/`replay_stats` 这类腐化） |
+| `test_skill_card_consistency.py` | 技能卡和 preset 不许提代码里不存在的参数/字段 |
 | `test_perm_autogrant.py` | 权限自动处置 + 只记账不进 YAML |
 
 ---

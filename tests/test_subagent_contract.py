@@ -86,25 +86,15 @@ if not PRESET.exists():
 else:
     y = PRESET.read_text(encoding="utf-8")
     ck("preset 存在", True, PRESET.name)
-    # 这是最容易腐化的地方：preset 在仓库外，改代码时没人会想起它
-    #
-    # ⚠️ 只认 yml 里的**指令行**（`android_case(...)` 这种调用示例），
-    #    不认注释里"以前写的是 replay=true"这种说明文字 —— 那也是应该留的。
-    calls = re.findall(r"^\s*android_case\(([^)]*)\)", y, re.M)
-    bad_calls = [c for c in calls if "replay" in c]
-    ck("★★ preset 的调用示例里没有 replay 参数（该参数已删除）",
-       not bad_calls, f"示例 {calls} / 违规 {bad_calls}")
+    # preset 在仓库外，改代码时没人会想起它 —— 所以这里盯得紧一点：
+    # 已废弃的机制一个字都不许留（详见 test_skill_card_consistency.py）
+    ck("★★ preset 不含已废弃的机制",
+       not any(w in y for w in ("replay", "replay_stats", "locate_seq")),
+       [w for w in ("replay", "replay_stats", "locate_seq") if w in y])
 
-    # 汇报要求里也不许再点名 replay_stats。
-    # 同样只认指令行：注释里"以前要求汇报 replay_stats"是故意留的说明。
-    instr_lines = [
-        ln for ln in y.splitlines()
-        if "replay_stats" in ln
-        and not ln.lstrip().startswith("#")   # 跳过整行注释
-        and "以前" not in ln and "不存在" not in ln
-    ]
-    ck("★★ preset 不再要求汇报 replay_stats（该字段不存在）",
-       not instr_lines, f"违规行 {instr_lines}")
+    calls = re.findall(r"^\s*android_case\(([^)]*)\)", y, re.M)
+    ck("preset 有正确的调用示例", bool(calls), str(calls))
+
     ck("preset 有子 Agent 专属 persona（否则它以为自己是主 Agent）",
        "你是**执行子 Agent**" in y)
     ck("persona 明确否掉「再派发」",
