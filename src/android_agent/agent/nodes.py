@@ -35,6 +35,13 @@ from .vision import VisionError, ask_image
 # 真机上每次检索都要读文件，而步骤毫无进展纯属烧时间。
 MAX_KNOWLEDGE_LOOKUPS = 8
 
+# ★ 一步落点不符，最多试这么多次（含首次），仍不符就 BLOCKED 停整个人 case。
+#
+# 为什么是 3：用户定的。1 次太急 —— 页面还在加载就会被误判；
+# 再多也没意义 —— 同一个动作重复三次都到不了目标页，说明路径本身就不对，
+# 继续试只是在烧时间，而且会让"关键路径没找到"这个结论变模糊。
+LANDING_MAX_TRIES = 3
+
 # --------------------------------------------------------------------------
 # 主 Agent -> 子 Agent 的任务包
 # --------------------------------------------------------------------------
@@ -389,7 +396,7 @@ class ChildState(TypedDict, total=False):
     # ★ 交给模型时的"处境说明"（测试员语言）：这步要干什么、现在在哪、
     #   上次踩过什么坑、能用哪些基本手段。见 _ask_model 的注释。
     fallback_guidance: str
-    retry_landing: int                    # 本步落点不符已重试几次（上限 1）
+    retry_landing: int                    # 本步落点不符已重试几次（上限见 LANDING_MAX_TRIES）
     last_step_id: str                     # 上一次 plan 进入的是哪一步（判断是否换步）
     # 统计：代码走了几步 vs 模型走了几步（跑完直接看出自动化率）
     strong_hits: Annotated[list[dict[str, Any]], operator.add]
@@ -2707,33 +2714,51 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
 
     # ★ 本步判"完成"了，但**代码复核落点不符** —— 该怎么办？
     #
-    # 先原地重试 1 次，还不对才落回模型。
+    # 用户定的规则：**最多试 3 次，仍不符就 BLOCKED，并停止后续步骤。**
+    #
     # 为什么不能直接认了：落点不符往往意味着
-    # ① 页面还在加载（重试一次就好）② 界面真的变了（得叫模型）。
+    #   ① 页面还在加载（再试一次就好）② 界面真的变了（得叫模型想办法）。
+    # 但也不能无限试：同一个动作反复三次都到不了目标页，说明这条路径本身
+    # 就不成立 —— 那是"关键路径没找到"，属于 BLOCKED 的定义。
+    #
+    # ⚠️ 必须是 BLOCKED 而不是 FAIL：FAIL 的语义是"所有路径都走完了、
+    #    只是结果和预期不符"。而这里连"走没走到"都确定不了，
+    #    后续步骤更没依据，所以必须停下，不能拿它当 FAIL 报出去。
     #
     # ⚠️ 这个判断必须放在 `if done:` **之前** ——
     #    放后面的话 done 分支已经 return 了，永远走不到（写完测试才发现的）。
     if done and issues and not state.get("fallback_reason"):
         tried = state.get("retry_landing", 0)
-        if tried < 1:
+        if tried + 1 < LANDING_MAX_TRIES:
             return {
                 "retry_landing": tried + 1,
                 "issues": issues,
                 "progress": [_tick(
                     "retry",
-                    f"{step['id']} 落点未到，原地重试 1 次（当前 {act_now}）",
+                    f"{step['id']} 落点未到，"
+                    f"第 {tried + 2}/{LANDING_MAX_TRIES} 次尝试（当前 {act_now}）",
                     step=step["id"])],
             }
         why = issues[-1]
         return {
-            "fallback_reason": f"{step['id']} 重试后落点仍不对：{why}",
-            "strong_hits": [{"step": step["id"], "by": "model",
-                             "reason": f"重试后落点仍未到（{act_now}）"}],
-            "issues": issues,
-            "action": None,       # 清掉"已完成"，让模型重新判断这一步
-            "progress": [_tick("fallback",
-                               f"{step['id']} 重试后仍不对，交给模型：{why}",
-                               step=step["id"])],
+            "status": "BLOCKED",
+            "retry_landing": tried + 1,
+            "issues": issues + [
+                f"🚫 {step['id']} 落点不符：试了 {LANDING_MAX_TRIES} 次都没到目标页"
+                f"（期望 {step.get('landing')}，实际停在 {act_now}）。"
+                f"关键路径没找到，后续步骤不再执行"],
+            "findings": [{"kind": "step", "step": step["id"],
+                          "desc": step["desc"],
+                          "landing": act_now,
+                          "status": "blocked"}],
+            "action": None,
+            "summary": (f"{step['id']} 落点不符（{LANDING_MAX_TRIES} 次），"
+                        f"关键路径没找到，用例未执行完"),
+            "progress": [_tick(
+                "blocked",
+                f"{step['id']} 试满 {LANDING_MAX_TRIES} 次仍没到目标页，"
+                f"BLOCKED 终止：{why}",
+                step=step["id"])],
         }
 
     if done:
@@ -3503,8 +3528,19 @@ def finish_child_node(state: ChildState) -> dict[str, Any]:
         status = "BLOCKED"
         issues.append(f"步骤 {len(steps)} 步只完成 {steps_done} 步")
     elif landing_miss:
-        status = "FAIL"
-        issues.append(f"{len(landing_miss)} 步落点不符，执行链路与预期不一致")
+        # ★ 落点不符 = 关键路径没找到 = 用例没执行完 -> BLOCKED，不是 FAIL。
+        #
+        # 用户定的语义（原话）：
+        #   BLOCKED 表示这个 Case 没执行完 —— 崩了、或者关键路径没找到。
+        #   FAIL    表示所有路径都执行完了，只是结果和预期有差别。
+        #
+        # 落点不符恰恰是"没走到该去的地方"：后面那些步骤和断言
+        # 都是在错误的前置上做的，结论没有意义，所以归 BLOCKED。
+        # （plan 里试满 LANDING_MAX_TRIES 次就会直接 BLOCKED 并停下，
+        #   这里兜的是别的路径漏进来的、或被模型重新判过的情况。）
+        status = "BLOCKED"
+        issues.append(f"{len(landing_miss)} 步落点不符，关键路径没找到，"
+                      f"用例未执行完")
     elif len(got) < len(asserts):
         status = "BLOCKED"
         issues.append(f"预期 {len(asserts)} 条，只验到 {len(got)} 条")
@@ -3976,15 +4012,20 @@ def _screen_fingerprint(state: ChildState) -> str:
     return f"{act}|{pkg}|{rids}"
 
 
-def route_after_strong(state: ChildState) -> Literal["act", "decide", "check"]:
+def route_after_strong(state: ChildState) -> Literal["act", "decide", "check", "finish"]:
     """强证据直点的结果去哪。
 
+    - 已经 BLOCKED -> finish（不再动设备）
     - 拿到动作 -> act（坐标校验等守卫照走）
     - 落回模型 -> decide
     - 本步已完成 -> check
 
     ⚠️ 不能只看 next_x：`key=` 这类按键动作没有坐标。
     """
+    # ★ 已 BLOCKED 就收尾。这里挡的是"状态说停、手上还在点"——
+    #   设备动作一旦多发一次，报告和现场就对不上了。
+    if state.get("status") == "BLOCKED":
+        return "finish"
     act = state.get("action") or {}
     if act.get("step_done"):
         return "check"
@@ -3994,8 +4035,20 @@ def route_after_strong(state: ChildState) -> Literal["act", "decide", "check"]:
 
 
 def route_after_plan(state: ChildState) -> Literal["prep_apply", "strong_target",
-                                                   "observe", "decide", "assert"]:
+                                                   "observe", "decide", "assert",
+                                                   "finish"]:
     task = state["task"]
+    # ★ 已经判定 BLOCKED 就直接收尾，**不再执行后面的步骤**。
+    #
+    # 用户定的语义：BLOCKED = 用例没执行完（崩溃 / 关键路径没找到）。
+    # 既然没执行完，就不能接着往下跑别的步骤 —— 那会让报告里的
+    # steps_done 和 findings 混进"本来就不该执行"的结果。
+    #
+    # ⚠️ 这条必须放在最前面。之前 plan 里判了落点不符 BLOCKED，
+    #    但路由照样往下走 —— 状态是 BLOCKED，动作却还在继续，
+    #    等于"说了停却没停"。
+    if state.get("status") == "BLOCKED":
+        return "finish"
     if state.get("step_index", 0) >= len(task["steps"]):
         return "assert"
     # ★ 前置数据没准备好 -> 先做掉，再谈步骤。

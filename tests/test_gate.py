@@ -92,14 +92,16 @@ check("全通过 -> PASS", out["status"] == "PASS", out["status"])
 check("steps_done=3", out["_report"]["steps_done"] == 3)
 check("coverage_ok=True", out["_report"]["coverage_ok"] is True)
 
-print("\n=== 闸门：步骤走完但某步落点不符 -> FAIL ===")
+# ★ 语义：落点不符 = 关键路径没找到 = 用例没执行完 -> BLOCKED。
+#   FAIL 只留给"所有路径都走完了、结果和预期不符"。
+print("\n=== 闸门：步骤走完但某步落点不符 -> BLOCKED（关键路径没找到）===")
 out, _ = finish_with(
     steps_findings=[{"kind": "step", "step": f"s{i}", "status": "ok"}
                     for i in (1, 2, 3)],
     assert_findings=[{"kind": "assert", "id": f"a{i}", "status": "PASS"}
                      for i in (1, 2, 3)],
     issues=["s2 声明完成但落点不符：期望 activity=B，实际 .MainActivity"])
-check("落点不符 -> FAIL", out["status"] == "FAIL", out["status"])
+check("落点不符 -> BLOCKED", out["status"] == "BLOCKED", out["status"])
 check("coverage_ok=False", out["_report"]["coverage_ok"] is False)
 
 print("\n=== 闸门：预期没收齐 -> BLOCKED ===")
