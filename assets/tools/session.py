@@ -509,7 +509,7 @@ def main() -> None:
     # 清理被强杀留下的孤儿会话（进程已死但没走 finish 的）
     rp = sub.add_parser(
         "reap-orphans",
-        help="把「执行进程已退出但没走 finish」的会话收尾为 ERROR")
+        help="把「执行进程已退出但没走 finish」的会话收尾为 BLOCKED")
     rp.add_argument("--dry-run", action="store_true", help="只报告不修改")
     rp.add_argument("--include-unowned", action="store_true",
                     help="连没有进程登记的会话也收尾（历史数据用，日常别开）")
@@ -525,7 +525,7 @@ def main() -> None:
         try:
             for got in db.reap_orphan_sessions():
                 print(f"[session] 清理中断会话 #{got['session_id']}"
-                      f"（pid {got['pid']} 已退出）→ ERROR", file=sys.stderr)
+                      f"（pid {got['pid']} 已退出）→ BLOCKED", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             print(f"[session] ⚠️ 孤儿会话清理失败（不影响本次运行）：{exc}",
                   file=sys.stderr)

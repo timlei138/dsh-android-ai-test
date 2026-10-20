@@ -106,7 +106,7 @@ check("enum 顺序 model 在前（默认值优先）",
 print("\n=== 6) 端到端：两种引擎的报告要能分辨 ===")
 # 不真连设备 —— 直接验 run_case_json 对非法值和缺省的处理。
 for payload, label, want in [
-    ('{"case_name":"__no_such_case__","answer":"bogus"}', "非法值", "ERROR"),
+    ('{"case_name":"__no_such_case__","answer":"bogus"}', "非法值", "BLOCKED"),
     ('{"case_name":"__no_such_case__","answer":"autopilot"}', "autopilot", None),
     ('{"case_name":"__no_such_case__"}', "不传（默认）", None),
 ]:

@@ -53,7 +53,7 @@ ck("start 成功", r.returncode == 0, r.stdout.strip()[:80])
 
 row = d._conn().execute("SELECT status FROM sessions WHERE id=?",
                         (sid,)).fetchone()
-ck("★ 僵尸被自动清理", row and row["status"] == "ERROR",
+ck("★ 僵尸被自动清理", row and row["status"] == "BLOCKED",
    row["status"] if row else "(没了)")
 
 m = re.search(r'"session_id":\s*(\d+)', r.stdout)

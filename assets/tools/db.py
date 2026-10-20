@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = STORAGE_DIR / "sessions.db"
 CURRENT_FILE = STORAGE_DIR / "current_session"
 
-STATUSES = ("PASS", "FAIL", "WARN", "BLOCKED", "ERROR")
+STATUSES = ("PASS", "FAIL", "WARN", "BLOCKED")
 # 会话中间态：不是结论，不计入通过率统计；必须以 pause 保持或 finish 收尾
 INTERIM = ("running", "paused", "waiting")
 
@@ -238,10 +238,10 @@ class SessionDB:
                     raise ValueError("PASS/WARN requires verified, non-blocked findings with no failures")
             if status == "FAIL" and "FAIL" not in statuses:
                 raise ValueError("FAIL requires a FAIL finding")
-            if status in ("BLOCKED", "ERROR") and not summary.strip():
-                raise ValueError("BLOCKED/ERROR requires a reason in summary")
-            if status not in ("ERROR", "BLOCKED") and recording_issues(Path(self.path).parent, session_id):
-                raise ValueError("Recording/ledger is incomplete; finish ERROR/BLOCKED with a reason")
+            if status == "BLOCKED" and not summary.strip():
+                raise ValueError("BLOCKED requires a reason in summary")
+            if status != "BLOCKED" and recording_issues(Path(self.path).parent, session_id):
+                raise ValueError("Recording/ledger is incomplete; finish BLOCKED with a reason")
             for finding in findings if status in ("PASS", "FAIL", "WARN") else []:
                 if finding["status"] not in ("PASS", "FAIL", "WARN"):
                     continue
@@ -503,7 +503,7 @@ class SessionDB:
 
     def reap_orphan_sessions(self, *, dry_run: bool = False,
                              include_unowned: bool = False) -> list[dict]:
-        """把"确认已死"的中间态会话收尾成 ERROR。
+        """把"确认已死"的中间态会话收尾成 BLOCKED。
 
         只动**能证明**是孤儿的：
           · 有 owner 登记且 pid 已不存在  -> 确定孤儿
@@ -556,8 +556,11 @@ class SessionDB:
                    if pid is not None else
                    "无进程登记的历史会话，人工确认后统一收尾（中断）")
             try:
+                # ★ 中断的会话收尾为 BLOCKED（不是 ERROR）：
+                #   它确实"没执行完"，这正是 BLOCKED 的定义 —— 崩溃 / 进程没了。
+                #   三档之外不再有第四种状态。
                 self._conn().execute(
-                    "UPDATE sessions SET status='ERROR', summary=?, finished_at=?"
+                    "UPDATE sessions SET status='BLOCKED', summary=?, finished_at=?"
                     " WHERE id=? AND status IN ('running','paused','waiting')",
                     (why, now, sid))
                 self._conn().commit()
@@ -690,7 +693,6 @@ class SessionDB:
             " SUM(CASE WHEN c.last_status='FAIL' THEN 1 ELSE 0 END) AS fail,"
             " SUM(CASE WHEN c.last_status='BLOCKED' THEN 1 ELSE 0 END) AS blocked,"
             " SUM(CASE WHEN c.last_status='WARN' THEN 1 ELSE 0 END) AS warn,"
-            " SUM(CASE WHEN c.last_status='ERROR' THEN 1 ELSE 0 END) AS error,"
             " SUM(CASE WHEN c.last_status IS NULL THEN 1 ELSE 0 END) AS never_run"
             " FROM cases c"
             " WHERE COALESCE(c.kind,'test') != 'mock'"
@@ -878,7 +880,6 @@ class SessionDB:
                 " SUM(CASE WHEN last_status='FAIL' THEN 1 ELSE 0 END) AS fail,"
                 " SUM(CASE WHEN last_status='BLOCKED' THEN 1 ELSE 0 END) AS blocked,"
                 " SUM(CASE WHEN last_status='WARN' THEN 1 ELSE 0 END) AS warn,"
-                " SUM(CASE WHEN last_status='ERROR' THEN 1 ELSE 0 END) AS error,"
                 " SUM(CASE WHEN last_status IS NULL THEN 1 ELSE 0 END) AS never_run"
                 " FROM cases WHERE COALESCE(kind,'test') != 'mock'").fetchone()
             return dict(row) if row else {}

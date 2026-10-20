@@ -180,7 +180,7 @@ class SubagentTask(BaseModel):
 class SubagentReport(BaseModel):
     """子 Agent 回报给主 Agent 的汇总结论（结构化，短）。"""
     case_id: str
-    status: str                       # PASS / FAIL / BLOCKED / ERROR
+    status: str                       # PASS / FAIL / BLOCKED（只有这三档）
     summary: str
     session_id: int | None = None
     findings: list[dict[str, Any]] = Field(default_factory=list)
@@ -1287,8 +1287,8 @@ def observe_node(state: ChildState) -> dict[str, Any]:
         if "terminated" in msg.lower() or "incomplete recording" in msg.lower():
             return {"status": "BLOCKED", "summary": f"会话被硬终止：{msg}",
                     "issues": [f"observe 被拒（硬终止）：{msg}"]}
-        return {"issues": [f"observe 失败：{exc}"], "status": "ERROR",
-                "summary": f"observe 失败：{exc}"}
+        return {"issues": [f"observe 失败：{exc}"], "status": "BLOCKED",
+                "summary": f"observe 失败（拿不到屏幕，没执行完）：{exc}"}
 
     shot = (out.get("evidence") or {}).get("png")
 
@@ -3611,7 +3611,7 @@ def route_after_observe(state: ChildState) -> Literal["strong_target", "decide",
     观察完先给代码一次机会：这一步的 target 在当前屏上能唯一确定就直点，
     定不下来才叫模型（`fallback_reason` 非空表示本步已经交给模型了，别再问一遍）。
     """
-    if state.get("status") in ("BLOCKED", "ERROR"):
+    if state.get("status") == "BLOCKED":
         return "finish"
     if not state.get("fallback_reason"):
         return "strong_target"
@@ -3685,7 +3685,7 @@ def route_after_start_check(state: ChildState) -> Literal["prep_apply", "decide"
     - 起点符合 -> 正常进入 plan 开始执行步骤
     - 硬终止（崩溃/锁死）-> finish
     """
-    if state.get("status") in ("BLOCKED", "ERROR"):
+    if state.get("status") == "BLOCKED":
         return "finish"
     if state.get("start_mismatch"):
         rounds = state.get("start_fix_rounds", 0)
@@ -3760,7 +3760,7 @@ def route_after_act(state: ChildState) -> Literal["vision", "strong_target", "de
 
 
 def route_after_vision(state: ChildState) -> Literal["observe", "start_check", "finish"]:
-    if state.get("status") in ("BLOCKED", "ERROR"):
+    if state.get("status") == "BLOCKED":
         return "finish"
     return "start_check" if state.get("start_mismatch") else "observe"
 

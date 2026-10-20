@@ -337,7 +337,7 @@ const apply = (ctx) => {
             "",
             "⚠️ 只改 do:（怎么走），**绝不改 expect:/assertions:**（验收标准）——",
             "标准是人写的需求，路径是工具的记录，两者不能混。",
-            "结论为 BLOCKED/ERROR 时不回写（路径没走完，写进去会固化半截经验）。",
+            "结论为 BLOCKED 时不回写（路径没走完，写进去会固化半截经验）。",
             "想先看效果不改文件，传 false。",
           ].join("\n"),
         },
@@ -370,7 +370,7 @@ const apply = (ctx) => {
             status: {
               type: "string",
               required: true,
-              description: "PASS / FAIL / BLOCKED / ERROR",
+              description: "PASS / FAIL / BLOCKED（只有这三档）",
             },
             engine: {
               type: "string",
@@ -470,7 +470,8 @@ const apply = (ctx) => {
             "为什么这样设计：执行节奏、坐标合法性、落点复核、死循环阻断都在子 Agent\n" +
             "那侧的执行器里。主 Agent 直接调等于把这些纪律全绕过了。";
           return {
-            status: "ERROR",
+            // 主 Agent 越权被拒 —— 用例一步都没跑，属于 BLOCKED（没执行完）。
+            status: "BLOCKED",
             engine: "",
             report: msg,
           };
@@ -506,7 +507,7 @@ const apply = (ctx) => {
             };
         const report = await runCase(spec, exec?.signal);
         return {
-          status: String(report.status ?? "ERROR"),
+          status: String(report.status ?? "BLOCKED"),
           engine: String(report.engine ?? ""),
           report: render(report),
         };

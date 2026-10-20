@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """用户实测反馈的三个问题的回归测试。
 
-1. 一条模型回复格式不对，不该让整轮用例 ERROR
+1. 一条模型回复格式不对，不该让整轮用例变 BLOCKED
    -> 裸双引号可修复；真解析不了时记 BLOCKED 不崩进程、不猜成 PASS/FAIL
 2. YAML 的 assert 类型前提被静默跳过
    -> 转成 Precondition.assert_start，并真的接到 start_check

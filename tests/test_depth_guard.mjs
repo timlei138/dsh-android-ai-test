@@ -38,7 +38,7 @@ console.log("=== 1) ★ 主 Agent（depth=0）必须被拒 ===");
 const r0 = await tool.execute(
   { case_name: "168" }, { agent: { options: { subagentDepth: 0 } } });
 check("主 Agent 被闸门拦下", hitGate(r0), String(r0?.status));
-check("status 是 ERROR", r0?.status === "ERROR", String(r0?.status));
+check("status 是 BLOCKED", r0?.status === "BLOCKED", String(r0?.status));
 
 console.log("\n=== 2) 拒绝时要说清「该怎么改」（不然模型会原地重试）===");
 const msg = String(r0?.report ?? "");

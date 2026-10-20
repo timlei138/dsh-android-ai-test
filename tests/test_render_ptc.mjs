@@ -64,7 +64,7 @@ check("report 原文完整带出",
 
 console.log("\n=== 3) 边界：report 为空/缺失时也不能炸 ===");
 for (const v of [
-  { status: "ERROR", engine: "", report: "" },
+  { status: "BLOCKED", engine: "", report: "" },
   { status: "PASS", engine: "model" },                    // report 缺失
   { status: "PASS", engine: "model", report: null },
 ]) {

@@ -75,7 +75,7 @@ ck("空 stdin -> 退出码非 0", r.returncode != 0, f"rc={r.returncode}")
 try:
     d = json.loads(r.stdout.strip())
     ck("空 stdin 的错误也是合法 JSON（主 Agent 能解析）",
-       d.get("status") == "ERROR", d.get("summary"))
+       d.get("status") == "BLOCKED", d.get("summary"))
 except json.JSONDecodeError:
     ck("空 stdin 的错误也是合法 JSON", False, r.stdout[:120])
 

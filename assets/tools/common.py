@@ -650,7 +650,7 @@ def _dump_hierarchy(d, xml: Path) -> tuple[str, int]:
     —— 上一位 dump 进程没释放 automation 会话，新的又去注册，直接撞死。
     崩溃主体是 **uiautomator 自己**（shell 起的进程，所以 crash buffer 里
     没有 `Process:` 行），**不是被测应用崩溃**。但工具层把它当成了环境故障，
-    整条会话按 ERROR 收尾，一天内因此废掉 6 条。
+    整条会话按 BLOCKED 收尾，一天内因此废掉 6 条。
 
     处置：这是**只读观测**，失败时设备状态没被改变，重试不会有副作用
     （不同于 tap/input —— 那些永不重放）。故：残留进程清掉 → 重 dump 一次。
@@ -1121,7 +1121,7 @@ def guard_terminated(tool: str) -> None:
         if not sid:
             return
         if recording_issues(STORAGE_DIR, sid):
-            fail(f"Session {sid} has incomplete recording. Resolve it and finish ERROR/BLOCKED; do not replay actions.", rejected=True)
+            fail(f"Session {sid} has incomplete recording. Resolve it and finish BLOCKED with a reason; do not replay actions.", rejected=True)
         reason = get_db().get_termination(sid)
     except (OSError, ValueError, sqlite3.Error) as error:
         fail(f"Cannot verify session guard: {error}")

@@ -129,7 +129,7 @@ check("同一坐标没有被无限制执行下去",
       len(clicks) < stubborn_calls["n"],
       f"执行 {len(clicks)} 次 < 决策 {stubborn_calls['n']} 次")
 check("运行有界结束（没死循环）",
-      report.status in ("PASS", "FAIL", "BLOCKED", "ERROR"), report.status)
+      report.status in ("PASS", "FAIL", "BLOCKED"), report.status)
 
 print("\n" + "=" * 60)
 print("  全部通过" if ok_all else "  存在失败项")

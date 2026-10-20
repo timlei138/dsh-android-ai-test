@@ -121,7 +121,7 @@ def _chat(cfg: dict[str, str], messages: list[dict[str, Any]],
     #
     # 用户的诉求：能不能要求子 Agent 严格返回 JSON。
     # 光在提示词里写"只输出 JSON"那是**请求**，模型可以不遵守 ——
-    # 实测就踩到 reason 里带裸双引号、把整轮用例打成 ERROR。
+    # 实测就踩到 reason 里带裸双引号、把整轮用例打成 BLOCKED。
     # DeepSeek 支持和 OpenAI 一致的 json_object 模式，由服务端保证
     # 产出是合法 JSON 字符串。
     #

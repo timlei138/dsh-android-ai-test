@@ -171,7 +171,7 @@ def make_model_answer(*, skill_root: str = DEFAULT_SKILL,
             return action
 
         if kind == "assert":
-            # ★ 断言阶段的模型回复格式错误，**不许**让整轮用例 ERROR。
+            # ★ 断言阶段的模型回复格式错误，**不许**让整轮用例变 BLOCKED。
             #
             # 实测踩到（用户反馈）：模型其实已经看清了界面（PhotoPicker 起来了、
             # 图片网格都在），只是 reason 里带了裸双引号
@@ -238,7 +238,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                 （用户要求：「用我们的工具完成后要生成或者把旧的 YAML
                 不合理的修改」）。不给就只报告、不动文件。
         writeback: 是否回写。用例 PASS/FAIL 都会写 —— 因为"实际怎么走到的"
-                对两种结论都有价值；但 BLOCKED/ERROR 不写（路径本身没走完，
+                对两种结论都有价值；但 BLOCKED 不写（路径本身没走完，
                 写进去会把半截路径固化成"经验"）。
         yaml_warnings: 加载用例 YAML 时**写了但没被采纳**的判据字段。
                 必须进报告 —— 只 print 到 stdout 等于没人知道。
@@ -459,7 +459,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         #
         # 断言阶段可以降级成"判不了"，decide 阶段不行 —— 它要给出坐标，
         # 猜错坐标会点到不该点的地方（SKILL 里最严重的坑）。
-        # 所以这里既不猜、也不让整个用例 ERROR 掉：
+        # 所以这里既不猜、也不让整个用例变 BLOCKED：
         # 把这一轮判成 give_up（"模型给不出可用动作"），让图正常收尾、
         # 报告正常写出来。用户看到的会是 BLOCKED/FAIL + 明确原因，
         # 而不是"执行器崩溃、报告没写入"这种没法归因的结果。
@@ -522,7 +522,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                 # 早先只打告警、把 history 喂回去，属于"请求"模型改；
                 # 实测它照样连点 9 次。纪律要由代码兜底。
                 # 第一次作废决定；模型还耍赖就直接判失败收场 ——
-                # 否则会空转到轮次上限，最后给个 ERROR（看起来像环境问题，
+                # 否则会空转到轮次上限，最后给个 BLOCKED（看起来像环境问题，
                 # 其实是模型卡住了，结论会被误读）。
                 key = f"({ans.get('next_x')},{ans.get('next_y')})"
 
@@ -539,7 +539,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                 # ⚠️ 但这个豁免必须**有上限**，否则它就是个无限通行证。
                 # 真机 168 实测：模型在「取消」和「前往设置」之间来回点了
                 # 7 轮，每轮都申报 is_dialog → 计数每轮被清零 → 交替循环检测
-                # 永远看不到 3 个点 → 一路点到轮次上限 80，整条用例 ERROR。
+                # 永远看不到 3 个点 → 一路点到轮次上限 80，整条用例 BLOCKED。
                 #
                 # 所以：同一屏上连续申报弹窗的次数用完就不再豁免。
                 # 正常清弹窗 1~2 次就够，给到 4 次已经很宽松。
@@ -663,7 +663,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         report = SubagentReport(**json.loads(report_path.read_text(encoding="utf-8")))
     else:
         report = SubagentReport(
-            case_id=spec.case_id, status="ERROR",
+            case_id=spec.case_id, status="BLOCKED",
             summary="未产出报告（执行异常）", session_id=sid)
 
     # ── 未采纳的判据字段：必须进报告 ──────────────────────────────
@@ -698,9 +698,9 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     #
     # 只在 PASS/FAIL 时写：
     #   PASS/FAIL = 路径走完了，实际怎么走到的有参考价值
-    #   BLOCKED/ERROR = 路径没走完，写进去会把半截路径固化成"经验"
+    #   BLOCKED = 路径没走完，写进去会把半截路径固化成"经验"
     #
-    # 失败不影响结论 —— 回写/生成是附带产物，不该让一次成功的执行变 ERROR。
+    # 失败不影响结论 —— 回写/生成是附带产物，不该让一次成功的执行变 BLOCKED。
     if writeback and not case_yaml_path and report.status in ("PASS", "FAIL"):
         # ★ 首次生成：这次跑之前没有 YAML，跑完了就把它沉淀下来。
         try:

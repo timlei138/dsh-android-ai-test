@@ -86,7 +86,7 @@ ck("★ 没动活着的会话", sid_alive not in ids, str(ids))
 # 检查状态
 row = d._conn().execute("SELECT status FROM sessions WHERE id=?",
                         (sid_dead,)).fetchone()
-ck("dead 会话变成 ERROR", row["status"] == "ERROR", row["status"])
+ck("dead 会话变成 BLOCKED", row["status"] == "BLOCKED", row["status"])
 row2 = d._conn().execute("SELECT status FROM sessions WHERE id=?",
                          (sid_alive,)).fetchone()
 ck("alive 会话仍 running", row2["status"] == "running", row2["status"])

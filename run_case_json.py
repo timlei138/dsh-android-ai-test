@@ -132,14 +132,14 @@ def main() -> int:
 
     raw = sys.stdin.read()
     if not raw.strip():
-        emit({"status": "ERROR", "summary": "没有收到用例数据",
+        emit({"status": "BLOCKED", "summary": "没有收到用例数据",
               "issues": ["stdin 为空"]})
         return 2
 
     try:
         spec_in = json.loads(raw)
     except json.JSONDecodeError as e:
-        emit({"status": "ERROR", "summary": "用例 JSON 解析失败",
+        emit({"status": "BLOCKED", "summary": "用例 JSON 解析失败",
               "issues": [str(e)]})
         return 2
 
@@ -188,7 +188,7 @@ def main() -> int:
                 perm_action=spec_in.get("perm_action") or None,
             )
     except Exception as e:
-        emit({"status": "ERROR", "summary": "用例结构不合法",
+        emit({"status": "BLOCKED", "summary": "用例结构不合法",
               "issues": [f"{type(e).__name__}: {e}"]})
         return 2
 
@@ -206,7 +206,7 @@ def main() -> int:
     if _engine not in ("model", "autopilot"):
         # 拼错时**报错**，不要静默退回某个引擎 ——
         # 静默退回正是"拿到假成绩却不知道"的成因。
-        emit({"status": "ERROR",
+        emit({"status": "BLOCKED",
               "summary": f"answer 只能是 model / autopilot，收到 {_engine!r}",
               "issues": ["拼写错误不会被静默容忍（否则会拿到不是你要的引擎的成绩）"]})
         return 2

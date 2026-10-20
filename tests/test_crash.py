@@ -113,7 +113,7 @@ class RejectedDev:
         self.observes += 1
         raise ca.ToolError(
             "Session 1 has incomplete recording. Resolve it and finish "
-            "ERROR/BLOCKED; do not replay actions.",
+            "BLOCKED with a reason; do not replay actions.",
             executed=False, returncode=3)
 
     def act(self, *a, **k):

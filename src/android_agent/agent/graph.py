@@ -310,7 +310,7 @@ def gate_node(state: CaseState) -> dict[str, Any]:
 
 def finish_node(state: CaseState) -> dict[str, Any]:
     """收尾提交。只在闸门放行后到达。"""
-    _dev().finish(status=state.get("status", "ERROR"),
+    _dev().finish(status=state.get("status", "BLOCKED"),
                   summary=state.get("summary", ""))
     return {"findings": []}
 
