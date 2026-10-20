@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path    TEXT,
     llm_path    TEXT,
     report_path TEXT,
+    -- ★ 这次跑的是**哪个用例文件**。没有它，报告只能告诉你 "168 跑过了"，
+    --   却指不回"当时那份 YAML 长什么样"—— 而 YAML 是会变的
+    --   （168 就改过 a3 的判据）。光看结论没法复核判据对不对。
+    --
+    --   存两份：
+    --     case_yaml_path  文件路径，点进去能看当前版本
+    --     case_yaml       跑的那一刻的内容快照
+    --
+    --   为什么要快照：YAML 改过之后，旧记录如果只存路径，看到的
+    --   就是**新判据配上旧结论**，等于在骗自己。
+    case_yaml_path TEXT,
+    case_yaml   TEXT,
     report_json TEXT              -- 完整报告，用于"详情页要什么给什么"
 );
 
@@ -141,7 +153,39 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     con = sqlite3.connect(str(p), timeout=10.0)
     con.row_factory = sqlite3.Row
     con.executescript(_SCHEMA)
+    _migrate(con)
     return con
+
+
+#: 建表之后又加的列：(表, 列, 类型)。老库靠它补齐。
+#:
+#: ⚠️ CREATE TABLE IF NOT EXISTS 对**已存在**的表完全不生效，
+#:    所以加了新列之后老库不会自动多出来。表现是 insert 报
+#:    "table runs has no column named case_yaml_path" —— 而我们的
+#:    save_run 是吞异常的，于是变成"跑完了但没落库"这种难查的问题。
+_ADDED_COLUMNS = (
+    ("runs", "case_yaml_path", "TEXT"),
+    ("runs", "case_yaml", "TEXT"),
+)
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """把老库缺的列补上。幂等，每次 connect 都跑（一次 PRAGMA 很便宜）。"""
+    for table, col, typ in _ADDED_COLUMNS:
+        try:
+            have = {r["name"] for r in
+                    con.execute(f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.Error:
+            continue
+        if not have or col in have:
+            continue
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            con.commit()
+        except sqlite3.Error:
+            # 加列失败不该让整个库打不开 —— 老数据还能看。
+            # 但要让调用方知道，所以不做静默 pass，由上层报。
+            pass
 
 
 # ---------- 写入 -----------------------------------------------------------
@@ -170,6 +214,8 @@ def save_run(
     report: dict[str, Any],
     ledger_rows: list[dict[str, Any]],
     paths: dict[str, str] | None = None,
+    case_yaml_path: str = "",
+    case_yaml: str = "",
     db: str | Path | None = None,
 ) -> int:
     """把一次运行整体落库，返回 run_id。
@@ -181,6 +227,12 @@ def save_run(
     崩了也会走到收尾 —— 所以一次性写入更简单，也不会看到半截数据。
 
     真要"实时看进度"，那是另一个功能（tail 日志），不该靠半截库凑。
+
+    ## case_yaml_path / case_yaml
+
+    记下这次跑的是**哪个文件**、**当时那份内容**。
+    只存路径不够：YAML 会被改（168 的 a3 判据就改过），
+    旧记录只存路径的话，点开看到的是"新判据 + 旧结论"，等于自欺。
     """
     con = connect(db)
     try:
@@ -199,8 +251,9 @@ def save_run(
                 steps_done, steps_total, auto_rate, elapsed_s,
                 by_model, by_code, engine,
                 started_at, started_ts, finished_at,
-                ledger_path, log_path, llm_path, report_path, report_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ledger_path, log_path, llm_path, report_path,
+                case_yaml_path, case_yaml, report_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 case_name,
                 str(report.get("case_id") or ""),
@@ -221,6 +274,8 @@ def save_run(
                 (paths or {}).get("log"),
                 (paths or {}).get("llm"),
                 (paths or {}).get("report") or report.get("report_path"),
+                case_yaml_path or None,
+                case_yaml or None,
                 json.dumps(report, ensure_ascii=False),
             ),
         )
@@ -302,12 +357,19 @@ def _fmt_ts(ts: Any) -> str:
 
 def list_runs(*, case_name: str = "", limit: int = 100,
               db: str | Path | None = None) -> list[dict[str, Any]]:
-    """运行列表，新的在前。不返回 report_json（列表页用不上，还占带宽）。"""
+    """运行列表，新的在前。
+
+    不返回 report_json / case_yaml —— 列表页用不上，还占带宽
+    （case_yaml 一个就 5-8KB，100 条就是近 1MB）。
+    列表里只带 case_yaml_path，够显示"这条跑的是哪个文件"了。
+    """
     con = connect(db)
     try:
         sql = ("SELECT run_id, case_name, case_id, case_title, status, summary,"
                " steps_done, steps_total, auto_rate, elapsed_s, by_model, by_code,"
-               " engine, started_at, finished_at, ledger_path, log_path, llm_path"
+               " engine, started_at, finished_at, ledger_path, log_path, llm_path,"
+               " case_yaml_path,"
+               " (case_yaml IS NOT NULL) AS has_yaml"
                " FROM runs")
         args: list[Any] = []
         if case_name:
@@ -378,7 +440,11 @@ def compare_runs(a: int, b: int, *,
 
 
 def stats(*, db: str | Path | None = None) -> dict[str, Any]:
-    """仪表盘要的汇总：各状态数量、最近趋势、平均耗时。"""
+    """仪表盘要的汇总：各状态数量、最近趋势、平均耗时。
+
+    `days` 是**最近三天**按天的成败分布（旧 skill 的仪表盘就这么画的）。
+    缺失的日期要补 0 —— 否则"昨天没跑"和"昨天全过"在图上没区别。
+    """
     con = connect(db)
     try:
         by_status = {r["status"]: r["n"] for r in con.execute(
@@ -397,12 +463,30 @@ def stats(*, db: str | Path | None = None) -> dict[str, Any]:
             r = con.execute("SELECT status FROM runs WHERE run_id = ?",
                             (c["last_run"],)).fetchone()
             c["last_status"] = r["status"] if r else ""
+
+        # 最近三天，按 started_at 的日期前缀分组。
+        # started_at 是 "YYYY-MM-DD HH:MM:SS"，取前 10 位就是日期。
+        days: dict[str, dict[str, int]] = {}
+        for r in con.execute(
+                "SELECT substr(started_at,1,10) d, status, COUNT(*) n"
+                " FROM runs WHERE started_at IS NOT NULL"
+                " GROUP BY d, status"):
+            d = r["d"] or ""
+            if not d:
+                continue
+            slot = days.setdefault(d, {"total": 0})
+            slot[r["status"] or "?"] = r["n"]
+            slot["total"] += r["n"]
+        trend = sorted(({"day": k, **v} for k, v in days.items()),
+                       key=lambda x: x["day"], reverse=True)[:7]
+
         return {
             "total": total,
             "by_status": by_status,
             "avg_elapsed_s": round(avg, 1) if avg else None,
             "recent": rows,
             "cases": cases,
+            "days": trend,
         }
     finally:
         con.close()

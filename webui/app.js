@@ -65,50 +65,371 @@ async function renderSidebar() {
   }
 }
 
-/* ---------- 视图：总览 ---------- */
+/* ---------- 视图：总览 ----------
+ *
+ * 布局参照旧 skill 的仪表盘（三段顶栏 + 按用例列），但数据全换成我们自己的：
+ *
+ *   ① 用例总数 + 整体通过率   ← 注意这里的分母是**用例**，不是运行次数。
+ *      旧 skill 混用过这两个口径，同一个"成功率"换个页面数就不一样了。
+ *   ② 环形图：各用例最近一次的结论分布
+ *   ③ 最近三天每天跑了多少、成多少败多少
+ *   ④ 按用例列成功率（由低到高 —— 最该看的排最前）
+ *
+ * 不引 echarts：旧 skill 带了个 1MB 的 echarts.min.js，我们只用饼图和柱状图，
+ * 用 SVG 手画就够，还能少一个要维护的第三方文件。
+ */
 async function viewDashboard() {
-  const s = await api('/api/stats');
+  const [s, cases] = await Promise.all([
+    api('/api/stats'),
+    api('/api/cases').catch(() => ({ items: [] })),
+  ]);
   if (!s.total) {
     main.innerHTML = `<h1>总览</h1>
       <div class="hint">还没有任何运行记录。先跑一个用例：
       <span class="mono">echo '{"case_name":"168"}' | python run_case_json.py</span></div>`;
     return;
   }
-  const bs = s.by_status || {};
-  const cards = `
-    <div class="cards">
-      <div class="card"><div class="n">${s.total}</div><div class="l">总运行次数</div></div>
-      <div class="card pass"><div class="n">${bs.PASS || 0}</div><div class="l">PASS</div></div>
-      <div class="card fail"><div class="n">${bs.FAIL || 0}</div><div class="l">FAIL</div></div>
-      <div class="card block"><div class="n">${bs.BLOCKED || 0}</div><div class="l">BLOCKED</div></div>
-      <div class="card"><div class="n">${fmtDur(s.avg_elapsed_s)}</div><div class="l">平均耗时</div></div>
+
+  const cs = s.cases || [];
+  // ★ 口径：一个用例只算一次，取它最近一次的结论。
+  //   用总运行次数当分母会让"反复重跑直到过"看起来像稳定性提升。
+  const lastOk = cs.filter((c) => c.last_status === 'PASS').length;
+  const lastFail = cs.filter((c) => c.last_status === 'FAIL').length;
+  const lastBlocked = cs.filter((c) => c.last_status === 'BLOCKED').length;
+  const lastOther = cs.length - lastOk - lastFail - lastBlocked;
+  const passPct = cs.length ? Math.round((lastOk / cs.length) * 100) : 0;
+
+  /* 最近三天：缺失的日子补 0，否则"昨天没跑"和"昨天全过"在图上没区别 */
+  const dayMap = {};
+  (s.days || []).forEach((d) => { dayMap[d.day] = d; });
+  const labels = ['今天', '昨天', '前天'];
+  const three = [];
+  for (let i = 0; i < 3; i++) {
+    const dt = new Date(Date.now() - i * 86400000);
+    const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    const r = dayMap[key] || {};
+    const tot = r.total || 0;
+    three.push({
+      label: labels[i], date: key, total: tot,
+      pass: r.PASS || 0, fail: r.FAIL || 0, blocked: r.BLOCKED || 0,
+      pct: tot ? Math.round((r.PASS || 0) / tot * 100) : null,
+    });
+  }
+
+  /* 环形图：用 stroke-dasharray 画，不依赖任何图表库 */
+  const ring = [
+    { k: 'PASS', v: lastOk, c: 'var(--pass)' },
+    { k: 'FAIL', v: lastFail, c: 'var(--fail)' },
+    { k: 'BLOCKED', v: lastBlocked, c: 'var(--block)' },
+    { k: '未跑', v: lastOther, c: 'var(--dim)' },
+  ].filter((x) => x.v > 0);
+  const R = 54, C = 2 * Math.PI * R;
+  let off = 0;
+  const arcs = ring.map((x) => {
+    const len = cs.length ? (x.v / cs.length) * C : 0;
+    const el = `<circle cx="70" cy="70" r="${R}" fill="none" stroke="${x.c}"
+      stroke-width="20" stroke-dasharray="${len} ${C - len}"
+      stroke-dashoffset="${-off}" transform="rotate(-90 70 70)"></circle>`;
+    off += len;
+    return el;
+  }).join('');
+  const ringHtml = ring.length ? `
+    <svg viewBox="0 0 140 140" class="ring">
+      <circle cx="70" cy="70" r="${R}" fill="none" stroke="var(--line)" stroke-width="20"></circle>
+      ${arcs}
+      <text x="70" y="66" text-anchor="middle" class="ring-n">${cs.length}</text>
+      <text x="70" y="86" text-anchor="middle" class="ring-l">个用例</text>
+    </svg>` : '<div class="empty">无用例</div>';
+
+  /* 三天柱：高度按当天总数，里面再按成败分色 */
+  const maxDay = Math.max(1, ...three.map((d) => d.total));
+  const bars = three.slice().reverse().map((d) => {
+    const h = (d.total / maxDay) * 100;
+    const seg = (n) => d.total ? (n / d.total) * 100 : 0;
+    return `<div class="bar-col">
+      <div class="bar-stack" style="height:${d.total ? h : 3}%">
+        ${d.total ? `<i style="height:${seg(d.pass)}%;background:var(--pass)"></i>
+        <i style="height:${seg(d.fail)}%;background:var(--fail)"></i>
+        <i style="height:${seg(d.blocked)}%;background:var(--block)"></i>`
+        : '<i style="height:100%;background:var(--line)"></i>'}
+      </div>
+      <div class="bar-n">${d.total || ''}</div>
+      <div class="bar-l">${esc(d.label)}</div>
+      <div class="bar-pct">${d.pct == null ? '—' : d.pct + '%'}</div>
     </div>`;
+  }).join('');
 
-  const caseRows = (s.cases || []).map((c) => `<tr class="clickable" data-case="${esc(c.case_name)}">
-      <td class="mono">${esc(c.case_name)}</td>
-      <td>${badge(c.last_status)}</td>
-      <td>${c.n}</td>
-      <td>${esc(c.last_at || '—')}</td>
-    </tr>`).join('');
-
-  const recentRows = (s.recent || []).map((r) => `<tr class="clickable" data-run="${r.run_id}">
-      <td class="mono">#${r.run_id}</td>
-      <td class="mono">${esc(r.case_name)}</td>
-      <td>${badge(r.status)}</td>
-      <td>${fmtDur(r.elapsed_s)}</td>
-      <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
-      <td>${esc(r.started_at || '')}</td>
-    </tr>`).join('');
+  /* 按用例：成功率由低到高，最该关注的排最前 */
+  const rows = cs.map((c) => {
+    // 用例名下能查到几次运行、各是什么结论
+    return c;
+  }).map((c) => {
+    const okPct = c.last_status === 'PASS' ? 100
+      : c.last_status ? 0 : null;
+    return `<div class="mod-row" data-case="${esc(c.case_name)}">
+      <div class="mod-head">
+        <span class="mod-name">用例 ${esc(c.case_name)}</span>
+        <span class="mod-meta">${c.n} 次运行 · 最近 ${esc(c.last_at || '—')}</span>
+        <span class="mod-pct ${okPct === null ? 'none' : c.last_status === 'PASS' ? 'good' : 'bad'}">
+          ${badge(c.last_status)}</span>
+      </div>
+    </div>`;
+  }).join('');
 
   main.innerHTML = `<h1>总览</h1>
-    <div class="sub">每次运行都会留一条历史，不再互相覆盖。</div>
-    ${cards}
-    <h2>各用例最近一次</h2>
-    <table><thead><tr><th>用例</th><th>最近结果</th><th>运行次数</th><th>最近运行时间</th></tr></thead>
-    <tbody>${caseRows || '<tr><td colspan="4" class="empty">无</td></tr>'}</tbody></table>
-    <h2>最近运行动态</h2>
-    <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>耗时</th><th>自动化率</th><th>开始时间</th></tr></thead>
-    <tbody>${recentRows || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>`;
+    <div class="panel">
+      <div class="dash-top">
+        <div class="dash-seg seg-count">
+          <div class="seg-label">用例总数</div>
+          <div class="big-num">${cs.length}</div>
+          <div class="big-rate ${passPct >= 80 ? 'good' : passPct >= 50 ? 'mid' : 'bad'}">
+            整体通过率 <b>${passPct}%</b></div>
+          <div class="seg-note">按用例最近一次结论计，共 ${s.total} 次运行</div>
+        </div>
+        <div class="dash-seg seg-pie">
+          <div class="seg-label">用例整体成功情况</div>
+          ${ringHtml}
+          <div class="chart-legend">
+            ${ring.map((x) => `<span><i style="background:${x.c}"></i>${esc(x.k)} ${x.v}</span>`).join('')}
+          </div>
+        </div>
+        <div class="dash-seg seg-bar">
+          <div class="seg-label">最近三天成功 / 失败</div>
+          <div class="bars">${bars}</div>
+          <div class="chart-legend">
+            <span><i style="background:var(--pass)"></i>成功</span>
+            <span><i style="background:var(--fail)"></i>失败</span>
+            <span><i style="background:var(--block)"></i>阻断</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">用例情况</div>
+      <div class="mod-list">${rows || '<div class="muted">无用例</div>'}</div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">最近运行</div>
+      <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>耗时</th>
+        <th>自动化率</th><th>开始时间</th></tr></thead>
+      <tbody>${(s.recent || []).slice(0, 8).map((r) => `<tr class="clickable" data-run="${r.run_id}">
+        <td class="mono">#${r.run_id}</td>
+        <td class="mono">${esc(r.case_name)}</td>
+        <td>${badge(r.status)}</td>
+        <td>${fmtDur(r.elapsed_s)}</td>
+        <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
+        <td>${esc(r.started_at || '')}</td>
+      </tr>`).join('') || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>
+    </div>`;
+}
+
+/* ---------- 视图：用例库 ----------
+ *
+ * 参照旧 skill 的用例库：列出 storage/cases 下的 YAML，点进去看原文。
+ *
+ * 和旧 skill 的差别（按我们的实际情况改的）：
+ *   · 旧 skill 的用例是"数据库里的 case 记录 + 沉淀出来的 YAML"两份
+ *   · 我们只有 YAML 一份 —— 用例就是文件，没有第二个真相
+ *   · 所以这里直接把文件列出来，每个用例后面带"跑过几次 / 最近结论"，
+ *     那部分从 runs 库里按 case_id 对上来
+ */
+async function viewCases() {
+  const [{ items, dir }, s] = await Promise.all([
+    api('/api/cases'),
+    api('/api/stats').catch(() => ({ cases: [] })),
+  ]);
+  const byId = {};
+  (s.cases || []).forEach((c) => { byId[c.case_name] = c; });
+
+  const rows = items.map((c) => {
+    const run = byId[c.case_id] || {};
+    return `<tr class="clickable" data-casefile="${esc(c.name)}">
+      <td class="mono">${esc(c.case_id || '—')}</td>
+      <td>${esc(c.title)}</td>
+      <td>${c.valid ? '' : '<span class="badge UNKNOWN">校验用</span>'}</td>
+      <td>${run.n ? `<span class="badge ${esc(run.last_status || 'UNKNOWN')}">${esc(run.last_status || '—')}</span>` : '<span class="muted">未跑过</span>'}</td>
+      <td>${run.n || 0} 次</td>
+      <td class="mono" style="font-size:12px">${(c.size / 1024).toFixed(1)} KB</td>
+      <td style="color:var(--dim);font-size:12.5px">${esc(c.mtime)}</td>
+    </tr>`;
+  }).join('');
+
+  main.innerHTML = `<h1>用例库</h1>
+    <div class="sub">共 ${items.length} 个用例文件 · <span class="mono">${esc(dir)}</span></div>
+    <table><thead><tr><th>编号</th><th>用例</th><th></th><th>最近结论</th>
+      <th>跑过</th><th>大小</th><th>修改时间</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="7" class="empty">cases 目录里没有 YAML</td></tr>'}</tbody></table>`;
+}
+
+/* 单个用例文件：YAML 原文，只读
+ *
+ * ★ 为什么只读：用例 YAML 是"判据的唯一真相"，跑出来的结论都拿它对照。
+ *   在网页上随手改一改，旧记录就会变成"新判据配旧结论"，等于自欺。 */
+async function viewCaseFile(name) {
+  const c = await api('/api/case/' + encodeURIComponent(name));
+  const lines = c.content.split('\n');
+  const body = lines.map((ln, i) => {
+    const n = String(i + 1).padStart(4, ' ');
+    // 极简高亮：注释、键、列表符。不做完整 YAML 语法解析 —— 那要引入高亮库，
+    // 而我们看的是"哪一行写了什么"，够用了。
+    let html = esc(ln);
+    if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
+    else html = html
+      .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
+      .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
+    return `<span class="ln"><i>${n}</i>${html}</span>`;
+  }).join('\n');
+
+  main.innerHTML = `<h1>${esc(c.name)}</h1>
+    <div class="sub"><span class="mono">${esc(c.path)}</span> ·
+      ${(c.size / 1024).toFixed(1)} KB · 只读（改判据请直接编辑文件后重跑）</div>
+    <div class="codebox"><pre>${body}</pre></div>`;
+  main.querySelectorAll('[data-casefile]').forEach((el) => {
+    el.addEventListener('click', () => go('casefile', { name: el.dataset.casefile }));
+  });
+}
+
+/* ---------- 视图：视觉模型 ----------
+ *
+ * 参照旧 skill 的视觉模型页。配置**写在同一个文件**里
+ * （assets/storage/vision.json），也就是 decice/decide 运行时读的那份 ——
+ * 网页不回显明文 key，留空保存表示"不改密钥"。
+ */
+async function viewVision() {
+  const c = await api('/api/vision');
+  main.innerHTML = `<h1>视觉模型</h1>
+    <div class="sub">OpenAI 兼容通道。这份配置就是运行时读的
+      <span class="mono">${esc(c.file)}</span></div>
+    <div class="panel" style="max-width:660px">
+      <div class="kb-bar">
+        <b>视觉 / LLM 配置</b>
+        <span style="flex:1"></span>
+        <span class="muted" id="vs-state">${c.configured ? '已配置' : '未配置'}</span>
+        <button class="ghost" id="vs-test">测试连接</button>
+        <button id="vs-save">保存</button>
+      </div>
+      <div class="form">
+        <label>Base URL
+          <input id="vs-url" placeholder="https://api.deepseek.com" value="${esc(c.base_url || '')}"></label>
+        <label>Model
+          <input id="vs-model" placeholder="deepseek-flash / gpt-4o / qwen-vl-max" value="${esc(c.model || '')}"></label>
+        <label>API Key
+          <input id="vs-key" type="password" placeholder="${esc(c.api_key_masked || '未配置')}" value="" autocomplete="off"></label>
+        <div class="meta">Key 只显示掩码；<b>留空保存 = 保留原值</b>（避免只想改 model 却把密钥清掉）。
+          配置文件不进版本库。</div>
+      </div>
+      <div id="vs-result"></div>
+    </div>`;
+
+  const formVal = () => ({
+    base_url: $('#vs-url').value,
+    model: $('#vs-model').value,
+    api_key: $('#vs-key').value,
+  });
+
+  const post = (path, body) => fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  }).then(async (r) => {
+    const j = await r.json().catch(() => ({ error: '返回的不是 JSON' }));
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  });
+
+  $('#vs-save').addEventListener('click', async () => {
+    const btn = $('#vs-save');
+    btn.disabled = true;
+    $('#vs-state').textContent = '保存中…';
+    try {
+      await post('/api/vision', formVal());
+      $('#vs-key').value = '';
+      $('#vs-state').textContent = '已保存 ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      $('#vs-state').textContent = '保存失败：' + e.message;
+    }
+    btn.disabled = false;
+  });
+
+  // 测试连接：先存表单，再用后端发一次真请求。
+  // 顺序很重要 —— 不先存就是拿旧配置在测，测通了也说明不了什么。
+  $('#vs-test').addEventListener('click', async () => {
+    const btn = $('#vs-test');
+    const box = $('#vs-result');
+    btn.disabled = true;
+    box.innerHTML = '<div class="test-box pending">⏳ 正在用当前配置发一次真实请求（最多 40s）…</div>';
+    try {
+      await post('/api/vision', formVal());
+      $('#vs-key').value = '';
+      const r = await post('/api/vision/test');
+      box.innerHTML = r.ok
+        ? `<div class="test-box ok">✅ <b>连接成功</b> · 耗时 ${r.latency_ms}ms ·
+            模型 <code>${esc(r.model)}</code>
+           <div class="meta">模型回复：${esc(r.reply || '(空)')}</div>
+           ${r.usage ? `<div class="meta">tokens: ${esc(JSON.stringify(r.usage))}</div>` : ''}</div>`
+        : `<div class="test-box err">❌ <b>连接失败</b>：${esc(r.error || '未知错误')}
+           ${r.detail ? `<div class="meta">响应：${esc(r.detail)}</div>` : ''}
+           ${r.hint ? `<div class="meta">💡 ${esc(r.hint)}</div>` : ''}</div>`;
+    } catch (e) {
+      box.innerHTML = `<div class="test-box err">❌ 请求异常：${esc(e.message)}</div>`;
+    }
+    btn.disabled = false;
+  });
+}
+
+/* 详情页顶部的"原始用例信息"
+ *
+ * 需求原话：「记录详情里面要包含原始 case 信息。这样就知道是哪个 case 了。」
+ *
+ * ## 为什么必须存快照，而不是只存路径
+ *
+ * YAML 是会改的 —— 168 的 a3 判据就改过两次（先钉死 activity，
+ * 再换 album_reached，最后交模型）。如果旧记录只存路径，
+ * 点开看到的就是"新判据 + 旧结论"，反过来还以为当初就是照这么判的。
+ * 所以跑完那一刻把内容快照进库（runs.case_yaml），这里优先显示快照。
+ *
+ * 老记录（加这个字段之前跑的）没有快照，退回显示当前文件，
+ * 并**明确标出来"这是当前版本，不是你跑的那份"** —— 不要假装一样。
+ */
+function caseInfoHtml(run) {
+  const snap = run.case_yaml || '';
+  const path = run.case_yaml_path || '';
+  const fname = path.split(/[\\/]/).pop();
+  const rep = (() => { try { return JSON.parse(run.report_json || '{}'); } catch (_) { return {}; } })();
+  const pkg = (rep && rep.package) || '';
+
+  if (!snap && !path) {
+    return `<h2>原始用例</h2>
+      <div class="hint">这次运行没有记录用例来源（早于该功能加入）。</div>`;
+  }
+
+  const lines = (snap || '').split('\n');
+  const body = lines.map((ln, i) => {
+    const n = String(i + 1).padStart(4, ' ');
+    let html = esc(ln);
+    if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
+    else html = html
+      .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
+      .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
+    return `<span class="ln"><i>${n}</i>${html}</span>`;
+  }).join('\n');
+
+  return `<h2>原始用例</h2>
+    <div class="casebar">
+      ${fname ? `<span class="mono">${esc(fname)}</span>` : ''}
+      ${pkg ? `<span class="mono dim">${esc(pkg)}</span>` : ''}
+      ${snap
+        ? '<span class="tag ok">跑的时候那份</span>'
+        : '<span class="tag warn">当前文件（这次没存快照）</span>'}
+      ${fname ? `<a class="ghost-link" data-casefile="${esc(fname)}">在用例库打开</a>` : ''}
+      <span style="flex:1"></span>
+      <span class="muted">${lines.length} 行${snap ? '' : ' · 显示的是现在的版本'}</span>
+    </div>
+    ${snap ? '' : `<div class="hint warn">⚠️ 这份运行早于"记录用例快照"功能，
+      下面是<b>当前</b>的 YAML，可能已经和你跑的时候不一样了。</div>`}
+    <div class="codebox collapsed"><pre>${body}</pre></div>`;
 }
 
 /* ---------- 视图：运行记录列表 ---------- */
@@ -233,6 +554,8 @@ async function viewRun(runId) {
     </div>
     <div class="hint">${esc(run.summary || '')}</div>
 
+    ${caseInfoHtml(run)}
+
     <h2>断言结果</h2>
     <div class="findings">${findingsHtml || '<div class="empty">这次没有断言</div>'}</div>
 
@@ -270,6 +593,9 @@ async function route() {
   try {
     if (STATE.view === 'run') await viewRun(STATE.runId);
     else if (STATE.view === 'runs') await viewRuns(STATE.case);
+    else if (STATE.view === 'cases') await viewCases();
+    else if (STATE.view === 'casefile') await viewCaseFile(STATE.name);
+    else if (STATE.view === 'vision') await viewVision();
     else await viewDashboard();
   } catch (e) {
     main.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
@@ -277,25 +603,37 @@ async function route() {
 }
 
 function go(view, extra = {}) {
-  STATE = { view, case: extra.case || '', runId: extra.runId };
-  history.replaceState(STATE, '', `#${view}${extra.runId ? '/' + extra.runId : ''}${extra.case ? '?case=' + encodeURIComponent(extra.case) : ''}`);
+  STATE = {
+    view, case: extra.case || '', runId: extra.runId, name: extra.name,
+  };
+  const q = extra.case ? '?case=' + encodeURIComponent(extra.case)
+    : extra.name ? '?name=' + encodeURIComponent(extra.name) : '';
+  history.replaceState(STATE, '', `#${view}${extra.runId ? '/' + extra.runId : ''}${q}`);
   route();
 }
 
-/* 事件委托：侧栏、表格行 */
+/* 事件委托：侧栏、表格行、用例文件链接 */
 document.addEventListener('click', (e) => {
   const nav = e.target.closest('.nav-item');
   if (nav && nav.dataset.view) {
     const v = nav.dataset.view;
     if (v === 'runs') return go('runs');
+    if (v === 'cases') return go('cases');
+    if (v === 'vision') return go('vision');
     return go('dashboard');
   }
+  // 用例文件（用例库的表格行、详情页的"在用例库打开"）
+  const cf = e.target.closest('[data-casefile]');
+  if (cf) return go('casefile', { name: cf.dataset.casefile });
   const cnav = e.target.closest('[data-case]');
   if (cnav && !cnav.dataset.run) {
     return go('runs', { case: cnav.dataset.case });
   }
   const row = e.target.closest('tr[data-run]');
   if (row) return go('run', { runId: row.dataset.run });
+  // 用例详情里的代码框：点一下展开/收起（YAML 动辄 200 行）
+  const code = e.target.closest('.codebox.collapsed');
+  if (code) code.classList.remove('collapsed');
   if (e.target.id === 'lightbox' || e.target.id === 'lightbox-img') {
     $('#lightbox').classList.add('hidden');
   }

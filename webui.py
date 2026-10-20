@@ -24,10 +24,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,8 +63,174 @@ else:
               f"已自动改用 {_root / 'assets'}", file=sys.stderr)
 
 from android_agent.reporting import store as st  # noqa: E402
+from android_agent.cases.paths import cases_dir as _cases_dir  # noqa: E402
 
 STATIC = _HERE / "webui"
+
+
+# ── 视觉模型配置 ──────────────────────────────────────────────────────
+#
+# 和 decide.py / vision.py 读的是**同一个文件**（storage/vision.json）。
+# 不改配置来源，只加一个网页界面 —— 两边各存一份迟早对不上。
+#
+# ⚠️ api_key 绝不明文回显。GET 只给脱敏值，改的时候留空表示"不动密钥"。
+VISION_KEYS = ("base_url", "model", "api_key")
+
+
+def _vision_file() -> Path:
+    root = os.environ.get("ANDROID_SKILL_ROOT")
+    base = Path(root) if root else (_HERE / "assets")
+    return base / "storage" / "vision.json"
+
+
+def _mask(s: str) -> str:
+    """只留首 4 末 4。短到分不出来就整串打码。"""
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "*" * len(s)
+    return s[:4] + "*" * (len(s) - 8) + s[-4:]
+
+
+def _load_vision() -> dict[str, str]:
+    conf = {k: "" for k in VISION_KEYS}
+    fp = _vision_file()
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            for k in VISION_KEYS:
+                conf[k] = str(data.get(k) or "")
+    except (OSError, ValueError):
+        pass          # 没有配置文件是正常状态（还没配过）
+    return conf
+
+
+def _save_vision(conf: dict[str, str]) -> None:
+    fp = _vision_file()
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(json.dumps(conf, ensure_ascii=False, indent=2),
+                  encoding="utf-8")
+
+
+# ── 用例文件 ──────────────────────────────────────────────────────────
+
+def _case_files() -> list[dict]:
+    """assets/storage/cases/*.yaml 的清单。
+
+    ⚠️ 故意**不解析**每个文件来取标题：解析要跑 YAML + pydantic 校验，
+    10 个文件还行，以后多了就慢。文件名本身就带用例名和编号。
+    case_id 从文件名前缀抠（"联想日历_168_图库导入入口" -> "168"）。
+    """
+    out = []
+    d = Path(_cases_dir())
+    if not d.is_dir():
+        return out
+    for fp in sorted(d.glob("*.yaml")):
+        name = fp.stem
+        cid = ""
+        for seg in name.split("_"):
+            if seg.isdigit():
+                cid = seg
+                break
+        out.append({
+            "name": fp.name,
+            "title": name,
+            "case_id": cid,
+            "size": fp.stat().st_size,
+            "mtime": _fmt_mtime(fp.stat().st_mtime),
+            "valid": "invalid" not in name.lower(),
+        })
+    return out
+
+
+def _fmt_mtime(ts: float) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _find_case_file(name: str) -> Path | None:
+    """按文件名找用例。**只允许 cases 目录内**，防路径穿越。"""
+    root = Path(_cases_dir()).resolve()
+    cand = (root / name).resolve()
+    if not str(cand).startswith(str(root)) or not cand.is_file():
+        return None
+    return cand
+
+
+def _test_vision() -> dict:
+    """拿 storage/vision.json 发一次**真实**请求，看视觉通道通不通。
+
+    为什么不做成"检查字段填了没"：填了不等于能用 —— key 错了、
+    模型名写错、base_url 少个 /v1，都只有真发一次才知道。
+    旧 skill 也是这么做的（发一张 1x1 的图）。
+
+    用 1x1 图而不是本机截图：不依赖证据文件，任何机器上都能测。
+    """
+    conf = _load_vision()
+    if not (conf["base_url"] and conf["model"] and conf["api_key"]):
+        missing = [k for k in ("base_url", "model", "api_key") if not conf[k]]
+        return {"ok": False, "error": f"配置不完整，缺：{', '.join(missing)}"}
+
+    import base64
+    import time
+
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    b64 = base64.b64encode(png_1x1).decode("ascii")
+
+    payload = {
+        "model": conf["model"],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "这张图是什么颜色？只回答一个词。"},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]}],
+        "max_tokens": 2000,     # 推理模型给太小会空返回，见 vision.py 注释
+    }
+    url = conf["base_url"].rstrip("/") + "/chat/completions"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {conf['api_key']}"},
+        method="POST")
+
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:400]
+        except OSError:
+            pass
+        return {"ok": False, "latency_ms": int((time.time() - t0) * 1000),
+                "error": f"HTTP {e.code}", "detail": detail,
+                "hint": "401/403 多半是 key 不对；404 检查 base_url 是否要带 /v1"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "latency_ms": int((time.time() - t0) * 1000),
+                "error": f"{type(e).__name__}: {e}",
+                "hint": "网络不通或 base_url 写错；公司内网可能要代理"}
+
+    ms = int((time.time() - t0) * 1000)
+    try:
+        text = (body["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return {"ok": False, "latency_ms": ms,
+                "error": "返回结构不认识", "detail": json.dumps(
+                    body, ensure_ascii=False)[:400]}
+
+    usage = body.get("usage") or {}
+    if not text:
+        # ok=true 但没文本 = 额度被 reasoning 吃光。别当成功。
+        return {"ok": False, "latency_ms": ms, "model": conf["model"],
+                "usage": usage,
+                "error": "模型返回空文本（通常是 max_tokens 被 reasoning 吃光）",
+                "hint": f"usage: {usage}"}
+    return {"ok": True, "latency_ms": ms, "model": conf["model"],
+            "reply": text[:200], "usage": usage}
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -156,6 +325,37 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._err("需要 a 和 b 两个 run_id")
             return self._json(st.compare_runs(a, b))
+
+        # --- 用例文件 ---
+        #
+        # 和旧 skill 一样：列出 cases 目录，点进去看 YAML 原文。
+        # 我们比旧 skill 多一层 —— 运行记录会带 case_yaml 快照，
+        # 所以详情页能显示"跑的时候那份"，而不只是"现在这份"。
+        if path == "/api/cases":
+            return self._json({"items": _case_files(),
+                               "dir": str(_cases_dir())})
+
+        if path.startswith("/api/case/"):
+            name = path[len("/api/case/"):]
+            fp = _find_case_file(name)
+            if not fp:
+                return self._err(f"没有这个用例文件：{name}", 404)
+            try:
+                content = fp.read_text(encoding="utf-8")
+            except OSError as e:
+                return self._err(f"读不出来：{e}", 500)
+            return self._json({"name": fp.name, "path": str(fp),
+                               "content": content,
+                               "size": fp.stat().st_size})
+
+        # --- 视觉模型配置 ---
+        if path == "/api/vision":
+            conf = _load_vision()
+            key = conf.pop("api_key", "")
+            conf["api_key_masked"] = _mask(key)
+            conf["configured"] = bool(key)
+            conf["file"] = str(_vision_file())
+            return self._json(conf)
 
         # 运行日志 / 模型对话：原样回文本，前端直接渲染
         if path.startswith("/api/file/"):
@@ -263,6 +463,45 @@ class Handler(BaseHTTPRequestHandler):
             return self._err("没有这个页面", 404)
         self._send(200, p.read_bytes(),
                    _MIME.get(p.suffix.lower(), "application/octet-stream"))
+
+    # ── POST ──────────────────────────────────────────────────────
+    def _body(self) -> dict | None:
+        """读请求体并解析成 dict。解析失败返回 None（调用方回 400）。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0:
+                return {}
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
+        except (ValueError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def do_POST(self):  # noqa: N802
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+
+        if path == "/api/vision":
+            data = self._body()
+            if data is None:
+                return self._err("请求体不是合法 JSON")
+            conf = _load_vision()
+            for k in VISION_KEYS:
+                v = str(data.get(k) or "").strip()
+                # ★ api_key 留空 = 保留原值。
+                #   否则"只想改 model"会把密钥清掉，下一个用例直接跑不动，
+                #   而且报错会是"LLM 配置不完整"，看不出是这个页面干的。
+                if k == "api_key" and not v and conf["api_key"]:
+                    continue
+                conf[k] = v
+            try:
+                _save_vision(conf)
+            except OSError as e:
+                return self._err(f"写不进去：{e}", 500)
+            return self._json({"ok": True, "file": str(_vision_file())})
+
+        if path == "/api/vision/test":
+            return self._json(_test_vision())
+
+        return self._err("没有这个接口", 404)
 
 
 def _already_running(host: str, port: int) -> bool:

@@ -154,3 +154,113 @@ a:hover{text-decoration:underline}
 .mono{font-family:ui-monospace,Consolas,monospace; font-size:12.5px}
 .hint{background:#f0f6ff; border:1px solid #d3e2fb; color:#1e40af;
   padding:9px 13px; border-radius:8px; font-size:13px; margin:12px 0}
+
+
+/* ══════════════════════════════════════════════════════════════
+   仪表盘（参照旧 skill 的三段式布局）
+   ══════════════════════════════════════════════════════════════ */
+.panel{background:var(--panel); border:1px solid var(--line);
+  border-radius:10px; padding:16px 18px; margin:14px 0}
+.panel-title{font-size:13px; font-weight:600; color:#374151; margin-bottom:12px}
+.dash-top{display:grid; grid-template-columns:1fr 1fr 1.3fr; gap:20px; align-items:start}
+.dash-seg{min-width:0}
+.seg-label{font-size:12.5px; color:var(--dim); margin-bottom:10px}
+.big-num{font-size:46px; font-weight:700; line-height:1; letter-spacing:-1px}
+.big-rate{margin-top:10px; font-size:13px; color:var(--dim)}
+.big-rate b{font-size:15px}
+.big-rate.good b{color:var(--pass)}
+.big-rate.mid b{color:var(--block)}
+.big-rate.bad b{color:var(--fail)}
+.seg-note{margin-top:8px; font-size:12px; color:var(--dim)}
+.ring{width:140px; height:140px; display:block; margin:0 auto}
+.ring-n{font-size:26px; font-weight:700; fill:var(--text)}
+.ring-l{font-size:11px; fill:var(--dim)}
+.chart-legend{display:flex; gap:12px; flex-wrap:wrap; justify-content:center;
+  margin-top:10px; font-size:12px; color:var(--dim)}
+.chart-legend i{display:inline-block; width:9px; height:9px; border-radius:2px;
+  margin-right:5px; vertical-align:-1px}
+.bars{display:flex; align-items:flex-end; gap:14px; height:120px;
+  padding:0 4px; border-bottom:1px solid var(--line)}
+.bar-col{flex:1; display:flex; flex-direction:column; justify-content:flex-end;
+  align-items:center; height:100%; position:relative}
+.bar-stack{width:34px; display:flex; flex-direction:column; justify-content:flex-end;
+  border-radius:3px 3px 0 0; overflow:hidden; min-height:3px}
+.bar-stack i{display:block; width:100%}
+.bar-n{font-size:12px; font-weight:600; margin-top:4px}
+.bar-l{font-size:11.5px; color:var(--dim)}
+.bar-pct{font-size:11px; color:var(--dim)}
+
+/* 按用例列表 */
+.mod-list{display:flex; flex-direction:column; gap:6px}
+.mod-row{border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+  cursor:pointer; transition:background .12s}
+.mod-row:hover{background:#fafcff; border-color:#cfd8e6}
+.mod-head{display:flex; align-items:center; gap:12px}
+.mod-name{font-weight:600; font-size:13.5px; flex:0 0 auto}
+.mod-meta{color:var(--dim); font-size:12px; flex:1; min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.mod-pct.none{color:var(--dim)}
+.muted{color:var(--dim); font-size:13px}
+
+/* ══════════════════════════════════════════════════════════════
+   代码 / YAML 展示
+   ══════════════════════════════════════════════════════════════ */
+.codebox{background:var(--code); border:1px solid var(--line);
+  border-radius:9px; overflow:auto; max-height:none}
+.codebox.collapsed{max-height:340px; cursor:pointer; position:relative}
+.codebox.collapsed::after{content:''; position:absolute; left:0; right:0;
+  bottom:0; height:56px; background:linear-gradient(transparent,#f6f8fa);
+  pointer-events:none}
+.codebox pre{margin:0; padding:10px 12px; font-size:12.5px; line-height:1.6;
+  font-family:ui-monospace,Consolas,monospace; white-space:pre; tab-size:2}
+.codebox .ln{display:block}
+.codebox .ln i{display:inline-block; width:42px; color:#b3bac4;
+  font-style:normal; user-select:none; text-align:right; margin-right:12px}
+.c-cm{color:#8a94a4; font-style:italic}
+.c-k{color:#1f5fbf}
+.c-ds{color:#b26a00}
+
+/* 用例信息条 */
+.casebar{display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  margin:6px 0 8px; font-size:12.5px}
+.casebar .dim{color:var(--dim)}
+.tag{font-size:11.5px; padding:1px 8px; border-radius:999px; font-weight:600}
+.tag.ok{background:var(--pass-bg); color:var(--pass)}
+.tag.warn{background:var(--block-bg); color:var(--block)}
+.ghost-link{color:var(--accent); cursor:pointer; text-decoration:none}
+.ghost-link:hover{text-decoration:underline}
+.hint.warn{background:var(--block-bg); border-color:#f2d9a8; color:#7a4b00}
+
+/* ══════════════════════════════════════════════════════════════
+   视觉模型配置
+   ══════════════════════════════════════════════════════════════ */
+.kb-bar{display:flex; align-items:center; gap:10px; padding-bottom:12px;
+  border-bottom:1px solid var(--line); margin-bottom:14px; font-size:13px}
+.kb-bar b{font-size:13.5px}
+.form{display:flex; flex-direction:column; gap:12px}
+.form label{display:flex; flex-direction:column; gap:5px; font-size:12.5px;
+  color:#374151; font-weight:600}
+.form input{padding:8px 10px; border:1px solid var(--line); border-radius:7px;
+  font-size:13px; font-family:ui-monospace,Consolas,monospace; font-weight:400}
+.form input:focus{outline:none; border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(47,110,224,.12)}
+.form .meta{color:var(--dim); font-size:12px; font-weight:400; line-height:1.6}
+button{padding:6px 14px; border-radius:7px; border:1px solid var(--accent);
+  background:var(--accent); color:#fff; font-size:13px; cursor:pointer;
+  font-family:inherit}
+button:hover{filter:brightness(1.07)}
+button:disabled{opacity:.55; cursor:default}
+button.ghost{background:#fff; color:var(--accent)}
+.test-box{margin-top:14px; padding:11px 14px; border-radius:8px; font-size:13px;
+  line-height:1.7}
+.test-box.pending{background:#eef3fd; color:#1f5fbf}
+.test-box.ok{background:var(--pass-bg); color:#14603a}
+.test-box.err{background:var(--fail-bg); color:#8e2b20}
+.test-box .meta{color:var(--dim); font-size:12px; margin-top:4px;
+  word-break:break-all}
+
+/* 窄屏：三段改竖排 */
+@media (max-width:980px){
+  .dash-top{grid-template-columns:1fr}
+  #sidebar{width:170px; flex:0 0 170px}
+}

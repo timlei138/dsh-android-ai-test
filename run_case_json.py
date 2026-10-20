@@ -331,6 +331,19 @@ def main() -> int:
                     except json.JSONDecodeError:
                         pass
         _rep = report.to_dict()
+        # ★ 记下这次跑的是哪个用例文件、当时那份内容。
+        #
+        # 只存路径不够 —— YAML 会被改（168 的 a3 判据就改过），
+        # 旧记录点开看到"新判据 + 旧结论"等于自欺。
+        # 所以在跑完这一刻把内容**快照**下来。
+        _yaml_path = str(ypath) if ypath else ""
+        _yaml_text = ""
+        if ypath:
+            try:
+                from pathlib import Path as _P
+                _yaml_text = _P(ypath).read_text(encoding="utf-8")
+            except OSError:
+                _yaml_text = ""      # 读不到就不存内容，路径照样存
         # 报告里的 steps_done 是"做了几步"，总步数在 summary 的
         # 「步骤 7/7」里 —— store 自己会去抠。
         run_id = _store.save_run(
@@ -343,6 +356,8 @@ def main() -> int:
                 "llm": str(_tmp() / f"llm_{spec.case_id}.md"),
                 "report": str(report_path),
             },
+            case_yaml_path=_yaml_path,
+            case_yaml=_yaml_text,
         )
         print(f"[report] 已落库 run_id={run_id}", file=sys.stderr, flush=True)
     except Exception as _e:  # noqa: BLE001
