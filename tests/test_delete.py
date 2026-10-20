@@ -25,6 +25,7 @@
 import os
 import sys
 import tempfile
+import time as _time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -181,7 +182,256 @@ st.delete_run(rid3, db=db)
 
 print()
 print("=" * 70)
-print("5) 接口层面：路由和参数都在")
+print("6) 共享文件：同用例的日志是共用的，删一条不能毁掉别人的证据")
+print("=" * 70)
+
+# 这是实测发现的真 bug：run_167.log / clicks_167.jsonl 按用例名命名、
+# 每次运行追加，7 条 167 记录全指向同几个文件。第一版 delete_run 无脑
+# 把这些路径都交出去 unlink —— 删任意一条，另外 6 条的日志和点击账本
+# 就一起没了，而它们看起来还好好的，只是点开是空的。
+shared_log = "tmp/run_sharedcase.log"
+shared_ledger = "tmp/clicks_sharedcase.jsonl"
+a = _mkrun("sharedcase", log=shared_log)
+b = _mkrun("sharedcase", log=shared_log)
+# 手工把 ledger 也指成同一个
+con = st.connect(db)
+con.execute("UPDATE runs SET ledger_path = ? WHERE run_id IN (?,?)",
+            (shared_ledger, a, b))
+con.commit()
+con.close()
+
+res_a = st.delete_run(a, db=db)
+ck("删掉 a", res_a.get("deleted") == 1, f"{res_a}")
+ck("★★ 共用的 log 没进待删列表",
+   shared_log not in (res_a.get("paths") or []), f"{res_a.get('paths')}")
+ck("★★ 共用的 ledger 没进待删列表",
+   shared_ledger not in (res_a.get("paths") or []), f"{res_a.get('paths')}")
+ck("★ 共享文件被单独报出来（好让前端告诉用户保留了什么）",
+   len(res_a.get("shared") or []) == 2, f"{res_a.get('shared')}")
+ck("★ b 的记录还在", st.get_run(b, db=db) is not None)
+
+# 删掉 b 之后，这些文件就没人引用了 -> 可以删
+res_b = st.delete_run(b, db=db)
+ck("★ 最后一个持有者删掉后，文件转为可删",
+   shared_log in (res_b.get("paths") or []), f"{res_b.get('paths')}")
+ck("此时 shared 为空", not (res_b.get("shared") or []), f"{res_b.get('shared')}")
+
+# 截图按 step 目录分，通常不共享，但同样要按引用数判断。
+#
+# ⚠️ 两个坑，都踩过：
+#   1. 用不存在的假路径测 —— delete_run 对它走"文件不在了"分支，
+#      删不删都看不出来，测了个寂寞。必须用真实文件。
+#   2. 真实文件的 mtime 是"刚才"，而 started_at 是"落库时刻 - elapsed"，
+#      于是它天然被判成"比本次运行新"= 过期。所以要把 mtime 拨回到
+#      运行开始之前，才是"这次运行写下的文件"该有的样子。
+indep_f = Path(tempfile.mkdtemp()) / "shot.png"
+indep_f.write_bytes(b"i")
+_started = _time.time() - 300
+os.utime(indep_f, (_started, _started))   # 假装是 5 分钟前那次运行写的
+indep = str(indep_f)
+c = _mkrun("indep", shots=[indep])
+res_c = st.delete_run(c, db=db)
+ck("独享的截图照常可删", indep in (res_c.get("paths") or []),
+   f"{res_c.get('paths')} / stale={res_c.get('stale')}")
+
+print()
+print("=" * 70)
+print("7) 过期文件：被后续运行覆盖过的截图不属于这次运行")
+print("=" * 70)
+
+# tmp/shots/stepNN/ 是按步号复用的，不是按 run 隔离。下一次运行会覆盖
+# 上一次的 shot.png。所以库里 #10 和 #15 都记着同一个 step04/shot.png，
+# 而磁盘上那份已经是后来那次的了。引用计数判不出来（后来的记录可能已删），
+# 只能看时间戳：文件比本次运行开始还新，就不是这次的证据。
+#
+# 用真文件 + 真时间戳验，不用 mock —— 这个判断整个建立在时间比较上。
+
+tmpdir = Path(tempfile.mkdtemp())
+old_f = tmpdir / "old.png"
+new_f = tmpdir / "new.png"
+old_f.write_bytes(b"o")
+new_f.write_bytes(b"n")
+now = _time.time()
+os.utime(old_f, (now - 3600, now - 3600))   # 一小时前
+os.utime(new_f, (now + 60, now + 60))       # 还没到（模拟比 started_at 新）
+
+con = st.connect(db)
+con.execute("DELETE FROM actions")
+con.execute("DELETE FROM runs")
+con.commit()
+con.close()
+
+# ⚠️ 时间判断只对**老布局**（stepNN/，按步号复用）生效。
+#    新布局 run_xxx/ 是按运行隔离的，天生属于这次运行，不该被时间否决。
+tmpdir = Path(tempfile.mkdtemp())
+old_f = tmpdir / "old.png"
+new_f = tmpdir / "new.png"
+old_f.write_bytes(b"o")
+new_f.write_bytes(b"n")
+now = _time.time()
+os.utime(old_f, (now - 3600, now - 3600))   # 一小时前
+os.utime(new_f, (now + 600, now + 600))     # 十分钟后（比运行结束还新）
+
+rid_ts = st.save_run(
+    case_name="tscase",
+    report={"case_id": "1", "status": "PASS", "summary": "s", "steps_done": 1,
+            "elapsed_s": 1.0, "progress": [{"t": now - 3600}], "findings": [],
+            "strong_stats": {"auto_rate": 1.0}},
+    ledger_rows=[{"seq": 1, "step": "s0", "action": "click", "x": 1, "y": 2,
+                  "before_act": "A", "after_act": "B", "changed": 1, "ms": 5,
+                  "shot_before": str(old_f), "shot_after": str(new_f)}],
+    db=db)
+
+res_ts = st.delete_run(rid_ts, db=db)
+ck("旧文件判为本次的，可删",
+   str(old_f) in (res_ts.get("paths") or []), f"{res_ts.get('paths')}")
+ck("★★ 比运行结束还新的老布局文件判为过期（被后来的运行覆盖了）",
+   str(new_f) not in (res_ts.get("paths") or []), f"{res_ts.get('paths')}")
+ck("★ 过期文件单独报出来",
+   len(res_ts.get("stale") or []) == 1, f"{res_ts.get('stale')}")
+
+# ★★ 新布局的文件即使比运行结束新，也必须能删 —— 它天生属于这次运行。
+#    这条是回归：第一版没区分布局，把新布局的文件也判成过期，
+#    结果"删记录"一个文件都不清，功能形同虚设。
+rundir = Path(tempfile.mkdtemp()) / "shots" / "run_20260101_000000" / "step03"
+rundir.mkdir(parents=True)
+newlayout_f = rundir / "shot.png"
+newlayout_f.write_bytes(b"n")
+os.utime(newlayout_f, (now + 600, now + 600))   # 同样比运行结束新
+rid_nl = st.save_run(
+    case_name="newlayout",
+    report={"case_id": "1", "status": "PASS", "summary": "s", "steps_done": 1,
+            "elapsed_s": 1.0, "progress": [{"t": now - 3600}], "findings": [],
+            "strong_stats": {"auto_rate": 1.0}},
+    ledger_rows=[{"seq": 1, "step": "s0", "action": "click", "x": 1, "y": 2,
+                  "before_act": "A", "after_act": "B", "changed": 1, "ms": 5,
+                  "shot_before": str(newlayout_f)}],
+    db=db)
+res_nl = st.delete_run(rid_nl, db=db)
+ck("★★ 新布局的文件不受时间判断影响（run_xxx/ 天生属于这次运行）",
+   str(newlayout_f) in (res_nl.get("paths") or []),
+   f"paths={res_nl.get('paths')} stale={res_nl.get('stale')}")
+
+# started_at 解析不出来时不启用时间判断（否则老记录永远删不掉）
+con = st.connect(db)
+rid_nots = st.save_run(
+    case_name="nots",
+    report={"case_id": "1", "status": "PASS", "summary": "s", "steps_done": 1,
+            "elapsed_s": 1.0, "progress": [{"t": 1.0}], "findings": [],
+            "strong_stats": {"auto_rate": 1.0}},
+    ledger_rows=[{"seq": 1, "step": "s0", "action": "click", "x": 1, "y": 2,
+                  "before_act": "A", "after_act": "B", "changed": 1, "ms": 5,
+                  "shot_before": str(new_f)}],
+    db=db)
+con = st.connect(db)
+con.execute("UPDATE runs SET started_at = NULL WHERE run_id = ?", (rid_nots,))
+con.commit()
+con.close()
+res_nots = st.delete_run(rid_nots, db=db)
+ck("取不到开始时间时不启用时间判断（否则老记录删不掉）",
+   str(new_f) in (res_nots.get("paths") or []), f"{res_nots.get('paths')}")
+
+print()
+print("=" * 70)
+print("8) started_at 不能是 1970（这条会让统计和删记录全错）")
+print("=" * 70)
+
+# 背景：_tick 写的是 time.time()（epoch 秒），所以 progress[0].t 可以是
+# started_at。但如果传进来的是个**小数字**（相对耗时 1.0、或者手搓的
+# 测试数据），直接当 epoch 用就会渲染成 1970-01-01 —— 而且不报错，
+# 只是"最近三天"统计空了、对比页时间戳荒唐、删记录时把文件全判成过期。
+# 现在加了 1e9 这道门槛：明显不可能是时间戳的值一律不认。
+cases = [
+    ("真时间戳（epoch 秒）直接用", _time.time() - 100, True),
+    ("相对耗时 1.0 不认", 1.0, False),
+    ("0.0 不认", 0.0, False),
+    ("None 不认", None, False),
+]
+for label, t_val, should_be_recent in cases:
+    probe_db = Path(tempfile.mkdtemp()) / "ts.db"
+    rid_probe = st.save_run(
+        case_name="p",
+        report={"case_id": "1", "status": "PASS", "summary": "s",
+                "steps_done": 1, "elapsed_s": 10.0,
+                "progress": [{"t": t_val}], "findings": [],
+                "strong_stats": {"auto_rate": 1.0}},
+        ledger_rows=[], db=probe_db)
+    sa = (st.get_run(rid_probe, db=probe_db) or {}).get("started_at") or ""
+    year = sa[:4]
+    if should_be_recent:
+        ck(label, year >= "2020", f"started_at={sa!r}")
+    else:
+        ck(label, year >= "2020", f"started_at={sa!r}（不该是 1970）")
+
+print()
+print("=" * 70)
+print("9) 按运行隔离的证据目录：整个丢，连记录没引用的中间文件也清掉")
+print("=" * 70)
+
+# 一次运行除了 shot.xml 还会写 meta.json / ocrNN 之类，
+# 这些不在 actions 表里。只删"记录引用过的"会让目录剩一堆孤儿文件。
+sandbox2 = Path(tempfile.mkdtemp())
+ev2 = sandbox2 / "shots"
+rundir = ev2 / "run_20261020_120000"
+(rundir / "step03").mkdir(parents=True)
+(rundir / "step04").mkdir(parents=True)
+shot = rundir / "step03" / "shot.png"
+shot.write_bytes(b"s")
+xmlf = rundir / "step03" / "dump.xml"
+xmlf.write_text("<x/>", encoding="utf-8")
+meta = rundir / "step03" / "meta.json"          # 记录里没有它
+ocr = rundir / "step04" / "ocr01.png"           # 记录里也没有它
+
+# 老布局（共用 stepNN）—— 绝不能整目录删
+legacy = ev2 / "step05"
+legacy.mkdir()
+legacy_f = legacy / "shot.png"
+legacy_f.write_bytes(b"L")
+
+_orig2 = webui._evidence_roots
+webui._evidence_roots = lambda: [ev2]
+try:
+    res = webui._purge_evidence([str(shot), str(xmlf), str(legacy_f)])
+    ck("★ 按运行隔离的整个目录被删掉", not rundir.exists())
+    ck("★★ 记录没引用的中间文件（meta.json/ocr）也一并清掉",
+       not meta.exists() and not ocr.exists())
+    ck("目录名记在 dirs 里", "run_20261020_120000" in (res.get("dirs") or []),
+       f"{res.get('dirs')}")
+    # ⚠️ 老布局的 stepNN 目录：文件删掉后它变空，会被 rmdir。
+    #    这是**要的**（不留空壳），但和"整目录 rmtree"有本质区别 ——
+    #    如果目录里还有别人的文件，它就不会变空、也就不会被删。
+    ck("★ 老布局只删自己的文件（目录内没别人的东西就成空壳被收走）",
+       not legacy_f.exists(), f"legacy_f 还在: {legacy_f.exists()}")
+    ck("★ 证据根本身不动", ev2.exists())
+
+    # ★ 关键一条：老布局目录里**还有别人的文件**时，绝不能连坐删掉
+    d3 = ev2 / "step05"
+    d3.mkdir(exist_ok=True)
+    mine = d3 / "mine.png"
+    mine.write_bytes(b"m")
+    other = d3 / "other.png"      # 别的记录的文件，不在待删列表里
+    other.write_bytes(b"o")
+    webui._purge_evidence([str(mine)])
+    ck("★★ 只删自己那个，别人同目录的文件不动",
+       not mine.exists() and other.exists())
+    ck("★★ 目录里还有别人的文件，目录本身保留", d3.exists())
+
+    # 目录名不以 run_ 开头的一律不整删，哪怕它在证据根内
+    d2 = ev2 / "shared_step99"
+    d2.mkdir(exist_ok=True)
+    f2 = d2 / "shot.png"
+    f2.write_bytes(b"z")
+    keep2 = d2 / "meta.json"
+    keep2.write_bytes(b"k")
+    webui._purge_evidence([str(f2)])
+    ck("★★ 不是 run_ 前缀的目录不会整删（目录里未引用的文件保住）",
+       not f2.exists() and keep2.exists(), f"keep2 还在: {keep2.exists()}")
+finally:
+    webui._evidence_roots = _orig2
+
+print()
+print("=" * 70)
+print("10) 接口层面：路由和参数都在")
 print("=" * 70)
 
 src = (ROOT / "webui.py").read_text(encoding="utf-8")
@@ -207,7 +457,7 @@ ck("没录原文时明确说没有（不拿 YAML 顶替）", "还没录原始 ca
 
 print()
 print("=" * 70)
-print("6) 顺手修的两个前端 bug")
+print("11) 顺手修的两个前端 bug")
 print("=" * 70)
 
 # bug 1：用例库的"最近结论/跑过"两列永远是空的

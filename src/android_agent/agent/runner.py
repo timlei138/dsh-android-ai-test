@@ -76,6 +76,16 @@ DEFAULT_SKILL = skill_root()
 #    两处各写一份，早晚会出现"日志说 8s、报告说 6s"这种对不上的情况。
 
 
+def _run_tag() -> str:
+    """本次运行的证据子目录名：run_<年月日_时分秒>。
+
+    为什么不用 run_id：落盘发生在落库之前，那时还没有 run_id。
+    时间戳够用了 —— 同一个用例不可能在同一秒跑两次（有锁，且跑一次几十秒）。
+    """
+    import datetime as _dt
+    return "run_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def _new_node_calls() -> dict[str, dict[str, float]]:
     """节点统计表：{节点名: {"n": 次数, "ms": 累计毫秒}}"""
     return {}
@@ -448,7 +458,20 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
 
     dev = device if device is not None else DirectDevice(
         serial=serial,
-        evidence_dir=Path(report_path).parent / "shots" if report_path else None,
+        # ★ 证据目录要**按运行隔离**，不能所有运行共用一个 shots/。
+        #
+        #   原来固定是 report_path.parent / "shots"，而 report_path 就叫
+        #   report_<case_id>.json —— 于是同一个用例每跑一次都往
+        #   tmp/shots/step03/、step04/ 里覆盖同一批文件名。
+        #   后果：库里 10 条 167 记录全都记着 tmp/shots/step04/shot.png，
+        #   而磁盘上那份是**最后一次**的，前面 9 条点开看到的是别的运行的图
+        #   （还看不出来，因为路径和文件名都对）。删除记录时也就没法判断
+        #   "这文件到底属于谁"，只能一律不删 —— 删除功能形同虚设。
+        #
+        #   现在每跑一次落一个 run_<时间戳>/ 子目录，各管各的。
+        #   旧数据不动：它们本来就共享，删的时候按"还被别人引用"保留。
+        evidence_dir=(Path(report_path).parent / "shots" / _run_tag()
+                      if report_path else None),
         ledger_path=ledger_path)
 
     if device is None:

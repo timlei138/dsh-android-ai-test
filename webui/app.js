@@ -722,7 +722,11 @@ function confirmDeleteRun(runId, after) {
       m.close();
       let msg = `已删除记录 #${runId}`;
       if (withEv) msg += `，清理 ${r.deleted_files || 0} 个证据文件`;
-      if ((r.skipped || []).length) msg += `（${r.skipped.length} 个跳过）`;
+      // ★ 共享文件（同用例的日志/点击账本是共用的）不会被删，
+      //   得说出来 —— 否则用户以为删干净了，磁盘上其实还留着。
+      if (r.kept_shared) msg += `，保留 ${r.kept_shared} 个共用文件`;
+      const skipped = (r.skipped || []).length - (r.kept_shared || 0);
+      if (skipped > 0) msg += `（${skipped} 个跳过）`;
       toast(msg);
       if (after) await after();
       else await viewRuns('');

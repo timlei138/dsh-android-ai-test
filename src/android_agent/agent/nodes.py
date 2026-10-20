@@ -23,7 +23,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -317,6 +317,10 @@ class ChildState(TypedDict, total=False):
     step_index: int
     round_in_step: int
     max_rounds_per_step: int
+    # check 节点的独立轮次计数：堵"反复判完成却没推进"的死循环。
+    # round_in_step 只在 act 里增长，模型光说 done 不点时它不动，
+    # 于是那个收口条件永远不成立（167 实测空转到 80 轮上限）。
+    check_rounds: NotRequired[int]
 
     # ★ 目标查找的有界重试（用户要求）。
     #
@@ -1311,6 +1315,8 @@ def plan_node(state: ChildState) -> dict[str, Any]:
         "fallback_reason": (state.get("fallback_reason", "")
                             if _keep_fallback else ""),
         "retry_landing": 0 if not same_step else state.get("retry_landing", 0),
+        # ★ check 自己的轮次计数，换步归零。见 step_check_node 里 check_rounds 的说明。
+        "check_rounds": 0 if not same_step else state.get("check_rounds", 0),
         "last_step_id": step["id"],
         "action": None,
         "issues": (
@@ -3053,11 +3059,27 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
                               "landing": act_now,
                               "status": "ok" if not issues else "landing_miss"}]}
 
-    if rounds >= limit:
+    # ★ 收口：两条路都堵住。
+    #
+    #   `rounds`（round_in_step）只在 act 里自增 —— 模型光说 done 不点时它不动。
+    #   `check_rounds` 由本节点自己数，专门堵"说了 done 又没推进"这条路。
+    #   缺一个就会空转到轮次上限（167 实测连挂 2 次）。
+    crounds = state.get("check_rounds", 0)
+    if rounds >= limit or crounds >= limit:
+        why2 = ("本步一直没动手" if crounds >= limit else f"重试 {rounds} 次")
         return {"status": "BLOCKED",
-                "summary": f"{step['id']} 重试 {rounds} 次未收敛，停止",
-                "issues": [f"{step['id']} 未收敛（{rounds} 轮）"],
-                "step_index": idx + 1}
+                "summary": f"{step['id']} {why2}仍未收敛，停止",
+                "issues": issues + [
+                    f"{step['id']} 未收敛（act {rounds} 轮 / check {crounds} 轮，"
+                    f"上限 {limit}）"],
+                "step_index": idx + 1,
+                "findings": [{"kind": "step", "step": step["id"],
+                              "desc": step["desc"], "landing": act_now,
+                              "status": "not_converged"}],
+                "progress": [_tick("blocked",
+                                   f"{step['id']} 反复判完成却没推进"
+                                   f"（check {crounds} 轮），停这一步",
+                                   step=step["id"])]}
 
     # ★ 本步**没判完成**（还有动作没做完）时不需要在这里处理 ——
     # 路由会把控制权交回 strong_target / decide，它们会给出下一个动作。
@@ -3116,6 +3138,20 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
                 }
 
     return {"issues": issues,
+            # ★ 自己记一个"同一步里被重新问了几次"的计数，不依赖 act 自增。
+            #
+            #   原先只靠 round_in_step（act 里 +1）来收口，于是有一个
+            #   **无出口的死循环**：
+            #     模型每轮都报 done -> check 复核不通过 -> plan 清 action
+            #     -> decide 再问 -> 又说 done …… 全程**没有 act**，
+            #     round_in_step 恒为 0，上面 `rounds >= limit` 永远不成立。
+            #   真机实测（167，两次）：decide 80 / plan 79 / check 78，
+            #   act 只有 1 次，一路空转到轮次上限，最后报 BLOCKED，
+            #   看起来像环境问题，其实是判定卡住。
+            #
+            #   这里用 check_rounds 自己数：每进一次 check 就 +1，
+            #   换步时由 plan 归零。够 limit 次还在这步没结论，就停。
+            "check_rounds": state.get("check_rounds", 0) + 1,
             "progress": [_tick("retry",
                                f"{step['id']} 第 {rounds + 1} 轮：{act_now}"
                                + (f"｜{issues[-1]}" if issues else ""),

@@ -185,32 +185,85 @@ def _safe_under(path: Path, roots: list[Path]) -> bool:
     return False
 
 
+def _run_dirs_of(paths: list[str], roots: list[Path]) -> dict[Path, int]:
+    """从证据路径里认出"属于单次运行的整目录"，返回 {目录: 里面有几个文件}。
+
+    认的是 `…/shots/run_YYYYmmdd_HHMMSS/` 这一层（evidence 同名）。
+
+    ## 为什么要有这条
+
+    一次运行除了 shot.png / dump.xml，还会写 meta.json、ocrNN 之类的
+    中间文件 —— 这些**不在 actions 表里**，只删"记录引用过的文件"
+    会让目录剩一堆孤儿文件（实测：删完还剩 18 个）。而按运行隔离的目录
+    是可以整个丢的。
+
+    ## 为什么只认 run_ 前缀
+
+    老的 evidence 布局是 tmp/shots/stepNN/ —— **各次运行共用同名目录**，
+    176 和 177 的图都在 tmp/shots/step04/ 里。那种目录 rmtree 一下就会
+    删掉别人的证据。所以判据是**目录名**（只有新布局带 run_ 前缀），
+    不是"它在证据根内"。
+    """
+    out: dict[Path, int] = {}
+    for raw in paths:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            p = _HERE / p
+        for anc in list(p.parents)[:3]:
+            if not anc.name.startswith("run_"):
+                continue
+            if anc.parent.name not in ("shots", "evidence"):
+                break
+            if not _safe_under(anc, roots):
+                break
+            if anc.is_dir():
+                out[anc] = sum(1 for f in anc.rglob("*") if f.is_file())
+            break
+    return out
+
+
 def _purge_evidence(paths: list[str]) -> dict:
-    """删掉一次运行留下的所有证据文件，返回统计。
+    """删掉一次运行留下的证据文件，返回统计。
+
+    ## 顺序很重要
+
+      1. 先认出"按运行隔离的整目录"（run_xxx/）—— 这些整个丢，最彻底
+      2. 再逐个删剩下的文件（老布局的 stepNN/xxx.png、以及 tmp/ 下的
+         log / ledger / report 等产物）
+      3. 最后把清空的 stepNN 目录 rmdir，但不动证据根本身
 
     ## 为什么删之前要这么小心
 
-    路径来自数据库。库是可信来源，但这个服务会被手动改库调试（改坏过），
+    路径来自数据库。库是可信来源，但这服务会被手动改库调试（改坏过），
     所以**不假设库里一定是干净的**。规则：
-
-      1. 只删**证据根目录内部**的文件（tmp/shots、tmp/evidence、
-         storage/evidence），以及这几类明确的产物（log/llm/ledger/report）。
-      2. 删完如果 stepNN 目录空了，顺手 rmdir —— 不删整个 shots 根。
-      3. 有任何一个文件不满足规则就**跳过它**并记下来，不报错中断 ——
-         删不掉一个文件，不该让整次删除失败。
-
-    ## 为什么不直接 `rmtree(evidence_dir)`
-
-    因为一次运行的截图是**按 stepNN 分目录**共存于同一个 evidence_dir 下的。
-    176 和 177 的图都在 tmp/shots/ 里。rmtree 一下就把别人的记录也删了。
+      · 只删证据根内部的，或 tmp 下明确后缀的产物
+      · 边界用 relative_to 判，不用 startswith（/a/bc 也 startswith /a/b）
+      · 任何一个不满足规则就**跳过并记下**，不报错中断 ——
+        删不掉一个文件不该让整次删除失败
     """
+    import shutil as _sh
+
     roots = [p.resolve() for p in _evidence_roots()]
-    # 产物文件（log/llm/ledger/report）不在证据根里，单独放行 —— 但只放行
-    # 我们自己的 tmp/ 下的这些后缀，别的一律不碰。
     tmp_root = (_HERE / "tmp").resolve()
     ok_suffix = {".png", ".xml", ".log", ".md", ".jsonl", ".json", ".txt"}
 
-    done, skipped = [], []
+    # ── 1. 整目录（按运行隔离的）──
+    run_dirs = _run_dirs_of(paths, roots)
+    freed = 0
+    purged: list[str] = []
+    for d, n_in in run_dirs.items():
+        _sh.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            purged.append(d.name)
+            freed += n_in
+    # 整目录已经连里面的文件一起删了，逐个删的时候要跳过
+    gone = {str(d.resolve()) for d in run_dirs}
+
+    # ── 2. 剩余文件 ──
+    done: list[str] = []
+    skipped: list[str] = []
     parents: set[Path] = set()
     for raw in paths:
         if not raw:
@@ -218,6 +271,13 @@ def _purge_evidence(paths: list[str]) -> dict:
         p = Path(raw)
         if not p.is_absolute():
             p = _HERE / p
+        try:
+            rp = str(p.resolve())
+        except OSError:
+            skipped.append(f"{raw}（路径解析失败）")
+            continue
+        if any(rp == g or rp.startswith(g + os.sep) for g in gone):
+            continue      # 已经在整目录里删掉了
         allowed = _safe_under(p, roots) or (
             _safe_under(p, [tmp_root]) and p.suffix.lower() in ok_suffix)
         if not allowed:
@@ -231,7 +291,7 @@ def _purge_evidence(paths: list[str]) -> dict:
         except OSError as e:
             skipped.append(f"{raw}（{e.strerror or e}）")
 
-    # 空的 stepNN 目录顺手清掉；只清空目录，非空/根目录不动
+    # ── 3. 清空的 stepNN 目录顺手删掉（只删空的，不碰根）──
     for d in sorted(parents):
         try:
             if d.is_dir() and not any(d.iterdir()):
@@ -239,8 +299,7 @@ def _purge_evidence(paths: list[str]) -> dict:
         except OSError:
             pass
 
-    return {"files": len(done), "skipped": skipped}
-
+    return {"files": len(done) + freed, "skipped": skipped, "dirs": purged}
 
 def _test_vision() -> dict:
 
@@ -667,13 +726,29 @@ class Handler(BaseHTTPRequestHandler):
             res = st.delete_run(rid)
             if not res.get("deleted"):
                 return self._err("删除失败：记录不在了", 404)
+
+            # ★ 共享文件不能删。
+            #   run_167.log / clicks_167.jsonl 是按用例名命名、每次追加的，
+            #   同用例的其它记录全都指向同一个文件。删了就等于把那些记录的
+            #   执行证据一起销毁 —— 而它们看着还好好的，只是点开日志是空的。
+            #   store 已经把这类路径单独挑出来了，这里只删"独享"的那批。
+            shared = res.get("shared") or []
+            stale = res.get("stale") or []
             ev = _purge_evidence(res.get("paths") or []) if with_ev else {
                 "files": 0, "skipped": []}
+            if with_ev:
+                ev["skipped"].extend(
+                    f"{p}（还被其它记录引用，保留）" for p in shared)
+                ev["skipped"].extend(
+                    f"{p}（已被后续运行覆盖，不是这次的证据）" for p in stale)
             return self._json({"ok": True, "run_id": rid,
                                "case_name": res.get("case_name") or "",
                                "evidence": ev,
                                "deleted_files": ev["files"],
+                               "kept_shared": len(shared),
+                               "kept_stale": len(stale),
                                "skipped": ev["skipped"]})
+
 
         # --- 删一条原始用例（单独删，保留 YAML）---
         if path.startswith("/api/rawcase/"):

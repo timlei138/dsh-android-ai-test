@@ -267,13 +267,29 @@ def save_run(
     con = connect(db)
     try:
         strong = report.get("strong_stats") or {}
-        started_ts = None
-        prog = report.get("progress") or []
-        if prog:
-            started_ts = prog[0].get("t")
         elapsed = report.get("elapsed_s")
-        finished_ts = (float(started_ts) + float(elapsed)) if (
-            started_ts and elapsed is not None) else None
+
+        # started_ts 取 progress[0].t —— nodes._tick 写的是 time.time()，
+        # 也就是 epoch 秒，可以直接用。
+        #
+        # ⚠️ 但要防一手：假如 progress 里的 t 是个小数字（< 1e9 —— 相对耗时、
+        #    或者调用方手搓的测试数据），拿它当 epoch 会渲染成 1970-01-01，
+        #    连带"最近三天"统计、对比页、删记录的时间判断全错。
+        #    这种明显不可能是时间戳的值一律不认，退回落库时刻减总耗时
+        #    （也就是"现在往前推本次运行的全部用时"≈真实开始时刻）。
+        raw_t = (report.get("progress") or [{}])[0].get("t")
+        try:
+            raw_t = float(raw_t)
+        except (TypeError, ValueError):
+            raw_t = 0.0
+        # 1e9 ≈ 2001 年。真时间戳都远大于它，相对耗时都远小于它。
+        started_ts = raw_t if raw_t > 1e9 else time.time()
+        if raw_t <= 1e9 and elapsed is not None:
+            try:
+                started_ts -= float(elapsed)
+            except (TypeError, ValueError):
+                pass
+        finished_ts = (started_ts + float(elapsed)) if elapsed is not None else None
 
         cur = con.execute(
             """INSERT INTO runs(
@@ -496,32 +512,137 @@ def delete_run(run_id: int, *, db: str | Path | None = None) -> dict[str, Any]:
        的 DELETE 处理：万一库里路径被改坏过，无脑递归删会删到别处去。
        所以"删文件"必须由一个知道证据根在哪的层来做，不在这里。
 
-    返回被删记录里记着的文件路径，供上层去清理。
+    ## 共享文件：只报不删
+
+    `run_167.log` / `clicks_167.jsonl` / `report_167_subagent.json` 是
+    **按用例名命名、每次运行追加**的，不是"一次运行一个文件"。实测库里
+    7 条 167 记录全都指向同三个文件 —— 删任意一条就顺手 unlink，
+    另外 6 条的日志和点击账本就一起没了，而那是它们唯一的执行证据。
+
+    所以这里先查"还有没有别的记录引用这个路径"，有的就放进 `shared`，
+    上层**不许删**，只能跳过。截图/xml 是按 stepNN 分目录的，通常不共享，
+    但同样走这个判断 —— 不靠"我以为它不会共享"来赌。
+
+    返回：
+      paths   只被这次运行引用的文件（可以删）
+      shared  还被别的记录引用着（不能删）
     """
     con = connect(db)
     try:
         row = con.execute("SELECT * FROM runs WHERE run_id = ?",
                           (run_id,)).fetchone()
         if not row:
-            return {"deleted": 0, "paths": []}
+            return {"deleted": 0, "paths": [], "shared": []}
         rec = dict(row)
-        # 先把这张运行下所有证据路径收齐，再去删行 —— 删完就查不到了
-        paths: list[str] = []
+
+        # 收集候选路径。用 dict 去重：同一次运行里同一个文件可能被记两遍
+        # （比如 shot_before 和 xml_before 恰好同目录的同一个名字不该出现，
+        # 但 report_path 之类确实可能与 ledger_path 重合）。
+        cand: dict[str, None] = {}
         for key in ("ledger_path", "log_path", "llm_path", "report_path"):
             if rec.get(key):
-                paths.append(str(rec[key]))
+                cand[str(rec[key])] = None
         for a in con.execute(
                 "SELECT shot_before, shot_after, xml_before, xml_after "
                 "FROM actions WHERE run_id = ?", (run_id,)):
-            paths.extend(str(v) for v in a if v)
+            for v in a:
+                if v:
+                    cand[str(v)] = None
+
+        # ★ 关键一步：把**别的记录**引用到的路径挑出来，判为共享。
+        #   比对用规范化后的绝对路径 —— 库里存的可能是相对路径
+        #   （跑用例时 cwd 不同就会这样），纯字符串比会漏掉。
+        others: set[str] = set()
+        for r2 in con.execute(
+                "SELECT run_id, ledger_path, log_path, llm_path, report_path "
+                "FROM runs WHERE run_id <> ?", (run_id,)):
+            for k in ("ledger_path", "log_path", "llm_path", "report_path"):
+                if r2[k]:
+                    others.add(_norm(r2[k]))
+        for a in con.execute(
+                "SELECT shot_before, shot_after, xml_before, xml_after "
+                "FROM actions WHERE run_id <> ?", (run_id,)):
+            for v in a:
+                if v:
+                    others.add(_norm(v))
+
+        shared, own = [], []
+        for p in cand:
+            (shared if _norm(p) in others else own).append(p)
+
+        # ★ 第二道：**老布局**下被后来的运行覆盖过的文件，不是这次的证据。
+        #
+        #   老布局是 tmp/shots/stepNN/ —— 按步号复用，下一次运行直接覆盖
+        #   上一次的 shot.png / dump.xml。所以库里 #10 和 #15 记着同一个
+        #   tmp/shots/step04/shot.png，而磁盘上那份其实是后来那次的。
+        #   引用计数判不出来（后来的记录可能已经被删了），只能看时间。
+        #
+        #   ⚠️ 两个前提，缺一个就会把正常删除变成"什么都不删"（踩过）：
+        #
+        #   1. **只对老布局生效**。新布局 tmp/shots/run_xxx/ 是按运行隔离的，
+        #      那里的文件天生属于这次运行，不该被时间戳否决。
+        #
+        #   2. 比的是**运行结束时刻**，不是开始时刻。截图是在运行过程中
+        #      写的，当然比 started_at 晚 —— 拿开始时刻当基准，等于把
+        #      这次运行自己的截图全判成"别人的"（实测：20 个文件判掉 14 个）。
+        #
+        #   start_ts 取不到（老记录/字段空）就不启用这道判断 ——
+        #   宁可多删一个，也不要因为解析失败把正常删除全挡掉。
+        start_ts = _parse_ts(rec.get("started_at"))
+        try:
+            end_ts = start_ts + float(rec.get("elapsed_s") or 0)
+        except (TypeError, ValueError):
+            end_ts = start_ts
+        stale = []
+        if start_ts:
+            keep2 = []
+            for p in own:
+                pp = Path(p)
+                # 新布局（run_xxx/ 下）不参与时间判断
+                if any(a.name.startswith("run_") for a in list(pp.parents)[:3]):
+                    keep2.append(p)
+                    continue
+                try:
+                    mt = pp.stat().st_mtime
+                except OSError:
+                    keep2.append(p)   # 文件不在了：交给上层当"已删"处理
+                    continue
+                # 留 2 秒余量：最后一张截图落盘和结束时刻很接近
+                if mt > end_ts + 2.0:
+                    stale.append(p)
+                else:
+                    keep2.append(p)
+            own = keep2
 
         con.execute("DELETE FROM actions WHERE run_id = ?", (run_id,))
         con.execute("DELETE FROM findings WHERE run_id = ?", (run_id,))
         con.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         con.commit()
-        return {"deleted": 1, "paths": paths, "case_name": rec.get("case_name")}
+        return {"deleted": 1, "paths": own, "shared": shared,
+                "stale": stale, "case_name": rec.get("case_name")}
     finally:
         con.close()
+
+
+def _parse_ts(s: Any) -> float:
+    """把 started_at（'2026-10-20 20:35:05' 这类）转成 epoch 秒；失败返回 0。"""
+    if not s:
+        return 0.0
+    text = str(s).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return time.mktime(time.strptime(text[:19], fmt))
+        except (ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+def _norm(p: str | Path) -> str:
+    """路径比对用的规范化形式（绝对 + 小写，Windows 不区分大小写）。"""
+    try:
+        return str(Path(p).resolve()).lower()
+    except OSError:
+        return str(p).lower()
 
 
 def compare_runs(a: int, b: int, *,
