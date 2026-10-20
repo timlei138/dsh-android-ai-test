@@ -390,6 +390,18 @@ class ChildState(TypedDict, total=False):
     # 和 seen_rids 一样用累加 reducer。
     seen_texts: Annotated[list[dict[str, str]], operator.add]
 
+    # ★ 每屏的**整屏文案**（去重后的一整段），一路累加。
+    #
+    # seen_texts 只收"带 rid 的控件"，可 `text_present` 判的常是
+    # **纯文本标签** —— 比如 177 a4 要判「周末是否有课」，
+    # 那是页面上一个没有 rid 的标题行，怎么都进不了 seen_texts。
+    # 于是断言在末尾判时屏幕早翻走了，`want in screen` 必然不成立。
+    #
+    # 这跟 seen_rids / seen_texts 是**同一个道理**：
+    # 判据要判"过程中出现过"，就必须把"过程中"存下来，
+    # 而不是只留最后一屏。
+    seen_screens: Annotated[list[str], operator.add]
+
     # ★ 进度轨迹：每条 {t, phase, step, note}，随报告回传主 Agent。
     # 用累加 reducer —— 一次 invoke 里多个节点都要往里追加。
     progress: Annotated[list[dict[str, Any]], operator.add]
@@ -1189,6 +1201,8 @@ def start_check_node(state: ChildState) -> dict[str, Any]:
         "last_event_ids": [str(e) for e in (out.get("event_ids") or [])],
         "obs_clickable": clickable,
         "obs_nodes_text": _screen_text(out),
+        # 整屏文案留档，供 text_present 判"过程中出现过"
+        "seen_screens": [_screen_text(out)],
         # 语义节点列表：模型据它看"这页到底有什么"（含不可点的文字）
         "obs_nodes": _brief_nodes(out.get("nodes")),
         "obs_xml_path": _screen_xml_path(out),
@@ -1325,6 +1339,7 @@ def observe_node(state: ChildState) -> dict[str, Any]:
         "obs_xml_path": _screen_xml_path(out),
         "seen_rids": _seen_rids(out.get("next")),
         "seen_texts": _seen_texts(out.get("next")),
+        "seen_screens": [_screen_text(out)],
     }
 
 
@@ -2076,7 +2091,11 @@ def act_node(state: ChildState) -> dict[str, Any]:
     _itext = action.get("input_text")
     if _irid and _itext is not None and not action.get("step_done"):
         try:
-            res = dev.input_text(_irid, str(_itext))
+            # step/why 传下去是为了**账本里能查到这一步**：
+            # 只记 rid 和时间不记步骤号，页面上一堆动作就分不清属于哪一步。
+            res = dev.input_text(_irid, str(_itext),
+                                 step=_step_id(state),
+                                 why=str(action.get("why") or ""))
         except (ToolError, AttributeError, TypeError) as exc:
             return {"issues": [f"输入 {_irid} 失败：{exc}"],
                     "action": {**action, "acted": False, "error": str(exc)}}
@@ -2110,7 +2129,8 @@ def act_node(state: ChildState) -> dict[str, Any]:
                           why=str(action.get("why", "")),
                           expect=action.get("expect"),
                           perm_action=task.get("perm_action"),
-                          perm=task.get("perm_name"))
+                          perm=task.get("perm_name"),
+                          step=_step_id(state))
         except ToolError as exc:
             return {"issues": [f"key 失败：{exc}"],
                     "action": {**action, "acted": False, "error": str(exc)}}
@@ -2138,7 +2158,8 @@ def act_node(state: ChildState) -> dict[str, Any]:
                       why=str(action.get("why", "")),
                       expect=action.get("expect"),
                       perm_action=task.get("perm_action"),
-                      perm=task.get("perm_name"))
+                      perm=task.get("perm_name"),
+                      step=_step_id(state))
     except ToolError as exc:
         # 动作可能已执行 -> 不能盲目重试；直接如实记录并停下
         return {"issues": [f"act 失败：{exc}"],
@@ -2162,6 +2183,7 @@ def act_node(state: ChildState) -> dict[str, Any]:
         "obs_fresh": bool(res.next),          # 画面是否来自 act 返回
         "seen_rids": _seen_rids(res.next),
         "seen_texts": _seen_texts(res.next),
+        "seen_screens": [_screen_text({"next": res.next})],
         "round_in_step": state.get("round_in_step", 0) + 1,
         "visited": [f"{state.get('last_activity')} -> {res.activity}"],
         # 轨迹：记下这一步实际点了哪个控件 —— 回写 YAML 用。
@@ -3299,6 +3321,27 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
     screen = str(state.get("obs_nodes_text") or "")
     last_pkg = str(state.get("last_package") or "")
 
+    # ★ 文案判据要搜**过程中所有屏**，不只最后一屏。
+    #
+    # 同上道理：断言在流程末尾才判，那时人早翻走了。
+    # 177 a4 要判「周末是否有课」—— 那是页面上一个**没有 rid 的标题行**，
+    # 进不了 seen_texts；末尾判时停在别的页，`want in screen` 必然 False。
+    # 结果是把"过程中明明出现过"判成"不成立"，用例白跑一遍。
+    #
+    # 所以：只要在**任何一屏**里出现过就算成立。
+    # 这不降低严格性 —— 判据的语义本来就是"这个过程里有没有过这个文案"，
+    # 不是"现在这一刻还在不在"（后者应该用 node_present 判当前屏）。
+    _screens = [screen]
+    for s in (state.get("seen_screens") or []):
+        s = str(s or "")
+        if s and s not in _screens:
+            _screens.append(s)
+
+    def _text_seen(want: str) -> bool:
+        if not want:
+            return False
+        return any(want in s for s in _screens)
+
     for key, val in check.items():
         if key in ANNOTATION_CHECKS:
             continue
@@ -3410,7 +3453,7 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
                                 break
                     if not got:
                         # 控件压根没带文案：只能靠整屏文案兜底
-                        ok = want in screen if want else False
+                        ok = _text_seen(want)
                     else:
                         ok = got == want
                     results.append(ok)
@@ -3418,12 +3461,12 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
                         f"text {'✔' if ok else '✘'} {rid}={want}"
                         + (f"（实际「{got}」）" if got else "（没见过该控件）"))
                 else:
-                    ok = want in screen if want else False
+                    ok = _text_seen(want)
                     results.append(ok)
                     notes.append(f"text {'✔' if ok else '✘'} {want}")
             else:
                 want = str(val).strip()
-                ok = want in screen if want else False
+                ok = _text_seen(want)
                 results.append(ok)
                 notes.append(f"text {'✔' if ok else '✘'} {want}")
 

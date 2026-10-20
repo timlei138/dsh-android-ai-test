@@ -217,7 +217,8 @@ class MockDevice:
     def act(self, x: int, y: int, why: str,
             expect: str | None = None,
             perm_action: str | None = None,
-            perm: str | None = None) -> ActResult:
+            perm: str | None = None,
+            step: str = "") -> ActResult:
         cur = self._scene()
         # 按坐标找到被点的节点（真实层由 dump 现场派生坐标，这里反查）
         hit = None
@@ -452,7 +453,8 @@ class RealDevice:
     def act(self, x: int, y: int, why: str,
             expect: str | None = None,
             perm_action: str | None = None,
-            perm: str | None = None) -> ActResult:
+            perm: str | None = None,
+            step: str = "") -> ActResult:
         # act 只按坐标点击；坐标必须来自本次 observe/act 的 next[].c
         args = ["tap", "--x", str(x), "--y", str(y), "--why", why]
         if expect:

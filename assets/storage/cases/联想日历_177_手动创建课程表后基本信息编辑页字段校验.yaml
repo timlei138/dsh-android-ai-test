@@ -101,15 +101,16 @@ assertions:
         - {rid: layout_total_weeks}
 
   - id: a4
-    desc: 周末有课、显示非本周课程两个开关都在页面上（用文案判据，不依赖未核实的 rid）
-    # ⚠️ 历史：原先用 rid=switch_weekend_classes / switch_show_non_current_week，实测两轮均
-    # 「rid ✘ 未命中」—— 这两个 rid 在本 ROM 的 UI 树里不存在（来自知识卡推测）。
-    # 探针任务也无法取回真实 rid（执行器报告不含 UI dump）。
-    # 改用**文案**判据：用例原文里这两行开关的标题文案是确定的，
-    # 且 text_present 是整屏文本包含匹配，不依赖控件 rid。
-    note: 若文案断言仍不命中，说明该页无这两行文本，需人工确认；不要再用未核实的 rid
+    desc: 周末是否有课、显示非本周课程两个开关都在页面上（用文案判据，不依赖未核实的 rid）
+    # ⚠️ 历史一：原先用 rid=switch_weekend_classes / switch_show_non_current_week，
+    #    实测两轮均「rid ✘ 未命中」—— 这两个 rid 在本 ROM 的 UI 树里不存在（来自知识卡推测）。
+    # ⚠️ 历史二：改成文案 "周末有课" 后又 FAIL。真机上抓 dump 确认，
+    #    页面原文是「**周末是否有课**」—— 多了「是否」两个字。
+    #    所以文案判据是子串匹配，一个字都不能少。
+    #    这是用例写错了，不是执行器的问题（同一屏上「显示非本周课程」是准的）。
+    note: 文案取自真机 dump 实测；若日后 UI 改文案，按实际 dump 更新，不要改用未核实的 rid
     check:
-      text_present: "周末有课"
+      text_present: "周末是否有课"
 
   - id: a5
     desc: 右上角「完成」按钮在页面上

@@ -657,7 +657,7 @@ class DirectDevice:
     # -- 动作 ---------------------------------------------------------------
     def act(self, x: int, y: int, why: str = "",
             perm_action: str | None = None, perm: str | None = None,
-            **_: Any) -> ActResult:
+            step: str = "", **_: Any) -> ActResult:
         """按坐标点击，处理掉点击引发的系统权限框，然后观察一次。
 
         ## 为什么要在这里接权限处理（不是可选优化，是硬约束）
@@ -726,7 +726,7 @@ class DirectDevice:
         except Exception as exc:  # noqa: BLE001
             if self._ledger is not None:
                 self._ledger.record(
-                    step=str(_.get("step") or ""), action="click", target=_tgt,
+                    step=str(step or ""), action="click", target=_tgt,
                     before=_act_before, after="", ms=(time.time() - t_click) * 1000,
                     changed=None, why=why, extra={"error": str(exc)[:200]})
             raise
@@ -783,7 +783,7 @@ class DirectDevice:
             _sig_before = _clickable_sig(_pre)
             _sig_after = _clickable_sig(scr)
             self._ledger.record(
-                step=str(_.get("step") or ""),
+                step=str(step or ""),
                 action="click",
                 target=_tgt,
                 before=_act_before,
@@ -798,7 +798,21 @@ class DirectDevice:
                        "ms_observe": round(_ms_obs, 1),
                        "sig": _sig_after,
                        "perm": (perm_result or {}).get("result")
-                       if isinstance(perm_result, dict) else None},
+                       if isinstance(perm_result, dict) else None,
+                       # ★ 证据路径：点**前**那屏 + 点**后**那屏。
+                       #
+                       # 为什么要记：截图和 XML 一直都在落盘（observe 每次
+                       # 都写 stepNNNN/dump.xml + shot.png），但账本里没有指针，
+                       # 于是"某次点击当时长什么样"永远关联不上 ——
+                       # WebUI 想展示证据也没法展示。
+                       #
+                       # 记 before 和 after 两个，是因为排查时最常问的是
+                       # "点之前是这样、点之后变那样了吗"，
+                       # 只有 after 一张看不出变化。
+                       "shot_before": getattr(_pre, "shot_path", None),
+                       "shot_after": getattr(scr, "shot_path", None),
+                       "xml_before": getattr(_pre, "xml_path", None),
+                       "xml_after": getattr(scr, "xml_path", None)},
             )
 
         return ActResult(ok=True, activity=scr.activity, next=scr.clickable,
@@ -814,8 +828,8 @@ class DirectDevice:
             return None
         return self.act(n["c"][0], n["c"][1], why=f"rid={rid}")
 
-    def input_text(self, rid: str, text: str, *,
-                   scr: Screen | None = None) -> ActResult | None:
+    def input_text(self, rid: str, text: str, *, scr: Screen | None = None,
+                   step: str = "", why: str = "") -> ActResult | None:
         """在 rid 那个输入框里填入 text。找不到控件返回 None。
 
         为什么要这个（实测踩到）：
@@ -838,9 +852,19 @@ class DirectDevice:
         s = scr or self.observe()
         n = s.find_rid(rid)
         if not n:
+            # 找不到也记账 —— 否则账本里会**整段缺失**这件事，
+            # 排查时看到的是"什么都没发生"，而不是"想输入但控件不在"。
+            if self._ledger is not None:
+                self._ledger.record(
+                    step=step, action="input",
+                    target={"rid": rid, "text": str(text)[:40]},
+                    before=s.activity, after=s.activity, ms=0.0,
+                    changed=None, why=why,
+                    extra={"error": f"找不到输入框 rid={rid}"})
             return None
 
         cx, cy = int(n["c"][0]), int(n["c"][1])
+        _t_in = time.time()
 
         # 1) 点进输入框（有些输入框不获得焦点就不接受 setText）
         self._call_with_timeout(
@@ -853,24 +877,46 @@ class DirectDevice:
         if not full and "." in rid:
             full = rid
         sel = {"resourceId": full} if full else {"focused": True}
+        _err = ""
         try:
             self._call_with_timeout(
                 lambda: self._d(**sel).set_text(str(text)),
                 timeout=15.0, label="input set_text")
-        except Exception:  # noqa: BLE001  退回聚焦控件再试一次
-            self._call_with_timeout(
-                lambda: self._d(focused=True).set_text(str(text)),
-                timeout=15.0, label="input set_text(focused)")
+        except Exception as exc:  # noqa: BLE001  退回聚焦控件再试一次
+            try:
+                self._call_with_timeout(
+                    lambda: self._d(focused=True).set_text(str(text)),
+                    timeout=15.0, label="input set_text(focused)")
+            except Exception as exc2:  # noqa: BLE001
+                _err = f"{exc} / {exc2}"[:200]
         # ★ 输入完同样等 1 秒再看 —— 和点击一个道理：
         #   键盘收起、正文上屏都有动画，立刻 dump 拿到的可能还是旧内容，
         #   后续判断就会以为"没填进去"。
         time.sleep(1.0)
 
         scr2 = self.observe()
+        # ★ 输入也要记账 —— 用户的要求是"每一步点击了啥都要留痕方便排查"，
+        #   而"填了什么字"比"点了哪"更容易出问题（中文、覆盖、焦点）。
+        if self._ledger is not None:
+            self._ledger.record(
+                step=step, action="input",
+                target={"rid": rid, "text": str(text)[:60],
+                        "c": [cx, cy]},
+                before=s.activity, after=scr2.activity,
+                ms=(time.time() - _t_in) * 1000,
+                changed=(s.activity != scr2.activity
+                         or _clickable_sig(s) != _clickable_sig(scr2)),
+                why=why,
+                extra={"error": _err or None,
+                       "shot_before": getattr(s, "shot_path", None),
+                       "shot_after": getattr(scr2, "shot_path", None),
+                       "xml_before": getattr(s, "xml_path", None),
+                       "xml_after": getattr(scr2, "xml_path", None)})
         return ActResult(ok=True, activity=scr2.activity, next=scr2.clickable,
                          event_ids=[], checkpoint=None, executed=True,
-                         error=None, permission=None,
+                         error=_err or None, permission=None,
                          package=scr2.package, xml_path=scr2.xml_path)
+
 
     def click_xpath(self, expr: str, *, scr: Screen | None = None) -> ActResult | None:
         """按 XPath 点。**必须命中唯一一个**，否则返回 None。
@@ -884,13 +930,16 @@ class DirectDevice:
         return self.act(c[0], c[1], why=f"xpath={expr[:60]}")
 
     def key(self, name: str, why: str = "", perm_action: str | None = None,
-            perm: str | None = None, **_: Any) -> ActResult:
+            perm: str | None = None, step: str = "", **_: Any) -> ActResult:
         """系统键（back / home）。
 
         为什么也要接权限处理：按返回键时系统可能弹「确定要退出吗」，
         某些 OEM 的权限框按返回会变成"仅本次允许"选择页。
         和点击一样，处置窗口只有几秒。
         """
+        _pre = self._last_screen
+        _before = getattr(_pre, "activity", "") if _pre else ""
+        _t_key = time.time()
         self._d.press(name)
         perm_result = None
         if self._perm is not None:
@@ -899,7 +948,32 @@ class DirectDevice:
                     self._d, perm_action, owner_package=self._perm_owner())
             except Exception as exc:  # noqa: BLE001
                 perm_result = {"error": str(exc)[:200]}
+        # ★ 按键后同样等 1 秒：返回/回桌面都有退出动画，
+        #   立刻 dump 会拿到上一屏（和点击同一个坑）。
+        time.sleep(1.0)
         scr = self.observe()
+        # ★ 记账。按键原来完全不进账本 —— 于是"模型按了返回"
+        #   在账本里看起来像"什么都没发生"，排查时最容易被误导。
+        if self._ledger is not None:
+            if not _before:
+                _before = self._app_current().get("activity", "")
+            self._ledger.record(
+                step=step, action=f"key:{name}",
+                target={"key": name},
+                before=_before, after=scr.activity,
+                ms=(time.time() - _t_key) * 1000,
+                changed=(
+                    None if not _before
+                    else (_before != scr.activity
+                          or _clickable_sig(_pre) != _clickable_sig(scr))
+                ),
+                why=why,
+                extra={"perm": (perm_result or {}).get("result")
+                       if isinstance(perm_result, dict) else None,
+                       "shot_before": getattr(_pre, "shot_path", None),
+                       "shot_after": getattr(scr, "shot_path", None),
+                       "xml_before": getattr(_pre, "xml_path", None),
+                       "xml_after": getattr(scr, "xml_path", None)})
         return ActResult(ok=True, activity=scr.activity, next=scr.clickable,
                          event_ids=[], checkpoint=None, executed=True,
                          error=None, permission=perm_result,

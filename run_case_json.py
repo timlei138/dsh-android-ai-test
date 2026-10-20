@@ -308,6 +308,47 @@ def main() -> int:
         print(f"[report] ⚠️ 报告文件没写成（{type(e).__name__}: {e}）；"
               f"结论仍会通过 stdout 返回", flush=True)
 
+    # ★ 落库：每次运行存一行历史，WebUI 从这里读。
+    #
+    # 为什么必须做：在此之前 report_<case>.json 和 clicks_<case>.jsonl
+    # **每次都覆盖**，于是"同一个用例上次过没过、这次为什么变了"
+    # 根本没有数据可查。落库之后历史才留得住。
+    #
+    # ⚠️ 落库失败**绝不能影响用例结论** —— 它只是展示层。
+    #    所以整段吞异常，只在 stderr 提示一句。
+    run_id = None
+    try:
+        from android_agent.reporting import store as _store
+        from android_agent.report.scratch import tmp_dir as _tmp
+        _rows: list = []
+        _ledger_file = _tmp() / f"clicks_{spec.case_id}.jsonl"
+        if _ledger_file.exists():
+            for _line in _ledger_file.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if _line:
+                    try:
+                        _rows.append(json.loads(_line))
+                    except json.JSONDecodeError:
+                        pass
+        _rep = report.to_dict()
+        # 报告里的 steps_done 是"做了几步"，总步数在 summary 的
+        # 「步骤 7/7」里 —— store 自己会去抠。
+        run_id = _store.save_run(
+            case_name=str(spec.case_id),
+            report=_rep,
+            ledger_rows=_rows,
+            paths={
+                "ledger": str(_ledger_file),
+                "log": str(_tmp() / f"run_{spec.case_id}.log"),
+                "llm": str(_tmp() / f"llm_{spec.case_id}.md"),
+                "report": str(report_path),
+            },
+        )
+        print(f"[report] 已落库 run_id={run_id}", file=sys.stderr, flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[report] ⚠️ 落库失败（{type(_e).__name__}: {_e}）；"
+              f"不影响本次结论", file=sys.stderr, flush=True)
+
     payload = {
         "status": report.status,
         # ★ 引擎必须回给主 Agent —— 报告长得一样，只有这个字段能分辨
