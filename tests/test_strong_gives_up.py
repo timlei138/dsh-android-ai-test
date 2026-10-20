@@ -93,11 +93,17 @@ empty_lg = ClickLedger(Path(tempfile.mkdtemp()) / "e.jsonl")
 use_ledger(empty_lg)
 
 st = {
-    "task": {"steps": [{"id": "s3", "desc": "点完成", "target": "rid=save_view",
+    # ★ package / last_package 必须给：强证据只在被测 App 自己的界面里生效
+    #   （用户：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧」）。
+    #   不给包名就等于"归属不明"，新逻辑会正确地转交模型 ——
+    #   那样这个用例就测不到"命中唯一 -> 直点"了。
+    "task": {"package": "com.zui.calendar",
+             "steps": [{"id": "s3", "desc": "点完成", "target": "rid=save_view",
                         "landing": "activity=.X"}]},
     "step_index": 0,
     "round_in_step": 5,
     "last_activity": ".timetable.management.EditTimetableActivity",
+    "last_package": "com.zui.calendar",
     "obs_clickable": [{"r": "save_view", "t": "完成", "c": [1777, 202]},
                       {"r": "other", "t": "", "c": [50, 50]}],
     "obs_xml_path": str(xml),

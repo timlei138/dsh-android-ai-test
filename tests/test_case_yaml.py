@@ -70,9 +70,15 @@ check("s2 定位到图库导入按钮",
 # ★ 而且要判"到了选图界面"，不能钉死具体 Activity 类名。
 #   原来写 PhotoPickerGetContentActivity，真机 Android 17 偶尔给的是
 #   PhotoPickerUserSelectActivity，就误报落点不符。
-#   用户的话：「打开相册。我不管打开的是哪个相册。打开就行了。」
-check("s2 落点是选图界面（稳定终态，且不钉死具体类名）",
-      (s2.landing or "").strip() == "album=any", str(s2.landing))
+#
+# ★ 最终做法是**干脆不给落点**：这一步的终点在日历外面，
+#   外部界面的 activity/rid 不受我们控制，写什么判据都在赌。
+#   用户：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。」
+#   代码只点到「从图库导入课程表」为止，之后交给模型。
+check("s2 不给落点判据（终点在 App 外面，交模型）",
+      not (s2.landing or "").strip(), str(s2.landing))
+check("s2 的 target 仍是代码可唯一判定的（App 内的那一下照样直点）",
+      nd.is_deterministic_landing(s2.target or "")[0], str(s2.target))
 
 print("\n=== 3) ★ 每个 target 都在代码能唯一判定的形态里 ===")
 # 早先这一步验的是「locate_seq 的两个动作都没丢」（点更多 + 点课程表）。
@@ -116,14 +122,12 @@ _UNKNOWN = [k for k in (a1.check or {}) if k not in nd.KNOWN_CHECKS]
 check("a1 的判据键都认识", not _UNKNOWN, str(_UNKNOWN))
 check("a2 是字典判据", isinstance(a2.check, dict), type(a2.check).__name__)
 check("a2 用了 node_present", "node_present" in (a2.check or {}), str(a2.check))
-# ★ a3 判"打开某种选图/相册界面"，不判是哪一个具体 Activity。
-#   原来还要求 package: com.android.providers.media.module —— 但换成
-#   DocumentsUI 或厂商相册时包名就变了，这条判据会把"打开了"判成"没打开"。
-#   具体打开了哪个由 album_reached 写进报告的 actual，排查时照样看得到。
-check("a3 用 album_reached 判据（不钉死 Activity 类名）",
-      "album_reached" in (a3.check or {}), str(a3.check))
-_UNKNOWN_A3 = [k for k in (a3.check or {}) if k not in nd.KNOWN_CHECKS]
-check("a3 的判据键都认识", not _UNKNOWN_A3, str(_UNKNOWN_A3))
+# ★ a3 判"跳出日历之后到没到选图界面"，**故意不给代码判据**。
+#   外部界面的 activity/rid 都不是我们能控制的，写死就会像原来那样误报。
+#   用户：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。
+#          虽然多一次访问。但更简单点。」
+check("★ a3 不给代码判据（跳出去交模型）",
+      not a3.check, str(a3.check))
 
 print("\n=== 6) 坑跟着步骤走（用例 YAML 的核心设计）===")
 check("s1 有坑", len(s1.pitfalls) > 0, str(len(s1.pitfalls)))

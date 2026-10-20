@@ -2560,59 +2560,6 @@ def _checkpoint():
     return _CHECKPOINT_MOD
 
 
-# ── 相册/图片选择器：只判"打开了某一类界面"，不判"哪一个" ────────────
-#
-# ## 为什么需要它
-#
-# 168 的 a3 原来写的是
-#     activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
-# 一字不差地钉死。Android 17 上系统给的是 PhotoPickerUserSelectActivity，
-# 于是真机跑出来 FAIL —— 但**功能明明是对的，图库确实打开了**。
-#
-# 用户的原话：
-#     「打开相册。我不管打开的是哪个相册。打开就行了。」
-#
-# 这就是判据的语义本身：要验的是"能不能进到选图界面"，
-# 不是"系统用的是哪个具体 Activity 类"。
-# 后者是实现细节，换个 Android 版本、换个 ROM 就变，钉死它等于自找误报。
-#
-# ## 怎么判才算"够确定"
-#
-# 不能简单用 "PhotoPicker" 子串匹配 —— 那仍然绑死在同一个实现上。
-# 这里走**语义特征**：前台 activity 满足任意一条即可
-#   · 包名/类是系统媒体选择器的（photopicker / mediapicker）
-#   · 是文档选择器的（documentsui —— 部分 ROM 就是拿它当选图器）
-#   · 是相册类 App 的（gallery / photos / album）
-#
-# 这几条都是"这一屏是干什么用的"层面的特征，不绑具体类名，
-# 换 ROM、换版本都还成立。
-#
-# ⚠️ 仍然交给代码判，不问模型：这只是字符串规则，确定得很，
-#    没有模糊到需要模型介入。真正模糊的是"这算不算一个好相册"
-#    —— 那不在本用例范围内。
-
-#: 前台 activity 里出现这些片段，就算"进到了选图/相册界面"
-_ALBUM_MARKERS = (
-    "photopicker",      # AOSP 系统图片选择器
-    "mediapicker",      # 部分 ROM 的命名
-    "documentsui",      # DocumentsUI 也能当选图器用
-    "/gallery",         # 相册类 App
-    ".gallery",
-    "/photos",
-    ".photos",
-    "/album",
-    ".album",
-)
-
-#: 肯定**不是**选图界面的，先排除掉。
-#: 不排除的话，"PhotoPicker" 这种字样出现在权限页包名里会误判为已打开。
-_ALBUM_EXCLUDES = (
-    "permissioncontroller",   # 权限弹窗
-    "GrantPermissions",       # 授权页
-    "launcher",               # 桌面
-)
-
-
 def match_landing(expr: str, *, activity: str = "",
                   clickable: list[dict[str, Any]] | None = None,
                   nodes_text: str = "",
@@ -2633,28 +2580,6 @@ def match_landing(expr: str, *, activity: str = "",
     expr = (expr or "").strip()
     if not expr:
         return False, "无落点判据"
-
-    # ★ `album=any` —— "到了任意一个选图/相册界面"。
-    #
-    # 168 s2 的落点原本写死
-    #   activity=com.android.providers.media.photopicker.PhotoPickerGetContentActivity
-    # Android 17 改叫 PhotoPickerUserSelectActivity，整步判"落点不符"，
-    # 明明图库已经打开了。
-    #
-    # 用户的要求是「打开相册，我不管打开的是哪个相册」——
-    # 落点判据就得能表达这个意思。这里只支持一个值 `any`：
-    # 判"这一屏是不是选图类的"，而不是"是不是那个类"。
-    # 别的词一律当写错，报出来别静默放行。
-    if expr.lower().startswith("album="):
-        want = expr.split("=", 1)[1].strip().lower()
-        if want != "any":
-            return False, f"album= 只支持 any，不认识 {want!r}"
-        low = (activity or "").lower()
-        if any(x.lower() in low for x in _ALBUM_EXCLUDES):
-            return False, f"当前是系统弹窗/桌面，不算打开相册：{activity}"
-        hit = any(m.lower() in low for m in _ALBUM_MARKERS)
-        return hit, (f"命中：{activity}" if hit
-                     else f"未命中：{activity or '未知界面'} 不是选图类界面")
 
     try:
         cp = _checkpoint()
@@ -3165,39 +3090,6 @@ def _steps_done(state: ChildState) -> int:
 
 
 
-def _album_reached(state: ChildState, kinds: tuple[str, ...] | None = None
-                   ) -> tuple[bool, str]:
-    """本次执行过程中，有没有到过"选图/相册"这类界面。
-
-    返回 (是否算达成, 命中的那一屏或失败说明)。
-
-    ★ 和 activity= 一样要判"到达过"，不能判"现在在哪"：
-      断言在流程末尾统一判，那时可能为了收尾又翻走了。
-    """
-    marks = kinds or _ALBUM_MARKERS
-    acts: list[str] = []
-    for v in (state.get("visited") or []):
-        s = str(v)
-        if "->" in s:
-            left, right = s.split("->", 1)
-            acts.extend([left.strip(), right.strip()])
-        else:
-            acts.append(s.strip())
-    if state.get("last_activity"):
-        acts.append(str(state["last_activity"]))
-    # 去重但保序，方便把"命中的是哪一个"写进判据说明里
-    seen: set[str] = set()
-    uniq = [a for a in acts if a and not (a in seen or seen.add(a))]
-    for a in uniq:
-        low = a.lower()
-        if any(x.lower() in low for x in _ALBUM_EXCLUDES):
-            continue
-        if any(m.lower() in low for m in marks):
-            return True, a
-    return False, (f"没到过选图/相册界面（走过 {len(uniq)} 个页面，"
-                   f"最后停在 {uniq[-1] if uniq else '未知'}）")
-
-
 def _activity_reached(state: ChildState, check: Any) -> bool | None:
     """代码判定 activity= 判据是否"本次到达过"。
 
@@ -3253,7 +3145,6 @@ def _activity_reached(state: ChildState, check: Any) -> bool | None:
 #   · 判据里出现**不认识的键**，必须显式报错 ——
 #     用例 YAML 自己写着「两者对不上时不会报错，只会静默跑偏」
 
-# 代码能判的判据键
 KNOWN_CHECKS = (
     "activity", "activity_changed_to", "package",
     "node_present", "node_absent", "rid_present",
@@ -3279,21 +3170,6 @@ KNOWN_CHECKS = (
     #
     # 权限名和包名都是**唯一确定**的，符合"确定的给代码判"的原则。
     "permission",
-    # ★ album_reached —— "有没有打开某个选图/相册界面"。
-    #
-    # 168 的 a3 原来写死
-    #   activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
-    # Android 17 上系统给的是 ...PhotoPickerUserSelectActivity，真机直接报 FAIL，
-    # 可功能是对的。用户的要求：
-    #   「打开相册。我不管打开的是哪个相册。打开就行了。」
-    #
-    # 所以判"这类界面到了没有"，不判是哪一个具体 Activity 类。
-    # 判法仍走代码（_album_reached 是纯字符串规则），不问模型。
-    #
-    # 写法：
-    #   album_reached: true                     任一类选图界面都行
-    #   album_reached: {kinds: [photopicker]}   限定只看系统选择器
-    "album_reached",
 )
 # 明确**不判**的键（注解性质，不是判据）
 ANNOTATION_CHECKS = (
@@ -3480,27 +3356,6 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
             ok = _activity_reached(state, f"activity={want}") is True
             results.append(ok)
             notes.append(f"activity {'✔' if ok else '✘'} {want}")
-
-        elif key == "album_reached":
-            # ★ 判"有没有打开某个选图/相册界面"，**不要求是哪一个**。
-            #
-            # 这是 168 踩出来的：写死 PhotoPickerGetContentActivity，
-            # Android 17 换成 PhotoPickerUserSelectActivity 就误报 FAIL。
-            # 用户要的是"打开了就行"，那判据就该按这个语义写。
-            kinds = None
-            if isinstance(val, dict):
-                raw_k = val.get("kinds") or val.get("kind")
-                if isinstance(raw_k, str):
-                    kinds = (raw_k,)
-                elif isinstance(raw_k, (list, tuple)):
-                    kinds = tuple(str(x) for x in raw_k)
-                elif raw_k is None:
-                    kinds = None
-            ok, where = _album_reached(state, kinds)
-            results.append(ok)
-            # 命中时把具体是哪一个写出来 —— 判"任意一个都行"不等于不记录是哪个，
-            # 出问题时得能在报告里看到实际打开的是哪一屏。
-            notes.append(f"album {'✔' if ok else '✘'} {where}")
 
         elif key == "package":
             want = str(val).strip()
@@ -4093,6 +3948,39 @@ def route_after_verdict(state: ChildState) -> Literal["assert", "finish"]:
     return "assert" if done < len(task["asserts"]) else "finish"
 
 
+def _foreground_owner(state: ChildState) -> tuple[str, str]:
+    """当前前台是哪个包、哪个 activity。拿不到就返回空串（不猜）。"""
+    return (str(state.get("last_package") or ""),
+            str(state.get("last_activity") or ""))
+
+
+def _is_sut(state: ChildState, pkg: str) -> bool:
+    """这个包是不是**被测 App 自己**。
+
+    强证据的适用范围就卡在这一个问题上（用户：
+    「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧」）。
+
+    ## 为什么用包名判，而不是 activity 名
+
+    包名是 App 的身份，稳定；activity 名是内部实现，会变。
+    而且"是不是我们的 App"本来就该看身份 —— 同一个 activity 名
+    在别的 App 里出现也不能算数。
+
+    ## 判不了怎么办
+
+    没有包名（还没观察到、dump 失败）→ 返回 False，即按"外部"处理。
+    宁可多花一次模型调用，也不要在归属不明时硬判 ——
+    硬判错了会去点一个不该点的地方，代价比多一次调用大得多。
+    """
+    app_pkg = str((state.get("task") or {}).get("package") or "").strip()
+    if not app_pkg or not pkg:
+        return False
+    # 精确比包名，不做子串匹配：
+    # com.zui.calendar 和 com.zui.calendar.widget 是两个 App，
+    # 子串匹配会把后者误认成前者。
+    return pkg.strip() == app_pkg
+
+
 def strong_target_node(state: ChildState) -> dict[str, Any]:
     """强证据直点：这一步的 target 在**当前屏**能不能唯一确定？
 
@@ -4123,6 +4011,42 @@ def strong_target_node(state: ChildState) -> dict[str, Any]:
 
     step = steps[idx]
     sid = str(step.get("id") or "")
+
+    # ══════════════════════════════════════════════════════════════════
+    # ⓪ 强证据只对**被测 App 自己的界面**生效
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # 用户原话：
+    #   「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。
+    #     虽然多一次访问。但更简单点。」
+    #
+    # 这条规则解决的是"外部界面不可控"的问题：
+    #   · 系统图库、权限框、分享面板 —— 它们不是我们的代码，
+    #     rid 叫什么、activity 叫什么、有几个都随时可能变
+    #   · 我们**改不了它们**，却要拿写死的规则去判，等于自己造误报
+    #
+    # 168 就是活证据：a3 钉死 PhotoPickerGetContentActivity，
+    # Android 17 换个分支就给了 PhotoPickerUserSelectActivity。
+    # 我当时的补法（给"相册"列一串关键词）方向是错的 ——
+    # 那仍然是拿规则去猜一个我们控制不了的界面，只是把关键词换宽了一点。
+    #
+    # 正确的分界是**归属**，不是**内容**：
+    #   前台是被测 App  → 界面结构稳定，强证据可靠，用代码判
+    #   前台是别人家的  → 结构不稳定，直接交给模型看一眼，别硬判
+    #
+    # 代价是外部界面每步多一次模型调用。用户明确接受了：
+    #   「虽然多一次访问，但更简单点」。
+    #
+    # ⚠️ 判不了归属（拿不到包名/activity）时也要交出去。
+    #    宁可按"外部"处理 —— 多花一次调用，好过拿不准还硬判。
+    from_pkg, from_act = _foreground_owner(state)
+    if not _is_sut(state, from_pkg):
+        return _ask_model(
+            state,
+            f"{sid} 当前前台不是被测 App"
+            f"（{from_pkg or '未知包名'}/{from_act or '未知界面'}）。"
+            f"强证据只在被测 App 自己的界面里用 —— 外部界面的结构不受我们控制，"
+            f"写死的 rid/activity 判不准。这一步由你看着屏幕判断该做什么。")
 
     # ══════════════════════════════════════════════════════════════════
     # ① 先问代码：这一步的**落点**是不是已经满足了？

@@ -36,7 +36,7 @@ spec, warns, path = load_case_by_name("168")
 check("读到了", spec is not None, path.name)
 check("3 步 3 断言", len(spec.steps) == 3 and len(spec.asserts) == 3)
 
-print("\n=== 2) 168 的三条断言，代码能判吗 ===")
+print("\n=== 2) 168 的断言：App 内的代码判，跳出 App 的交模型 ===")
 # 造一个"跑成功了"的状态
 good = {
     "last_activity": "com.android.providers.media.photopicker."
@@ -55,10 +55,18 @@ good = {
     "seen_rids": ["iv_more", "btnImportFromGallery", "button1"],
 }
 
+# ★ a3 是**故意**没判据的：它判的是"跳出日历之后到没到选图界面"，
+#   而外部界面的 activity/rid 都不受我们控制，写死了就会像原来那样误报。
+#   用户：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。」
+#   所以这里验的是"边界对不对"，不是"每条都能代码判"。
+_OUTSIDE = {"a3"}          # 判据落在日历外面的断言
 for a in spec.asserts:
     v, why = evaluate_check(a.check, state=good)
-    check(f"{a.id} 能由代码判定", v is not None,
-          f"{'成立' if v else '不成立'}：{why}")
+    if a.id in _OUTSIDE:
+        check(f"{a.id} 不给代码判据（跳出去交模型）", v is None, why)
+    else:
+        check(f"{a.id} 由代码判定（App 内，稳定）", v is not None,
+              f"{'成立' if v else '不成立'}：{why}")
 
 print("\n=== 3) 跑失败的状态，代码也要判得出来（不能只会说通过）===")
 bad = {**good,
@@ -68,6 +76,8 @@ bad = {**good,
        "obs_clickable": [{"r": "iv_more"}],
        "seen_rids": ["iv_more"]}
 for a in spec.asserts:
+    if a.id in _OUTSIDE:
+        continue
     v, why = evaluate_check(a.check, state=bad)
     check(f"{a.id} 判为不成立", v is False, why)
 
@@ -85,8 +95,16 @@ if "after_tap" in (a2.check or {}):
     check("弹框没出现过 -> a2 判不成立", v2 is False, why2)
 
 print("\n=== 5) 每一步的强证据目标与落点都解析出来了 ===")
+# ★ 例外是 s2：它的终点在日历外面（系统图片选择器），
+#   所以**故意不写 landing** —— 外部界面不受我们控制，
+#   写死判据就会像原来那样误报。它的完成由模型判。
+_NO_LANDING = {"s2"}
 for s in spec.steps:
-    check(f"{s.id} 有落点", bool(s.landing), str(s.landing))
+    if s.id in _NO_LANDING:
+        check(f"{s.id} 不给落点判据（终点在 App 外面）",
+              not s.landing, str(s.landing))
+    else:
+        check(f"{s.id} 有落点（App 内，代码可判）", bool(s.landing), str(s.landing))
     # ★ 换了关注点：早先验的是 locate_seq 里存了几个动作（按序重放的旧机制）。
     #   现在没有回放了，靠的是**每步一个可唯一判定的 target**：
     #   命中恰好 1 个 -> 代码直点；0 个或 >1 个 -> 交模型。
