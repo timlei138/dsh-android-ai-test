@@ -132,6 +132,32 @@ CREATE TABLE IF NOT EXISTS findings (
     note        TEXT
 );
 
+-- ★ 原始用例（用户写的那份「测试步骤 + 预期结果」）
+--
+-- 为什么要单独一张表、而不是跟 runs 挤在一起：
+--   原始用例是**用例的属性**，不是"某一次运行"的属性。
+--   同一条用例跑 20 次，原始用例还是那一份 —— 存进 runs 就是 20 份重复。
+--
+-- 为什么之前没有：
+--   系统里一直只有 YAML，而 YAML 里的 steps[].desc / assertions[].desc
+--   是**改写过的判据描述**（"点掉 pm clear 后的「同意」权限说明框…"），
+--   跟用户当初写的"首次打开日历，关掉权限弹窗"不是一回事。
+--   前端要展示"原始 case"时才发现根本没存过 —— 这次补上。
+--
+-- 为什么进库不进文件：
+--   文件要额外管目录、编码、命名冲突、跟 YAML 改名同步；
+--   而它天然是"一条用例一份"，跟 case_name 一一对应，正好是表。
+--
+-- 一个 case_name 可能有多条记录吗？
+--   不会 —— case_name 是主键。改了就 REPLACE，永远保留最新那份。
+--   历史版本不需要留：YAML 已经存了每次运行的快照，那才是判据的真相；
+--   原始用例是"需求原话"，需求变了就以新的为准。
+CREATE TABLE IF NOT EXISTS raw_cases (
+    case_name   TEXT PRIMARY KEY,  -- 跟 runs.case_name 对齐（YAML 文件名，不含扩展名）
+    raw_text    TEXT NOT NULL,     -- 用户原文，原样存，不加工
+    updated_at  TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_case   ON runs(case_name, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
@@ -410,9 +436,98 @@ def get_run(run_id: int, *, db: str | Path | None = None) -> dict[str, Any] | No
         con.close()
 
 
+# ── 原始用例（用户写的那份需求原话）─────────────────────────────
+# 存在 raw_cases 表，一个 case_name 一份。见 _SCHEMA 里那张表的说明。
+
+def save_raw_case(case_name: str, raw_text: str, *,
+                  db: str | Path | None = None) -> bool:
+    """存/覆盖一条原始用例。返回 True 表示是新写入。
+
+    空文本不存 —— 否则手滑清空就把原来那份删掉了，
+    而"清空"和"从来没有"在前端看起来一样。
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return False
+    con = connect(db)
+    try:
+        had = con.execute("SELECT 1 FROM raw_cases WHERE case_name = ?",
+                          (case_name,)).fetchone() is not None
+        con.execute(
+            "INSERT OR REPLACE INTO raw_cases(case_name, raw_text, updated_at) "
+            "VALUES(?,?,?)",
+            (case_name, text, _fmt_ts(time.time())))
+        con.commit()
+        return not had
+    finally:
+        con.close()
+
+
+def get_raw_case(case_name: str, *,
+                 db: str | Path | None = None) -> dict[str, Any] | None:
+    """取一条原始用例；没有则 None（**不要返回空串冒充有**）。"""
+    con = connect(db)
+    try:
+        row = con.execute(
+            "SELECT raw_text, updated_at FROM raw_cases WHERE case_name = ?",
+            (case_name,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def delete_raw_case(case_name: str, *, db: str | Path | None = None) -> int:
+    """删掉一条原始用例，返回删了几行（0/1）。"""
+    con = connect(db)
+    try:
+        cur = con.execute("DELETE FROM raw_cases WHERE case_name = ?",
+                          (case_name,))
+        con.commit()
+        return cur.rowcount or 0
+    finally:
+        con.close()
+
+
+def delete_run(run_id: int, *, db: str | Path | None = None) -> dict[str, Any]:
+    """删掉一次运行（runs + actions + findings 三张表里的行）。
+
+    ⚠️ **只删库里的行，不碰磁盘**。
+       磁盘上的日志/截图/xml 由调用方决定删不删 —— 理由见 webui.py
+       的 DELETE 处理：万一库里路径被改坏过，无脑递归删会删到别处去。
+       所以"删文件"必须由一个知道证据根在哪的层来做，不在这里。
+
+    返回被删记录里记着的文件路径，供上层去清理。
+    """
+    con = connect(db)
+    try:
+        row = con.execute("SELECT * FROM runs WHERE run_id = ?",
+                          (run_id,)).fetchone()
+        if not row:
+            return {"deleted": 0, "paths": []}
+        rec = dict(row)
+        # 先把这张运行下所有证据路径收齐，再去删行 —— 删完就查不到了
+        paths: list[str] = []
+        for key in ("ledger_path", "log_path", "llm_path", "report_path"):
+            if rec.get(key):
+                paths.append(str(rec[key]))
+        for a in con.execute(
+                "SELECT shot_before, shot_after, xml_before, xml_after "
+                "FROM actions WHERE run_id = ?", (run_id,)):
+            paths.extend(str(v) for v in a if v)
+
+        con.execute("DELETE FROM actions WHERE run_id = ?", (run_id,))
+        con.execute("DELETE FROM findings WHERE run_id = ?", (run_id,))
+        con.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        con.commit()
+        return {"deleted": 1, "paths": paths, "case_name": rec.get("case_name")}
+    finally:
+        con.close()
+
+
 def compare_runs(a: int, b: int, *,
                  db: str | Path | None = None) -> dict[str, Any]:
     """对比两次运行 —— 这是变成数据库之后最有价值的一件事。
+
 
     回答的问题：「同一个用例，这次和上次差在哪」
       · 状态变了没（PASS -> BLOCKED 是回归）

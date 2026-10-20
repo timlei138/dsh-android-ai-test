@@ -54,11 +54,72 @@ function shotUrl(runId, seq, which) {
   return `/shot/${runId}/${seq}/${which}`;
 }
 
-async function api(path) {
-  const r = await fetch(path);
+async function api(path, opts) {
+  // 默认 GET。传 {method:'DELETE'} / {method:'POST', body:{...}}。
+  // body 自动 JSON 序列化 —— 调用点不用每次自己 stringify + 设 header。
+  const init = { ...(opts || {}) };
+  if (init.body && typeof init.body !== 'string') {
+    init.headers = { ...(init.headers || {}), 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(init.body);
+  }
+  const r = await fetch(path, init);
   const j = await r.json().catch(() => ({ error: '返回的不是 JSON' }));
   if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
+}
+
+/* ---------- 通用弹窗 / 提示 ---------- */
+
+/* 返回 {el, close}。按键 Esc、点遮罩都能关。
+ *
+ * 为什么不直接用 confirm()：浏览器的 confirm 不能带"同时删除截图"这种
+ * 勾选项，也不能把"会具体删掉哪些东西"排版清楚 —— 而删除恰恰是最需要
+ * 让人看清楚后果的操作。 */
+function modal(title, bodyHtml, footHtml) {
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = `<div class="modal">
+      <h3>${esc(title)}</h3>
+      <div class="modal-body">${bodyHtml}</div>
+      <div class="modal-foot">${footHtml}</div>
+    </div>`;
+  document.body.appendChild(mask);
+  const close = () => mask.remove();
+  mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
+  document.addEventListener('keydown', function onKey(e) {
+    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); }
+  });
+  return { el: mask, close };
+}
+
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+/* 弹一个"输入多行文本"的框，返回 Promise<string|null>。
+ * 原始用例只能人来录，所以需要一个能贴长文本的地方。 */
+function promptText(title, hint, value) {
+  return new Promise((resolve) => {
+    const m = modal(title,
+      `<div class="meta" style="margin-bottom:8px">${esc(hint)}</div>
+       <textarea id="pt-area" spellcheck="false"
+         style="width:100%;min-height:240px;font-family:ui-monospace,Consolas,monospace;
+                font-size:12.5px;line-height:1.6;padding:10px;border:1px solid var(--line);
+                border-radius:8px;resize:vertical">${esc(value || '')}</textarea>`,
+      `<button class="ghost" data-cancel>取消</button>
+       <button data-ok>保存</button>`);
+    const ta = m.el.querySelector('#pt-area');
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    let settled = false;
+    const fin = (v) => { if (!settled) { settled = true; resolve(v); } m.close(); };
+    m.el.querySelector('[data-cancel]').addEventListener('click', () => fin(null));
+    m.el.querySelector('[data-ok]').addEventListener('click', () => fin(ta.value));
+  });
 }
 
 /* ---------- 侧栏 ---------- */
@@ -257,35 +318,113 @@ async function viewCases() {
     api('/api/cases'),
     api('/api/stats').catch(() => ({ cases: [] })),
   ]);
-  const byId = {};
-  (s.cases || []).forEach((c) => { byId[c.case_name] = c; });
+  // ⚠️ 索引键是 stats 里的 case_name（= YAML 文件名去扩展名），
+  //    不是 case_id。之前建索引用 case_name、查却用 c.case_id，
+  //    于是「最近结论」「跑过」两列永远是空的 —— 而且不报错，只是空的。
+  const byName = {};
+  (s.cases || []).forEach((c) => { byName[c.case_name] = c; });
 
   const rows = items.map((c) => {
-    const run = byId[c.case_id] || {};
+    const stem = c.name.replace(/\.yaml$/, '');
+    const run = byName[stem] || {};
+    const n = run.n || run.runs || 0;
     return `<tr class="clickable" data-casefile="${esc(c.name)}">
       <td class="mono">${esc(c.case_id || '—')}</td>
       <td>${esc(c.title)}</td>
+      <td>${c.has_raw
+        ? '<span class="raw-yes">✓ 原始 case</span>'
+        : '<span class="raw-no">未录原文</span>'}</td>
       <td>${c.valid ? '' : '<span class="badge UNKNOWN">校验用</span>'}</td>
-      <td>${run.n ? `<span class="badge ${esc(run.last_status || 'UNKNOWN')}">${esc(run.last_status || '—')}</span>` : '<span class="muted">未跑过</span>'}</td>
-      <td>${run.n || 0} 次</td>
+      <td>${n ? `<span class="badge ${esc(run.last_status || 'UNKNOWN')}">${esc(run.last_status || '—')}</span>` : '<span class="muted">未跑过</span>'}</td>
+      <td>${n} 次</td>
       <td class="mono" style="font-size:12px">${(c.size / 1024).toFixed(1)} KB</td>
       <td style="color:var(--dim);font-size:12.5px">${esc(c.mtime)}</td>
+      <td style="white-space:nowrap">
+        <button class="danger sm" data-del="${esc(c.name)}"
+          title="删除这个用例文件和它的原始 case">删除</button>
+      </td>
     </tr>`;
   }).join('');
 
   main.innerHTML = `<h1>用例库</h1>
     <div class="sub">共 ${items.length} 个用例文件 · <span class="mono">${esc(dir)}</span></div>
-    <table><thead><tr><th>编号</th><th>用例</th><th></th><th>最近结论</th>
-      <th>跑过</th><th>大小</th><th>修改时间</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="7" class="empty">cases 目录里没有 YAML</td></tr>'}</tbody></table>`;
+    <table><thead><tr><th>编号</th><th>用例</th><th>原始 case</th><th></th><th>最近结论</th>
+      <th>跑过</th><th>大小</th><th>修改时间</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="9" class="empty">cases 目录里没有 YAML</td></tr>'}</tbody></table>`;
+
+  // 点一行 -> 打开用例详情（原始 case + YAML）
+  main.querySelectorAll('tr[data-casefile]').forEach((tr) => {
+    tr.addEventListener('click', () => go('casefile', { name: tr.dataset.casefile }));
+  });
+  // 删除按钮：stopPropagation，否则点删除会同时触发"打开行"
+  main.querySelectorAll('button[data-del]').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      confirmDeleteCase(b.dataset.del);
+    });
+  });
 }
 
-/* 单个用例文件：YAML 原文，只读
+/* 删除用例：只删 YAML 和原始 case，**历史记录保留**
  *
- * ★ 为什么只读：用例 YAML 是"判据的唯一真相"，跑出来的结论都拿它对照。
- *   在网页上随手改一改，旧记录就会变成"新判据配旧结论"，等于自欺。 */
+ * 为什么不连坐删历史：
+ *   历史记录里存了 case_yaml 快照，是"当时那份判据"的唯一副本。
+ *   用例文件删了，快照还在 —— 那条记录仍然可复核。
+ *   连坐删掉等于把证据一起销毁了。
+ *   （旧 skill 是连坐的，这条刻意不学。）
+ */
+function confirmDeleteCase(fname) {
+  const stem = fname.replace(/\.yaml$/, '');
+  const m = modal('删除用例', `
+    <div class="warn-text">确定删除用例 <b>${esc(stem)}</b> 吗？</div>
+    <div class="meta">将删除：<br>
+      · 用例文件 <span class="mono">${esc(fname)}</span><br>
+      · 该用例已录入的<b>原始 case 原文</b><br>
+      <br>
+      <b>历史测试记录会保留</b> —— 记录里存着跑的时候那份 YAML 快照，
+      删了用例仍然能复核当时的判据。需要清理记录请到「测试记录」里逐条删。<br>
+      <b class="danger-text">文件不可恢复。</b></div>`,
+    `<button class="ghost" data-cancel>取消</button>
+     <button class="danger solid" data-ok>确认删除</button>`);
+  m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
+  m.el.querySelector('[data-ok]').addEventListener('click', async () => {
+    const btn = m.el.querySelector('[data-ok]');
+    btn.disabled = true;
+    btn.textContent = '删除中…';
+    try {
+      const r = await api('/api/case/' + encodeURIComponent(fname),
+                          { method: 'DELETE' });
+      m.close();
+      await viewCases();
+      toast(`已删除 ${fname}` +
+            (r.raw_deleted ? '，含原始 case' : '') +
+            (r.runs_kept ? `；保留了 ${r.runs_kept} 条历史记录` : ''));
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '确认删除';
+      toast('删除失败：' + e.message);
+    }
+  });
+}
+
+/* 单个用例：原始 case（用户写的步骤/预期）+ YAML 判据，两块都显示
+ *
+ * ★ 为什么两块都要
+ *   YAML 是**执行判据**（landing / pitfalls / check），是改写过的结构；
+ *   原始 case 是**需求原话**（"打开日历 → 点更多 → 选课程表"）。
+ *   看结论时人想对着自己的原话看，改判据时人要看 YAML ——
+ *   只给其中一份,总有一边要脑补。
+ *
+ * ★ YAML 只读
+ *   用例 YAML 是"判据的唯一真相"，跑出来的结论都拿它对照。
+ *   在网页上随手改一改，旧记录就会变成"新判据配旧结论"，等于自欺。
+ *   原始 case 可以改 —— 它是需求记录，不是判据。
+ */
 async function viewCaseFile(name) {
-  const c = await api('/api/case/' + encodeURIComponent(name));
+  const [c, raw] = await Promise.all([
+    api('/api/case/' + encodeURIComponent(name)),
+    api('/api/rawcase/' + encodeURIComponent(name)).catch(() => ({ found: false })),
+  ]);
   const lines = c.content.split('\n');
   const body = lines.map((ln, i) => {
     const n = String(i + 1).padStart(4, ' ');
@@ -299,13 +438,68 @@ async function viewCaseFile(name) {
     return `<span class="ln"><i>${n}</i>${html}</span>`;
   }).join('\n');
 
+  const rawBlock = raw && raw.found
+    ? `<div class="codebox"><pre style="white-space:pre-wrap">${esc(raw.raw_text)}</pre></div>
+       <div class="sub" style="margin:6px 0 0">录入于 ${esc(raw.updated_at || '—')}</div>`
+    : `<div class="hint warn">这条用例还没录原始 case。
+         原始 case 是<b>你当初写的测试步骤和预期结果</b>，它和 YAML 里的判据
+         不是一回事 —— 前端要对着你的原话看结论，就必须把它录进来。</div>`;
+
   main.innerHTML = `<h1>${esc(c.name)}</h1>
-    <div class="sub"><span class="mono">${esc(c.path)}</span> ·
-      ${(c.size / 1024).toFixed(1)} KB · 只读（改判据请直接编辑文件后重跑）</div>
-    <div class="codebox"><pre>${body}</pre></div>`;
-  main.querySelectorAll('[data-casefile]').forEach((el) => {
-    el.addEventListener('click', () => go('casefile', { name: el.dataset.casefile }));
+    <div class="sub"><span class="mono">${esc(c.path)}</span> · ${(c.size / 1024).toFixed(1)} KB</div>
+
+    <div class="kb-bar" style="margin:18px 0 10px">
+      <b>原始 case（你写的测试步骤 / 预期结果）</b>
+      <span style="flex:1"></span>
+      <button class="ghost sm" id="raw-edit">${raw && raw.found ? '修改' : '录入'}</button>
+      ${raw && raw.found ? '<button class="danger sm" id="raw-del">删除原文</button>' : ''}
+    </div>
+    <div id="raw-box">${rawBlock}</div>
+
+    <div class="kb-bar" style="margin:22px 0 10px">
+      <b>用例 YAML（执行判据，只读）</b>
+      <span style="flex:1"></span>
+      <button class="danger sm" id="case-del">删除这个用例</button>
+    </div>
+    <div class="codebox"><pre>${body}</pre></div>
+    <div class="sub" style="margin-top:6px">改判据请直接编辑文件后重跑 —— 网页改会让旧记录变成「新判据配旧结论」。</div>`;
+
+  main.querySelector('#raw-edit').addEventListener('click', async () => {
+    const v = await promptText(raw && raw.found ? '修改原始 case' : '录入原始 case',
+      '把用户当初写的测试步骤和预期结果原样贴进来。不要改写成执行判据 —— YAML 那边才是判据。',
+      raw && raw.found ? raw.raw_text : '');
+    if (v == null) return;
+    if (!v.trim()) { toast('内容不能为空'); return; }
+    try {
+      await api('/api/rawcase/' + encodeURIComponent(name),
+                { method: 'POST', body: { raw_text: v } });
+      toast('已保存');
+      await viewCaseFile(name);
+    } catch (e) { toast('保存失败：' + e.message); }
   });
+
+  const rd = main.querySelector('#raw-del');
+  if (rd) {
+    rd.addEventListener('click', async () => {
+      const m = modal('删除原始 case',
+        `<div class="warn-text">只删「原始 case 原文」，<b>YAML 文件不动</b>。</div>
+         <div class="meta">不可恢复。之后可以重新录入。</div>`,
+        `<button class="ghost" data-cancel>取消</button>
+         <button class="danger solid" data-ok>确认删除</button>`);
+      m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
+      m.el.querySelector('[data-ok]').addEventListener('click', async () => {
+        try {
+          await api('/api/rawcase/' + encodeURIComponent(name), { method: 'DELETE' });
+          m.close();
+          toast('已删除原始 case 原文');
+          await viewCaseFile(name);
+        } catch (e) { m.close(); toast('删除失败：' + e.message); }
+      });
+    });
+  }
+
+  main.querySelector('#case-del').addEventListener('click',
+    () => confirmDeleteCase(name));
 }
 
 /* ---------- 视图：视觉模型 ----------
@@ -475,13 +669,69 @@ async function viewRuns(caseName) {
       <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
       <td>${fmtDur(r.elapsed_s)}</td>
       <td>${esc(r.started_at || '')}</td>
-      <td style="color:var(--dim);font-size:12.5px">${esc((r.summary || '').slice(0, 60))}</td>
+      <td style="color:var(--dim);font-size:12.5px">${esc((r.summary || '').slice(0, 50))}</td>
+      <td style="white-space:nowrap">
+        <button class="danger sm" data-delrun="${r.run_id}"
+          title="删除这条记录和它的日志/截图/xml">删除</button>
+      </td>
     </tr>`).join('');
   main.innerHTML = `<h1>${title}</h1>
     <div class="sub">${runs.length} 次运行</div>
     <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>步数</th>
-      <th>自动化率</th><th>耗时</th><th>开始时间</th><th>摘要</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="8" class="empty">还没有运行</td></tr>'}</tbody></table>`;
+      <th>自动化率</th><th>耗时</th><th>开始时间</th><th>摘要</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="9" class="empty">还没有运行</td></tr>'}</tbody></table>`;
+
+  main.querySelectorAll('tr[data-run]').forEach((tr) => {
+    tr.addEventListener('click', () => go('run', { id: tr.dataset.run }));
+  });
+  main.querySelectorAll('button[data-delrun]').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      confirmDeleteRun(Number(b.dataset.delrun), () => viewRuns(caseName));
+    });
+  });
+}
+
+/* 删除一次运行：库里的记录 + 磁盘上的日志/截图/xml
+ *
+ * ★ 为什么给"同时删证据文件"一个勾选框，而且默认勾上
+ *   不删文件的话，删了记录截图还躺在 tmp/shots 里，没人知道它们属于谁 ——
+ *   越积越多且永远清不掉。但有些时候人只想清列表、留着图（比如要拿去做
+ *   缺陷单），所以给个开关，不搞"一律删"。
+ */
+function confirmDeleteRun(runId, after) {
+  const m = modal('删除测试记录', `
+    <div class="warn-text">确定删除记录 <b>#${esc(runId)}</b> 吗？</div>
+    <div class="meta">将同时删除这条记录的动作账本、断言结论，
+      以及<b>磁盘上的日志 / 截图 / dump.xml</b>。<b class="danger-text">不可恢复。</b><br>
+      用例文件和其它记录不受影响。</div>
+    <label class="chk">
+      <input type="checkbox" id="del-ev" checked> 同时删除日志 / 截图 / xml 文件
+    </label>`,
+    `<button class="ghost" data-cancel>取消</button>
+     <button class="danger solid" data-ok>确认删除</button>`);
+  m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
+  m.el.querySelector('[data-ok]').addEventListener('click', async () => {
+    const withEv = m.el.querySelector('#del-ev').checked;
+    const btn = m.el.querySelector('[data-ok]');
+    btn.disabled = true;
+    btn.textContent = '删除中…';
+    try {
+      const r = await api(`/api/run/${runId}?evidence=${withEv ? 1 : 0}`,
+                          { method: 'DELETE' });
+      m.close();
+      let msg = `已删除记录 #${runId}`;
+      if (withEv) msg += `，清理 ${r.deleted_files || 0} 个证据文件`;
+      if ((r.skipped || []).length) msg += `（${r.skipped.length} 个跳过）`;
+      toast(msg);
+      if (after) await after();
+      else await viewRuns('');
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '确认删除';
+      toast('删除失败：' + e.message);
+    }
+  });
 }
 
 /* ---------- 视图：单次详情 ---------- */
@@ -573,7 +823,11 @@ async function viewRun(runId) {
     </div>`;
   }).join('');
 
-  main.innerHTML = `<h1>运行 #${run.run_id} · 用例 <span class="mono">${esc(run.case_name)}</span></h1>
+  main.innerHTML = `<div class="kb-bar">
+      <h1 style="margin:0">运行 #${run.run_id} · 用例 <span class="mono">${esc(run.case_name)}</span></h1>
+      <span style="flex:1"></span>
+      <button class="danger sm" id="run-del">删除这条记录</button>
+    </div>
     <div class="sub">${esc(run.started_at || '')} · 耗时 ${fmtDur(run.elapsed_s)}${fmtSplit(run)} ·
       引擎 ${esc(run.engine || '—')}</div>
     <div class="cards">
@@ -611,6 +865,11 @@ async function viewRun(runId) {
       $('#lightbox').classList.remove('hidden');
     });
   });
+
+  // 删掉这条记录。删完回列表 —— 停在已删条目的详情页上没意义，
+  // 而且下一次刷新会 404，看起来像"页面坏了"。
+  main.querySelector('#run-del').addEventListener('click',
+    () => confirmDeleteRun(Number(run.run_id), () => viewRuns(run.case_name || '')));
 }
 
 /* ---------- 路由 ---------- */
@@ -660,6 +919,10 @@ document.addEventListener('click', (e) => {
   if (cnav && !cnav.dataset.run) {
     return go('runs', { case: cnav.dataset.case });
   }
+  // ⚠️ 表格行上的按钮（删除）不能把点击冒泡成"打开这一行"。
+  //    tr 里有 data-run，全局委托会把它当成"点了这一行" ——
+  //    于是点删除的同时把详情也打开了，弹窗被盖在下面。
+  if (e.target.closest('button')) return;
   const row = e.target.closest('tr[data-run]');
   if (row) return go('run', { runId: row.dataset.run });
   // 用例详情里的代码框：点一下展开/收起（YAML 动辄 200 行）

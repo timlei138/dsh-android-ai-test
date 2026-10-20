@@ -157,7 +157,93 @@ def _find_case_file(name: str) -> Path | None:
     return cand
 
 
+def _case_key(name: str) -> str:
+    """文件名 -> raw_cases 表里的 case_name（去掉 .yaml）。
+
+    和 runs.case_name 保持一致 —— 那里存的就是 YAML 文件名去掉扩展名，
+    两边不一致的话"这条用例的原始需求"就查不出来了。
+    """
+    return Path(name).stem
+
+
+def _safe_under(path: Path, roots: list[Path]) -> bool:
+    """path 解析后是否真的落在 roots 之一的**内部**。
+
+    ⚠️ 只判 startswith 是不够的：`/a/bc` 也 startswith `/a/b`。
+       要么比到分隔符，要么用 relative_to。这里用后者 —— 它天然认边界。
+    """
+    try:
+        rp = path.resolve()
+    except OSError:
+        return False
+    for r in roots:
+        try:
+            rp.relative_to(r.resolve())
+            return rp != r.resolve()   # 根目录本身不能删
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+def _purge_evidence(paths: list[str]) -> dict:
+    """删掉一次运行留下的所有证据文件，返回统计。
+
+    ## 为什么删之前要这么小心
+
+    路径来自数据库。库是可信来源，但这个服务会被手动改库调试（改坏过），
+    所以**不假设库里一定是干净的**。规则：
+
+      1. 只删**证据根目录内部**的文件（tmp/shots、tmp/evidence、
+         storage/evidence），以及这几类明确的产物（log/llm/ledger/report）。
+      2. 删完如果 stepNN 目录空了，顺手 rmdir —— 不删整个 shots 根。
+      3. 有任何一个文件不满足规则就**跳过它**并记下来，不报错中断 ——
+         删不掉一个文件，不该让整次删除失败。
+
+    ## 为什么不直接 `rmtree(evidence_dir)`
+
+    因为一次运行的截图是**按 stepNN 分目录**共存于同一个 evidence_dir 下的。
+    176 和 177 的图都在 tmp/shots/ 里。rmtree 一下就把别人的记录也删了。
+    """
+    roots = [p.resolve() for p in _evidence_roots()]
+    # 产物文件（log/llm/ledger/report）不在证据根里，单独放行 —— 但只放行
+    # 我们自己的 tmp/ 下的这些后缀，别的一律不碰。
+    tmp_root = (_HERE / "tmp").resolve()
+    ok_suffix = {".png", ".xml", ".log", ".md", ".jsonl", ".json", ".txt"}
+
+    done, skipped = [], []
+    parents: set[Path] = set()
+    for raw in paths:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            p = _HERE / p
+        allowed = _safe_under(p, roots) or (
+            _safe_under(p, [tmp_root]) and p.suffix.lower() in ok_suffix)
+        if not allowed:
+            skipped.append(f"{raw}（不在证据目录内）")
+            continue
+        try:
+            if p.is_file():
+                p.unlink()
+                done.append(raw)
+                parents.add(p.parent)
+        except OSError as e:
+            skipped.append(f"{raw}（{e.strerror or e}）")
+
+    # 空的 stepNN 目录顺手清掉；只清空目录，非空/根目录不动
+    for d in sorted(parents):
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+    return {"files": len(done), "skipped": skipped}
+
+
 def _test_vision() -> dict:
+
     """拿 storage/vision.json 发一次**真实**请求，看视觉通道通不通。
 
     为什么不做成"检查字段填了没"：填了不等于能用 —— key 错了、
@@ -332,8 +418,12 @@ class Handler(BaseHTTPRequestHandler):
         # 我们比旧 skill 多一层 —— 运行记录会带 case_yaml 快照，
         # 所以详情页能显示"跑的时候那份"，而不只是"现在这份"。
         if path == "/api/cases":
-            return self._json({"items": _case_files(),
-                               "dir": str(_cases_dir())})
+            items = _case_files()
+            # 标上"有没有录原始用例"，列表里才好一眼看出来 / 提供录入入口。
+            # 逐条查库：条数是个位数，不值得为它搞批量接口。
+            for it in items:
+                it["has_raw"] = st.get_raw_case(_case_key(it["name"])) is not None
+            return self._json({"items": items, "dir": str(_cases_dir())})
 
         if path.startswith("/api/case/"):
             name = path[len("/api/case/"):]
@@ -347,6 +437,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"name": fp.name, "path": str(fp),
                                "content": content,
                                "size": fp.stat().st_size})
+
+        # 原始用例（用户写的「测试步骤 + 预期结果」原文）
+        #
+        # ⚠️ 和 /api/case/<name> 是**两样东西**，别混：
+        #   /api/case/         YAML 原文（判据、landing、pitfalls —— 改写过的执行结构）
+        #   /api/rawcase/      用户当初写的需求原话（"打开日历，点更多→课程表"）
+        # 前端两个都显示，因为用户要对着自己的原话看跑得对不对。
+        if path.startswith("/api/rawcase/"):
+            key = _case_key(path[len("/api/rawcase/"):])
+            rec = st.get_raw_case(key)
+            if not rec:
+                # 200 + found:false，不是 404 —— "这条用例没录原文"是正常状态，
+                # 前端要据此显示"还没录"，而不是弹个错误。
+                return self._json({"case_name": key, "found": False,
+                                   "raw_text": "", "updated_at": ""})
+            return self._json({"case_name": key, "found": True, **rec})
 
         # --- 视觉模型配置 ---
         if path == "/api/vision":
@@ -500,6 +606,108 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/vision/test":
             return self._json(_test_vision())
+
+        # 保存原始用例（用户写的需求原话）
+        #
+        # 为什么要留这个写入口：这条东西**只能人来录**（它是"用户当初
+        # 说了什么"，任何自动推导都只是猜）。不录的话前端就只能显示
+        # YAML 里改写过的 desc，那正是这次要避免的。
+        if path.startswith("/api/rawcase/"):
+            key = _case_key(path[len("/api/rawcase/"):])
+            if not key:
+                return self._err("要带上用例名")
+            data = self._body()
+            if data is None:
+                return self._err("请求体不是合法 JSON")
+            text = str(data.get("raw_text") or "")
+            if not text.strip():
+                return self._err("原始用例不能为空")
+            try:
+                created = st.save_raw_case(key, text)
+            except Exception as e:  # noqa: BLE001
+                return self._err(f"存不进去：{e}", 500)
+            rec = st.get_raw_case(key) or {}
+            return self._json({"ok": True, "case_name": key,
+                               "created": created,
+                               "updated_at": rec.get("updated_at") or ""})
+
+        return self._err("没有这个接口", 404)
+
+    # -- DELETE -------------------------------------------------------------
+    def do_DELETE(self):  # noqa: N802
+        """删记录 / 删用例 / 删原始用例。
+
+        ## 两件事分开删，是刻意的
+
+          DELETE /api/run/<id>?evidence=1   只删"这一次运行"
+          DELETE /api/case/<name>?raw=1     只删"用例文件（和它的原始需求）"
+
+        **删用例不连坐历史记录**。旧 skill 是连坐的（删用例顺手把该用例
+        全部记录带走），这里不学那条 —— 历史记录里存了 case_yaml 快照，
+        是"当时那份判据"的唯一副本；用例文件删了，快照还在，
+        那条记录就仍然可复核。连坐删掉等于把证据一起销毁了。
+
+        真要清历史，逐条删记录即可（那是显式的、看得见删了几条）。
+        """
+        u = urllib.parse.urlparse(self.path)
+        path = urllib.parse.unquote(u.path)
+        qs = urllib.parse.parse_qs(u.query)
+
+        # --- 删一次运行 ---
+        if path.startswith("/api/run/"):
+            tail = path[len("/api/run/"):]
+            if not tail.isdigit():
+                return self._err("run_id 要是数字")
+            rid = int(tail)
+            if not st.get_run(rid):
+                return self._err("没有这次运行", 404)
+
+            # evidence 默认 1（跟着记录一起清）。传 0 表示只删库里的行。
+            with_ev = str(qs.get("evidence", ["1"])[0]) not in ("0", "false")
+            res = st.delete_run(rid)
+            if not res.get("deleted"):
+                return self._err("删除失败：记录不在了", 404)
+            ev = _purge_evidence(res.get("paths") or []) if with_ev else {
+                "files": 0, "skipped": []}
+            return self._json({"ok": True, "run_id": rid,
+                               "case_name": res.get("case_name") or "",
+                               "evidence": ev,
+                               "deleted_files": ev["files"],
+                               "skipped": ev["skipped"]})
+
+        # --- 删一条原始用例（单独删，保留 YAML）---
+        if path.startswith("/api/rawcase/"):
+            key = _case_key(path[len("/api/rawcase/"):])
+            n = st.delete_raw_case(key)
+            return self._json({"ok": True, "deleted": n, "case_name": key})
+
+        # --- 删用例（YAML 文件 + 原始需求）---
+        if path.startswith("/api/case/"):
+            name = path[len("/api/case/"):]
+            fp = _find_case_file(name)
+            if not fp:
+                return self._err(f"没有这个用例文件：{name}", 404)
+            # 校验文件名没被编码绕过（_find_case_file 已经限定在 cases 目录内，
+            # 这里再确认一次它不是个目录、也不是软链出去的）
+            if not fp.is_file():
+                return self._err("不是文件", 400)
+            try:
+                fp.unlink()
+            except OSError as e:
+                return self._err(f"删不掉：{e.strerror or e}", 500)
+
+            key = _case_key(name)
+            raw_n = 0
+            if str(qs.get("raw", ["1"])[0]) not in ("0", "false"):
+                raw_n = st.delete_raw_case(key)
+
+            # 历史记录保留（见上面 docstring）。但要告诉前端还有几条，
+            # 免得用户以为删干净了。
+            left = len(st.list_runs(case_name=key, limit=1000))
+            return self._json({"ok": True, "case_name": key,
+                               "deleted_file": fp.name,
+                               "raw_deleted": raw_n,
+                               "runs_kept": left})
 
         return self._err("没有这个接口", 404)
 
