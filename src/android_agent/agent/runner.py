@@ -269,7 +269,7 @@ def make_model_answer(*, skill_root: str = DEFAULT_SKILL,
     from . import decide as dc
 
     root = str(skill_root)
-    # 解释器不在资产目录下（见 assets_path），交给统一解析
+    # 解释器不在资产目录下（资产在 assets/，.venv 在仓库根），交给统一解析
     py = python or runner_python()
     emit = log or (lambda m: print(f"[model] {m}") if verbose else None)
 

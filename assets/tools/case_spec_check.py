@@ -504,8 +504,8 @@ def self_consistency() -> tuple[list[str], bool]:
     """
     problems: list[str] = []
     ran = True          # 至少有一道探针真的执行过，才置 True
-    # 路径：`child_agent` / `case_yaml` / `assets_path` 都在项目根，
-    # 而本脚本在 assets/tools/ 下 —— 两处都要进 sys.path。
+    # 路径：真实模块在 src/android_agent/ 下，而本脚本在 assets/tools/ ——
+    # 两处都要进 sys.path。
     _tools = Path(__file__).resolve().parent
     _assets = _tools.parent
     _root = _assets.parent

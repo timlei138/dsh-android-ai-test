@@ -85,17 +85,15 @@ try {
   check("validateArgs 不可用，退化为 required 检查", ok, e.message);
 }
 
-console.log("\n=== 3. RUNNER_PY 必须指向**编排** venv（不是 assets/.venv）===");
-// ⚠️ 这条最容易搞反，所以专门钉住：
-//   run_case_json.py --import--> subagent --> child_agent --> langgraph
-//   langgraph 只在 langgraph-poc/.venv 里；assets/.venv 里是 adbutils（设备操作）。
-//   把这里改成 assets/.venv 会 ImportError: No module named 'langgraph'。
-//   实测两个 venv 的依赖清单确认过 —— 我自己就先改错了一次。
+console.log("\n=== 3. RUNNER_PY 必须指向仓库根那个唯一的 .venv ===");
+// 工作区只有一个 venv（langgraph-poc/.venv），编排和设备依赖都在里面。
+// 这里钉住它别再被写成别的路径：run_case_json.py --import--> subagent
+// --> child_agent --> langgraph，指向一个不存在的解释器会 import 失败。
 const src = (await import("node:fs")).readFileSync(
   "D:/dsh/langgraph-poc/runner-tool/lib/index.js", "utf8");
 const at = src.indexOf("const RUNNER_PY");
 const runnerPyBlock = src.slice(at, at + 400);
-check("RUNNER_PY 指向 RUNNER_DIR/.venv（编排 venv，有 langgraph）",
+check("RUNNER_PY 指向 RUNNER_DIR/.venv（唯一的运行环境）",
   /join\(RUNNER_DIR,\s*"\.venv"/.test(runnerPyBlock),
   "run_case_json.py 需要 langgraph，它只在编排 venv 里");
 check("RUNNER_PY 没被改成 assets/.venv",

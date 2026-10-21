@@ -170,6 +170,22 @@ print()
 print("=" * 70)
 print("6) runner 技能卡的关键规则都在")
 print("=" * 70)
+
+
+# 技能卡是 SKILL.md + references/ 两层结构，判据要看**整份技能卡** ——
+# 只看 SKILL.md 会把"内容已经下沉到 references"误判成"内容丢了"。
+def _skill_corpus(skill_name: str) -> str:
+    base = SKILLS / skill_name
+    if not base.is_dir():
+        return ""
+    return "\n".join(
+        p.read_text(encoding="utf-8-sig")
+        for p in sorted(base.rglob("*.md"))
+    )
+
+
+_corpus = _skill_corpus("android-case-runner") + _skill_corpus("android-case-planner")
+
 ck("说明自己是给执行子 Agent 的", "执行子 Agent" in runner)
 ck("★ 强调唯一性门槛（0 或多个都不点）",
    "唯一命中" in runner and ("0 个" in runner or "2 个" in runner))
@@ -178,12 +194,30 @@ ck("★ 强调「没有判据 ≠ 已完成」",
 ck("★ 说明强证据直点是按屏判断（不是一次放弃）",
    "按屏判断" in runner)
 ck("★ 说明权限只记账不进 YAML",
-   "不写进 YAML" in runner or "不进 YAML" in runner)
+   "不写进 YAML" in runner or "不进 YAML" in runner
+   or "不写进 YAML" in _corpus or "不进 YAML" in _corpus)
 ck("★ 说明只有代码直点才回写 YAML",
    "只有代码直点" in runner)
 ck("说明落点必须是稳定终态", "稳定终态" in runner)
 ck("说明 activity 短名子串匹配的坑", "子串" in runner)
-ck("说明两个 venv 不能互换", "不能合并" in runner or "不能互换" in runner)
+
+# ── 运行环境口径（整份技能卡都要一致）──
+# ⚠️ 这条以前断言"技能卡里写着两个 venv 不能互换"—— 那是**过时事实**。
+#   两个 venv 早已合并成一个（rapidocr 支持 3.13 后），assets/.venv 已删。
+#   旧断言把错误结论钉死成"正确"，技能卡照着它写等于持续教错。
+#   现在反过来守：**整份技能卡里不许再出现分家的说法**。
+_venv_words = ("两个 venv", "不能合并", "不能互换")
+_hits = [ln.strip()[:70] for ln in _corpus.splitlines()
+         if any(w in ln for w in _venv_words)]
+ck("技能卡不再教「两个 venv」（已合并成一个）", not hits,
+   f"违规 {_hits}" if _hits else "")
+# 正面：必须说明只有一个运行环境，否则"缺依赖"会被归错因
+ck("技能卡说明只有一个运行环境", "只有一个 venv" in _corpus)
+
+# 老模块名 assets_path 早已改名为 android_agent.cases.paths —— 不许再教
+_ap = [ln.strip()[:70] for ln in _corpus.splitlines()
+       if "assets_path" in ln and "不存在" not in ln]
+ck("技能卡不再提老模块名 assets_path", not _ap, f"违规 {_ap}" if _ap else "")
 
 print()
 print("=" * 70)
@@ -192,18 +226,30 @@ print("=" * 70)
 import filecmp
 
 SNAP = ROOT / "config"
-PAIRS = [
-    (Path.home() / ".dsh" / ".agent-presets" / "android-runner" / "agent.cordis.yml",
-     SNAP / "preset" / "agent.cordis.yml"),
-    (Path.home() / ".agents" / "skills" / "android-case-runner" / "SKILL.md",
-     SNAP / "skills" / "android-case-runner.SKILL.md"),
-    (Path.home() / ".agents" / "skills" / "android-case-planner" / "SKILL.md",
-     SNAP / "skills" / "android-case-planner.SKILL.md"),
-]
-for live, snap in PAIRS:
-    ck(f"{snap.name} 快照与真实一致",
+
+# ★ 直接复用 sync_config 的清单，不在这里另抄一份。
+#   以前两边各写一份 PAIRS，内容下沉到 references/ 之后两边一起漏了 ——
+#   清单只有一处才不会漂移。
+sys.path.insert(0, str(ROOT))
+from sync_config import _pairs  # noqa: E402
+
+_pa = _pairs()
+ck("快照清单非空", bool(_pa), f"{len(_pa)} 个文件")
+for live, snap in _pa:
+    try:
+        rel = snap.relative_to(ROOT)
+    except ValueError:
+        rel = snap
+    ck(f"{rel} 快照与真实一致",
        snap.exists() and filecmp.cmp(live, snap, shallow=False),
        "" if snap.exists() else "快照缺失，跑 python sync_config.py")
+
+# 反向：快照里不该有原文件已经删掉的东西（会变成骗人的"配置"）
+_snap_known = {s for _, s in _pa}
+_orphans = [p.relative_to(ROOT) for p in (SNAP / "skills").rglob("*.md")
+            if p not in _snap_known]
+ck("没有孤儿快照（原文件已删但快照还在）", not _orphans,
+   f"违规 {_orphans}" if _orphans else "")
 
 print()
 print("=" * 70)

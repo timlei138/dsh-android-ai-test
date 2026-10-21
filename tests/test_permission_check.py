@@ -153,8 +153,23 @@ print("=" * 78)
 print("7) App 自己的弹窗 = 流程的一部分（技能卡要这么说）")
 print("=" * 78)
 base = Path.home() / ".agents" / "skills"
-runner = io.open(base / "android-case-runner" / "SKILL.md", encoding="utf-8").read()
-planner = io.open(base / "android-case-planner" / "SKILL.md", encoding="utf-8").read()
+
+
+def _skill_all(name: str) -> str:
+    """整个技能卡目录（SKILL.md + references/*.md）。
+
+    技能卡已拆成两层：SKILL.md 只留主干，细节下沉到 references/。
+    只读 SKILL.md 会把"内容已经下沉"误判成"内容丢了"。
+    """
+    d = base / name
+    if not d.is_dir():
+        return ""
+    return "\n".join(io.open(p, encoding="utf-8-sig").read()
+                     for p in sorted(d.rglob("*.md")))
+
+
+runner = _skill_all("android-case-runner")
+planner = _skill_all("android-case-planner")
 
 ck("runner 说 App 弹窗是流程的一部分",
    "流程的一部分" in runner)

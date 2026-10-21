@@ -31,19 +31,14 @@ const RUNNER_DIR =
 /**
  * 跑 run_case_json.py 的解释器。
  *
- * ⚠️ 这里**必须是 `langgraph-poc/.venv`（编排 venv）**，不是 assets/.venv。
- *    工作区里有两个 venv，依赖完全不同、不能互换：
- *      · langgraph-poc/.venv        → langgraph / langchain / pyyaml  ← 本文件要用的
- *      · langgraph-poc/assets/.venv → adbutils / opencv / rapidocr（设备操作）
+ * 工作区**只有一个** venv：`langgraph-poc/.venv`。
+ * 编排依赖（langgraph / langchain / pyyaml）和设备依赖（adbutils / opencv /
+ * rapidocr）都装在里面 —— 以前分过两个，rapidocr 支持 3.13 之后合并了，
+ * `assets/.venv` 已被删除（`test_assets_selfcontained.py` 守着它不再回来）。
  *
- *    为什么是编排 venv：`run_case_json.py` 会 import `subagent`，
- *    而 subagent → child_agent → **langgraph**。langgraph 只在编排 venv 里。
- *    设备依赖（adbutils）不在这里用 —— 它由 Python 侧
- *    `assets_path.runner_python()` 独立解析，喂给 `tools/run.py`（真正碰设备的那个）。
- *
- *    ⚠️ 别"顺手"把它改成 assets/.venv：那会让 run_case_json.py 直接
- *    ImportError: No module named 'langgraph'（实测确认过两个 venv 的依赖清单）。
- *    "看见 adbutils 在 assets/.venv 就以为设备操作要用它" 是这里最容易犯的错。
+ * 所以"该用哪个 venv"这个问题不存在，唯一的答案就是这一个。
+ * 设备侧不需要另找解释器：Python 侧 `paths.runner_python()` 解析出来的
+ * 是同一个环境，喂给 `tools/run.py`（真正碰设备的那个）。
  */
 const RUNNER_PY =
   process.env.ANDROID_CASE_PYTHON ||
@@ -52,7 +47,7 @@ const RUNNER_PY =
 /**
  * 设备技能包（知识卡/工具层的来源）。
  *
- * ⚠️ 留空时**交给 Python 侧解析**（assets_path.skill_root()），
+ * ⚠️ 留空时**交给 Python 侧解析**（`android_agent.cases.paths.skill_root()`），
  *    因为资产已经迁到工作区的 assets/ 下，再由 Node 写死老路径
  *    就会"Node 读旧的、Python 读新的" —— 两边不一致且**不会报错**。
  *    只有显式设了 ANDROID_SKILL_ROOT 才在这里覆盖。

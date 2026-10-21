@@ -338,8 +338,8 @@ class RealDevice:
                 f"storage/vision.json）。{hint}")
         self.serial = serial
         self.timeout = timeout
-        # 解释器**不在**资产目录下（资产在 assets/，.venv 在工作区根），
-        # 所以交给 assets_path 统一解析 —— 自己拼 skill_root/.venv 会找不到。
+        # 解释器**不在**资产目录下（资产在 assets/，.venv 在仓库根），
+        # 所以交给 paths.runner_python() 统一解析 —— 自己拼 skill_root/.venv 会找不到。
         if python:
             self.python = python
         else:

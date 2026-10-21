@@ -460,25 +460,27 @@ landing: album=any
 > 子 Agent 以为自己是主 Agent 想再往下派（报 "subagent run failed"，连诊断都没有）、
 > 两个子 Agent 同时点同一台设备（产出一份看起来正常的错误报告，比直接报错危险得多）。
 
-### 仓库外的两个文件，同样决定子 Agent 行为
+### 仓库外的配置，同样决定子 Agent 行为
 
 ```
 ~/.dsh/.agent-presets/android-runner/agent.cordis.yml   工具面 + persona
-~/.agents/skills/android-case-runner/SKILL.md           子 Agent 读的技能卡
-~/.agents/skills/android-case-planner/SKILL.md          主 Agent 读的技能卡
+~/.agents/skills/android-case-runner/SKILL.md           子 Agent 读的技能卡（+ references/*.md）
+~/.agents/skills/android-case-planner/SKILL.md          主 Agent 读的技能卡（+ references/*.md）
 ```
 
 它们不在 git 里，但**决定子 Agent 被教成什么样** ——
 子 Agent 读技能卡、跑代码，两边说法不一致，它就会照着错的写。
-所以 `config/` 下存了它们的**镜像快照**（可 diff、可回退）：
+所以 `config/` 下存了它们的**镜像快照**（可 diff、可回退）。
+`references/` 下的细分文档也一起镜像 —— 它们同样在教模型做事：
 
 ```powershell
-python sync_config.py            # 改完原文件，同步进快照
+python sync_config.py            # 改完原文件，同步进快照（顺带清掉孤儿快照）
 python sync_config.py --check    # 只比对
 ```
 
-`test_skill_card_consistency.py`（24 项）盯着两件事：
-**技能卡不许教代码里不存在的东西**、**快照不许和真实文件不一致**。
+`test_skill_card_consistency.py` 盯着三件事：
+**技能卡不许教代码里不存在的东西**、**快照不许和真实文件不一致**、
+**不许留下已经过期的说法**（如已合并的 venv、已改名的模块）。
 
 ---
 
@@ -521,7 +523,7 @@ for f in tests/test_*.py; do .venv/Scripts/python.exe "$f"; done
 cd tests && for f in test_*.mjs; do node "$f"; done
 ```
 
-当前 **51 个 Python 测试 + 7 个 JS 测试全部通过**。
+当前全部测试通过（数量会变，以实际跑的结果为准，别在这儿写死数字）。
 
 其中四个专门盯着"不靠自觉"这件事：
 

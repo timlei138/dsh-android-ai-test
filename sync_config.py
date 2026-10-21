@@ -39,36 +39,88 @@ PAIRS = [
      SNAP / "skills" / "android-case-planner.SKILL.md"),
 ]
 
+# ★ references/ 下的细分文档同样是"技能卡"，一样决定子 Agent 怎么做事。
+#   以前只镜像 SKILL.md，于是内容下沉到 references 之后就**完全脱离快照**：
+#   改了没记录、坏了没法回退，而 test_skill_card_consistency 也看不见它。
+#   这里按目录整棵镜像，新增一个 reference 文件不必再改本脚本。
+REF_DIRS = [
+    (HOME / ".agents" / "skills" / "android-case-runner" / "references",
+     SNAP / "skills" / "android-case-runner.references"),
+    (HOME / ".agents" / "skills" / "android-case-planner" / "references",
+     SNAP / "skills" / "android-case-planner.references"),
+]
+
+
+def _pairs():
+    """展开成 (原文件, 快照文件) 列表，含 references/ 下的每个文件。"""
+    out = list(PAIRS)
+    for live_dir, snap_dir in REF_DIRS:
+        if not live_dir.is_dir():
+            continue
+        for p in sorted(live_dir.rglob("*.md")):
+            out.append((p, snap_dir / p.relative_to(live_dir)))
+    return out
+
+
+def _rel(p: Path) -> str:
+    try:
+        return str(p.relative_to(ROOT))
+    except ValueError:
+        return str(p)
+
 
 def check_only() -> int:
     bad = 0
-    for live, snap in PAIRS:
+    pairs = _pairs()
+    for live, snap in pairs:
         if not live.exists():
             print(f"  ⚠️  原文件不存在：{live}")
             bad += 1
             continue
         if not snap.exists():
-            print(f"  ❌ 快照缺失：{snap.name}")
+            print(f"  ❌ 快照缺失：{_rel(snap)}")
             bad += 1
             continue
         if filecmp.cmp(live, snap, shallow=False):
-            print(f"  ✅ 一致：{snap.name}")
+            print(f"  ✅ 一致：{_rel(snap)}")
         else:
-            print(f"  ❌ 不一致：{snap.name}")
+            print(f"  ❌ 不一致：{_rel(snap)}")
             print(f"      原文件 {live}")
             print(f"      跑 `python sync_config.py` 同步")
             bad += 1
+
+    # ★ 孤儿快照：原文件已经删了，快照还留着 —— 快照会开始骗人
+    #   （看着像"还生效的配置"，实际早已不存在）。
+    known = {snap for _, snap in pairs}
+    for snap_dir in [SNAP / "skills"]:
+        if not snap_dir.is_dir():
+            continue
+        for p in sorted(snap_dir.rglob("*.md")):
+            if p not in known:
+                print(f"  ⚠️  孤儿快照（原文件已删，快照该同步清理）：{_rel(p)}")
+                bad += 1
     return 1 if bad else 0
 
 
 def sync() -> int:
-    for live, snap in PAIRS:
+    pairs = _pairs()
+    for live, snap in pairs:
         if not live.exists():
             print(f"  ⚠️  原文件不存在，跳过：{live}")
             continue
         snap.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(live, snap)
-        print(f"  · {snap.relative_to(ROOT)}  <-  {live}")
+        print(f"  · {_rel(snap)}  <-  {live}")
+
+    # 清掉孤儿快照（原文件已删）
+    known = {snap for _, snap in pairs}
+    for snap_dir in [SNAP / "skills"]:
+        if not snap_dir.is_dir():
+            continue
+        for p in sorted(snap_dir.rglob("*.md")):
+            if p not in known:
+                p.unlink()
+                print(f"  · 已删除孤儿快照：{_rel(p)}")
     print("  同步完成")
     return 0
 

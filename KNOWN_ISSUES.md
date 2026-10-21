@@ -62,7 +62,11 @@ L2776  throw new TypeError(`tool "${name}" must declare output { schema, render,
 
 ```js
 // runner-tool/lib/index.js，apply() 里
-tool.output.render({}, { status: "PASS", report: "__selfcheck__" }) === "__selfcheck__"
+// ★ 断言的是契约（ContentBlock[]），不是"返回字符串"——
+//   早期写成 probe !== "__selfcheck__"，把错的形态钉死成了"正确"，
+//   结果普通会话正常、测试模式（PTC）一跑就 content.some is not a function。
+const probe = tool.output.render({}, { status: "PASS", report: "__selfcheck__" });
+if (!Array.isArray(probe) || !probe.some(b => b?.type === "text")) throw ...
 ```
 
 **为什么是"试打"而不是"检查存在"**：包装函数**永远存在**，
