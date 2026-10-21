@@ -175,8 +175,16 @@ ck("runner 说 App 弹窗是流程的一部分",
    "流程的一部分" in runner)
 ck("runner 说顺手点掉/不必特别在意",
    "顺手" in runner or "不必" in runner)
-ck("★ runner 归属按包名（不是文案）",
-   "包名" in runner and "固定" in runner)
+# ⚠️ 这条以前要求 runner 卡写"包名 + 固定"，那是**过时的判据**：
+#   子 Agent 每轮收到的处境里**没有包名**（只有可点项 + 整屏文字），
+#   所以"你要按包名判断归属"对它是一句无法执行的话。
+#   真实的归属判断在工具层（bridge.py 用 permissioncontroller 包名自动点允许）。
+#   现在改为看守**正确的分工**：告诉子 Agent 这不是它的活。
+ck("★ runner 说明判归属不是子 Agent 的活",
+   ("工具层" in runner and "包名" in runner)
+   or "不是你的" in runner)
+ck("★ runner 提醒不要点「拒绝并不再询问」",
+   "拒绝并不再询问" in runner)
 ck("★ planner 归属按包名", "包名" in planner)
 
 print()

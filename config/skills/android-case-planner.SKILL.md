@@ -14,6 +14,19 @@ description: 主 Agent 用于把 Android GUI 测试需求拆成可执行的用�
 （按 `delegationDepth` 判断，主 Agent = 0 → 拒，子 Agent = 1 → 放行）。
 被拒了就改用 `subagent` 派发，别原地重试。
 
+## 运行环境：只有一个 venv
+
+排查"缺依赖 / 跑不起来"类问题时看这里：**整条链路只有一个运行环境**，
+编排（langgraph/langchain）和设备依赖（adbutils/opencv/rapidocr）装在同一个
+`.venv` 里。
+
+- 位置：`D:\dsh\langgraph-poc\.venv`，由 `requirements.txt` 可重建
+- **`assets/.venv` 不该存在** —— 存在说明环境又分家了，回归测试会失败
+- 别按"编排 venv / 设备 venv"两套去理解报错：**只有一个 venv**，
+  缺依赖就是这一个没装好
+
+> 子 Agent 那边看不到也改不了这些（它没有 shell），所以环境知识只放这里。
+
 ## ★ 「打开 webui」指哪个
 
 这个模式下说 **webui = 用例执行结果 WebUI（`http://127.0.0.1:8770`）**，
@@ -30,38 +43,40 @@ D:\dsh\langgraph-poc\start-webui.cmd -Port 8771 -NoBrowser
 - 回答"上次这个用例过没过、这次为什么变了"就靠它（历史在
   `assets/storage/runs.db`，每次运行带 YAML 快照）
 
-你没有 shell，**不能自己启动它**。用户要开时，把上面这条命令给用户执行，
-不要自己去猜 DSH 的端口或界面。
+开服务需要你启动进程。**别自己去猜 DSH 的端口或界面** —— 这个模式下的
+webui 就是上面那个测试结果界面，不是 DSH 自己的对话界面。
 
 
 ## ★★ 铁律：不许写 Python 脚本去探测页面
 
-**找元素、验证元素，一律用执行器的步骤循环（观察 → 下一步 → 再观察）。**
-不要写临时 python 脚本去 dump XML、数控件、猜"这页里应该有什么 id"。
+**找元素、验证元素，一律走执行器（派子 Agent 跑）。别自己写脚本 dump XML。**
+
+你有 shell，**技术上写得了** —— 所以这条得靠你自己守住。
 
 用户多次实测的结论：
 - 脚本写错就得改，改完再跑，**一轮几分钟** —— 比直接观察效率低得多
 - 脚本里写死的字段是**猜的**，跟执行器真正用的判据（`landing` / `check`）不是一回事
 - 拿脚本"验证过"的结论去写 YAML，等于把猜测固化成判据
 
-**你没有 shell，写不了脚本。** 拆解需要的设备事实（界面长什么样、
-控件 rid 是什么），要么来自已有 YAML / 知识卡，要么**派子 Agent 跑一次观察**，
-要么问用户。别在提示词里幻想一条"先探一下"的路。
+拆解需要的设备事实（界面长什么样、控件 rid 是什么），要么来自已有 YAML / 知识卡，
+要么**派子 Agent 跑一次观察**，要么问用户。别自己先探一遍。
 
 ## 第一步：先看有没有沉淀好的用例
 
 **优先复用，不要重新拆。** 已经验证过的用例比现场拆的可靠得多
 （里面有跨版本踩出来的坑、验证过的落点判据）。
 
-用 `glob` 查：
+用户说"跑 168"时，用编号去匹配文件名：
 
 ```
-glob("**/storage/cases/*.yaml")
-glob("**/storage/cases/*联想日历*")
+glob("**/storage/cases/*168*")        # 优先：按编号找
+glob("**/storage/cases/*联想日历*")   # 只知道 App 名时
+glob("**/storage/cases/*.yaml")       # 都不确定就列全部
 ```
 
-- **找到了** → 直接派发，`case_name` 传名字片段即可（见下）
-- **没找到** → 走第二步现场拆解
+- **命中 1 个** → 直接派发，`case_name` 传名字片段（如 `"168"`）
+- **命中多个** → 把候选列给用户确认，**别自己挑一个**
+- **命中 0 个** → 走第二步现场拆解，或先问用户用例在哪
 
 YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
@@ -75,8 +90,8 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
   "title": "联想日历_168_图库导入入口",
   "package": "com.zui.calendar",
   "preconditions": [
-    {"kind": "data", "desc": "清理 APP 数据",
-     "do": "pm clear com.zui.calendar", "undo": null}
+    {"kind": "nav", "desc": "拉起 App 回到首页作为起点",
+     "do": ["am start -n com.zui.calendar/.AllInOneActivity"]}
   ],
   "steps": [
     {
@@ -93,21 +108,36 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 }
 ```
 
+> ⚠️ **`do` 字符串和数组都收**（`"am start ..."` 或 `["cmd1", "cmd2"]`）；
+> 多条命令必须用数组，否则会被当成一条。
+> ⚠️ **`pm clear` 不是默认前提**。它只在用例明确要"首次使用/首次授权"时用，
+> 且尽量写 `undo`、并确认清的是测试账号 —— 真实账号数据不可逆。
+>
+> `locate` 和 `target` 是**同一个字段的两个名字**（加载器两个都收），
+> 内联传参时写 `locate: {"rid": "..."}` 就行。
+
 ### `landing` 是质量的关键
 
-**每一步都必须给 `landing`。** 没有它，执行器无法判断这一步到底成没成，
-只能问模型 —— 那就退化回"靠模型自觉"了。
+**每一步都应该给 `landing`。** 没有它的步骤代码无从复核，
+只能靠执行子 Agent 自己判断"到了没有" —— 那就退化回"靠模型自觉"。
 
-`landing` 支持的判据：
+⚠️ 技术上说，**没写 `landing` 的步骤不会报错**（子 Agent 说完成就算完成），
+所以这是"你不给它就没人给"的地方。**漏写不会失败，只会悄悄变差。**
+
+`landing` 是个字符串，最常用的两种判据：
 
 | 判据 | 例子 | 说明 |
 |---|---|---|
-| `activity` | `.timetable.display.TimetableActivity` | 页面类名。**是子串包含匹配**，短名必须真的包含在完整名里 |
+| `activity` | `.timetable.display.TimetableActivity` | 页面类名。**是子串包含匹配**：短名必须真的包含在完整名里 |
 | `rid` | `btnImportFromGallery` | 控件资源 id |
-| `text` | `图库导入` | 屏幕文字 |
-| `package` | `com.android.providers.media.module` | 弹窗/浮层的来源包（跨 App 跳转时用） |
+| `text` | `图库导入` | 屏幕文字（代码只能子串匹配，**判不准，会交给模型**） |
 
 多个条件用**逗号**（AND）或**竖线**（OR）。
+
+> `asserts` 里的 `check` 是**字典**，能写的键更多（`permission`、`node_present`、
+> `dialog_present`、`after_tap` 等）。完整清单读
+> `references/permissions.md`，别凭印象写 —— 写了代码不认的键会被丢弃
+> （报告里会打"不认识的判据键"警告，但那条断言就等于没验）。
 
 ### 拆解纪律（这几条是踩出来的）
 
@@ -124,8 +154,10 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
    结构化判据代码能核，自然语言只能再问一遍模型。
 
 4. **前提该清就清，但要能恢复**
-   `kind: "data"` 表示会改设备数据（如 `pm clear`），必须写 `undo`。
-   用户会看到"我设备上的日历数据被清了"这类副作用。
+   `kind` 只支持三种：`nav`（回起点，拉起 App 用这个，**不改数据**）、
+   `data`（改数据，如 `pm clear`，能恢复就写 `undo`）、
+   `env`（改环境/硬件，**代码强制必须给 `undo`**，否则直接报错）。
+   `pm clear` 不是默认前提：它清的是真实账号数据，**不可逆**。
 
 5. **不确定的写在 `pitfalls`，别猜**
    每步可以带 `pitfalls`（这一步容易踩什么）。宁可多写一句提示，
@@ -145,8 +177,8 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
 判**被测 App 的授权状态**（`permission: {CAMERA: true}`），不是"弹窗出现过没有"。
 
-> 判据边界（代码只认哪些键）、为什么不能写 `dialog_present` 那类、
-> 169 的真实误判案例，读 `references/permissions.md`。
+> 判据边界（代码只认哪些键）、权限判据为什么不能用 `permission_dialog`
+> 这类自造形状，读 `references/permissions.md`。
 ## 第三步：派发
 
 > ⚠️ **一个用例派一个子 Agent，只派一次。**
@@ -160,17 +192,43 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
 用 `subagent` 工具。**把拆解结果完整放进 prompt**，因为子 Agent 不继承你的上下文。
 
+**两种模板，二选一照抄 —— 不要混用**（同时给 `case_name` 和结构会打架）。
+
+有现成 YAML 时：
+
 ```
 subagent(
   prompt: """
     执行这个 Android 用例，用 android_case 工具。
 
-    case_name: 168          ← 有现成 YAML 时用这个，最省事
-    或者
-    用例结构: {上面那份 JSON}   ← 现场拆解时用这个
+    case_name: 168
 
     要求：
-    - 直接跑，不用加别的开关（代码会自动先试强证据直点）
+    - 直接跑，不用加别的开关
+    - 判据（landing / asserts）是验收标准，不许改；跑不通就照实报
+    - 把报告的 status / engine / steps_done / issues 原样转述回来
+    - steps_done=0 表示一步都没执行，这时不要说"功能正常/不正常"
+  """
+)
+```
+
+⚠️ **`case_name` 方式默认会回写 YAML**（`writeback=true`）—— 只改每步的
+`locate`（点哪个控件），不动 `landing`/`asserts`。这是有意的自我校准。
+如果你只想看看、不想落盘，在派发时明确加一句"用 `writeback=false` 跑"。
+
+现场拆的（把上面那份 JSON 原样贴进去）：
+
+```
+subagent(
+  prompt: """
+    执行这个 Android 用例，用 android_case 工具。
+
+    用例结构：
+    {上面那份 JSON 原样贴这里}
+
+    要求：
+    - 直接跑，不用加别的开关
+    - 判据（landing / asserts）是验收标准，不许改；跑不通就照实报
     - 把报告的 status / engine / steps_done / issues 原样转述回来
     - steps_done=0 表示一步都没执行，这时不要说"功能正常/不正常"
   """
@@ -179,7 +237,7 @@ subagent(
 
 ### 派发时必须交代的三件事
 
-1. **用哪个用例**（`case_name` 还是内联结构）
+1. **用哪个用例**（`case_name` 还是内联结构，**只能选一个**）
 2. **用例内容别改** —— 判据（`landing` / `asserts`）是验收标准，
    子 Agent 只负责跑，跑不通就照实报，不许迁就结果改判据
 3. **报告怎么转述**（见下）

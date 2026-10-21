@@ -211,7 +211,9 @@ _hits = [ln.strip()[:70] for ln in _corpus.splitlines()
          if any(w in ln for w in _venv_words)]
 ck("技能卡不再教「两个 venv」（已合并成一个）", not hits,
    f"违规 {_hits}" if _hits else "")
-# 正面：必须说明只有一个运行环境，否则"缺依赖"会被归错因
+# 正面：环境知识必须存在，否则"缺依赖"会被归错因。
+#   但它属于**维护者/主 Agent** 的知识（子 Agent 没有 shell，看不到也改不了环境），
+#   所以只要求"技能卡整体里有"，不绑定具体某一张 —— 放错位置才会误导。
 ck("技能卡说明只有一个运行环境", "只有一个 venv" in _corpus)
 
 # 老模块名 assets_path 早已改名为 android_agent.cases.paths —— 不许再教
