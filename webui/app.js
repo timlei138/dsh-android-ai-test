@@ -305,85 +305,121 @@ async function viewDashboard() {
 
 /* ---------- 视图：用例库 ----------
  *
- * 参照旧 skill 的用例库：列出 storage/cases 下的 YAML，点进去看原文。
+ * ★ 一条用例 = 原始 case 原文 + （可能有的）YAML 判据，两样绑在一起。
+ *   这是按用户要求改的："把 case 和 yaml 都关联起来，这样删除的时候简单点"。
  *
- * 和旧 skill 的差别（按我们的实际情况改的）：
- *   · 旧 skill 的用例是"数据库里的 case 记录 + 沉淀出来的 YAML"两份
- *   · 我们只有 YAML 一份 —— 用例就是文件，没有第二个真相
- *   · 所以这里直接把文件列出来，每个用例后面带"跑过几次 / 最近结论"，
- *     那部分从 runs 库里按 case_id 对上来
+ *   所以列表的数据源是**数据库里的 cases 表**（63 条，两个文件夹导进来的），
+ *   不是"扫 cases 目录看有几个 YAML"。只扫目录的话，那 56 条还没拆解成
+ *   YAML 的用例永远不会出现在页面上。
  */
 async function viewCases() {
-  const [{ items, dir }, s] = await Promise.all([
-    api('/api/cases'),
-    api('/api/stats').catch(() => ({ cases: [] })),
-  ]);
-  // ⚠️ 索引键是 stats 里的 case_name（= YAML 文件名去扩展名），
-  //    不是 case_id。之前建索引用 case_name、查却用 c.case_id，
-  //    于是「最近结论」「跑过」两列永远是空的 —— 而且不报错，只是空的。
-  const byName = {};
-  (s.cases || []).forEach((c) => { byName[c.case_name] = c; });
+  const j = await api('/api/cases');
+  const items = j.items || [];
 
-  const rows = items.map((c) => {
-    const stem = c.name.replace(/\.yaml$/, '');
-    const run = byName[stem] || {};
-    const n = run.n || run.runs || 0;
-    return `<tr class="clickable" data-casefile="${esc(c.name)}">
-      <td class="mono">${esc(c.case_id || '—')}</td>
-      <td>${esc(c.title)}</td>
-      <td>${c.has_raw
-        ? '<span class="raw-yes">✓ 原始 case</span>'
-        : '<span class="raw-no">未录原文</span>'}</td>
-      <td>${c.valid ? '' : '<span class="badge UNKNOWN">校验用</span>'}</td>
-      <td>${n ? `<span class="badge ${esc(run.last_status || 'UNKNOWN')}">${esc(run.last_status || '—')}</span>` : '<span class="muted">未跑过</span>'}</td>
-      <td>${n} 次</td>
-      <td class="mono" style="font-size:12px">${(c.size / 1024).toFixed(1)} KB</td>
-      <td style="color:var(--dim);font-size:12.5px">${esc(c.mtime)}</td>
+  // 筛选：默认全部。用例多起来之后，"只看有 YAML 的"是最常用的一个。
+  const f = STATE.filter || 'all';
+  const shown = items.filter((c) => (f === 'yaml' ? c.yaml_exists
+    : f === 'noyaml' ? !c.yaml_exists
+      : f === 'run' ? c.runs > 0 : true));
+
+  const rows = shown.map((c) => `<tr class="clickable" data-casekey="${esc(c.case_key)}">
+      <td class="mono">${esc(c.case_key)}</td>
+      <td>${esc(c.title || '（未命名）')}
+        ${c.priority ? `<span class="prio">${esc(c.priority)}</span>` : ''}</td>
+      <td>${c.yaml_exists
+        ? `<span class="raw-yes">✓ 已拆解</span>`
+        : '<span class="raw-no">未拆解</span>'}</td>
+      <td>${c.runs
+        ? `<span class="badge ${esc(c.last_status || 'UNKNOWN')}">${esc(c.last_status || '—')}</span>`
+        : '<span class="muted">未跑过</span>'}</td>
+      <td>${c.runs ? c.runs + ' 次' : '—'}</td>
+      <td style="color:var(--dim);font-size:12.5px">${esc(c.last_at || '')}</td>
       <td style="white-space:nowrap">
-        <button class="danger sm" data-del="${esc(c.name)}"
-          title="删除这个用例文件和它的原始 case">删除</button>
+        <button class="danger sm" data-delcase="${esc(c.case_key)}"
+          title="删除这条用例（原始 case 和关联的 YAML）">删除</button>
       </td>
-    </tr>`;
-  }).join('');
+    </tr>`).join('');
+
+  const tab = (k, label, n) => `<button class="tab ${f === k ? 'on' : ''}"
+    data-filter="${k}">${label}<span class="n">${n}</span></button>`;
+  const nYaml = items.filter((c) => c.yaml_exists).length;
+  const nRun = items.filter((c) => c.runs > 0).length;
 
   main.innerHTML = `<h1>用例库</h1>
-    <div class="sub">共 ${items.length} 个用例文件 · <span class="mono">${esc(dir)}</span></div>
-    <table><thead><tr><th>编号</th><th>用例</th><th>原始 case</th><th></th><th>最近结论</th>
-      <th>跑过</th><th>大小</th><th>修改时间</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="9" class="empty">cases 目录里没有 YAML</td></tr>'}</tbody></table>`;
+    <div class="sub">
+      共 <b>${items.length}</b> 条 · 已拆解 YAML <b>${nYaml}</b> 条 ·
+      跑过 <b>${nRun}</b> 条
+      <span style="color:var(--dim)">｜原文来自 ${(j.raw_dirs || []).map((d) => `<span class="mono">${esc(d)}</span>`).join(' 和 ') || '—'}</span>
+    </div>
+    <div class="tabs">
+      ${tab('all', '全部', items.length)}
+      ${tab('yaml', '已拆解', nYaml)}
+      ${tab('noyaml', '未拆解', items.length - nYaml)}
+      ${tab('run', '跑过', nRun)}
+      <span style="flex:1"></span>
+      <button class="ghost sm" id="case-sync" title="从文件夹把新增的原始 case 补进来（不覆盖网页里改过的）">从文件夹同步</button>
+    </div>
+    <table><thead><tr><th>编号</th><th>用例</th><th>YAML</th>
+      <th>最近结论</th><th>跑过</th><th>最近一次</th><th></th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="7" class="empty">这个筛选下没有用例</td></tr>`}</tbody></table>
+    ${(j.orphan_yaml || []).length ? `<div class="hint" style="margin-top:16px">
+      还有 <b>${j.orphan_yaml.length}</b> 个 YAML 文件没对上任何用例编号
+      （${j.orphan_yaml.map((o) => `<span class="mono">${esc(o.name)}</span>`).join('、')}）——
+      它们在 <span class="mono">${esc(j.dir)}</span> 里，不随用例删除。
+    </div>` : ''}`;
 
-  // 点一行 -> 打开用例详情（原始 case + YAML）
-  main.querySelectorAll('tr[data-casefile]').forEach((tr) => {
-    tr.addEventListener('click', () => go('casefile', { name: tr.dataset.casefile }));
-  });
-  // 删除按钮：stopPropagation，否则点删除会同时触发"打开行"
-  main.querySelectorAll('button[data-del]').forEach((b) => {
+  bindBack();
+  // 行点击交给全局委托处理（[data-casekey]），这里不再单独绑 ——
+  // 两边都绑会导致一次点击跳两次，白跑一遍接口。
+  main.querySelectorAll('button[data-delcase]').forEach((b) => {
     b.addEventListener('click', (e) => {
       e.stopPropagation();
-      confirmDeleteCase(b.dataset.del);
+      confirmDeleteCase(b.dataset.delcase);
     });
+  });
+  main.querySelectorAll('[data-filter]').forEach((b) => {
+    b.addEventListener('click', () => {
+      STATE.filter = b.dataset.filter;
+      viewCases();
+    });
+  });
+  main.querySelector('#case-sync').addEventListener('click', async () => {
+    try {
+      const r = await api('/api/cases/import', { method: 'POST', body: {} });
+      toast(`已同步：新增 ${r.created} 条，跳过已存在 ${r.skipped} 条，`
+        + `关联 YAML ${r.linked} 个`);
+      await viewCases();
+    } catch (e) { toast('同步失败：' + e.message); }
   });
 }
 
-/* 删除用例：只删 YAML 和原始 case，**历史记录保留**
+/* 删除用例：原始 case 和 YAML 一起删，**历史记录保留**
  *
  * 为什么不连坐删历史：
  *   历史记录里存了 case_yaml 快照，是"当时那份判据"的唯一副本。
- *   用例文件删了，快照还在 —— 那条记录仍然可复核。
+ *   用例删了，快照还在 —— 那条记录仍然可复核。
  *   连坐删掉等于把证据一起销毁了。
  *   （旧 skill 是连坐的，这条刻意不学。）
  */
-function confirmDeleteCase(fname) {
-  const stem = fname.replace(/\.yaml$/, '');
+async function confirmDeleteCase(key) {
+  let d = null;
+  try { d = await api('/api/cases/' + encodeURIComponent(key)); }
+  catch (e) { toast('读不到这条用例：' + e.message); return; }
+
+  const hasYaml = d.yaml && d.yaml.exists;
   const m = modal('删除用例', `
-    <div class="warn-text">确定删除用例 <b>${esc(stem)}</b> 吗？</div>
+    <div class="warn-text">确定删除用例 <b>${esc(key)}</b>
+      ${d.title ? '「' + esc(d.title) + '」' : ''} 吗？</div>
     <div class="meta">将删除：<br>
-      · 用例文件 <span class="mono">${esc(fname)}</span><br>
-      · 该用例已录入的<b>原始 case 原文</b><br>
+      · 原始 case 原文（${(d.raw_text || '').length} 字）<br>
+      ${hasYaml ? `· 关联的 YAML <span class="mono">${esc(d.yaml.name)}</span><br>`
+    : '<span style="color:var(--dim)">· 这条还没有 YAML，无需删文件</span><br>'}
       <br>
-      <b>历史测试记录会保留</b> —— 记录里存着跑的时候那份 YAML 快照，
-      删了用例仍然能复核当时的判据。需要清理记录请到「测试记录」里逐条删。<br>
-      <b class="danger-text">文件不可恢复。</b></div>`,
+      <b>历史测试记录会保留</b>${d.runs && d.runs.length
+    ? `（这条用例还有 ${d.runs.length} 条记录）` : ''} ——
+      记录里存着跑的时候那份 YAML 快照，删了用例仍然能复核当时的判据。
+      需要清理记录请到「测试记录」里逐条删。<br>
+      <b class="danger-text">文件和原文都不可恢复。</b></div>`,
     `<button class="ghost" data-cancel>取消</button>
      <button class="danger solid" data-ok>确认删除</button>`);
   m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
@@ -392,13 +428,15 @@ function confirmDeleteCase(fname) {
     btn.disabled = true;
     btn.textContent = '删除中…';
     try {
-      const r = await api('/api/case/' + encodeURIComponent(fname),
-                          { method: 'DELETE' });
+      const r = await api('/api/cases/' + encodeURIComponent(key),
+        { method: 'DELETE' });
       m.close();
-      await viewCases();
-      toast(`已删除 ${fname}` +
-            (r.raw_deleted ? '，含原始 case' : '') +
-            (r.runs_kept ? `；保留了 ${r.runs_kept} 条历史记录` : ''));
+      toast(`已删除用例 ${key}`
+        + (r.deleted_yaml ? `，含 YAML 文件` : '')
+        + (r.runs_kept ? `；保留了 ${r.runs_kept} 条历史记录` : ''));
+      // 删完回列表。用 replace 不记历史 —— 那条用例已经不在了，
+      // 退回它的详情页只会 404。
+      go('cases', {}, { replace: true });
     } catch (e) {
       btn.disabled = false;
       btn.textContent = '确认删除';
@@ -407,99 +445,122 @@ function confirmDeleteCase(fname) {
   });
 }
 
-/* 单个用例：原始 case（用户写的步骤/预期）+ YAML 判据，两块都显示
+/* 单个用例：原始 case（用户写的步骤/预期）+ 关联的 YAML 判据，一页看完
  *
- * ★ 为什么两块都要
+ * ★ 为什么两块放同一页
  *   YAML 是**执行判据**（landing / pitfalls / check），是改写过的结构；
  *   原始 case 是**需求原话**（"打开日历 → 点更多 → 选课程表"）。
  *   看结论时人想对着自己的原话看，改判据时人要看 YAML ——
- *   只给其中一份,总有一边要脑补。
+ *   分成两个页面，每次都要来回跳，还得记住编号。
  *
- * ★ YAML 只读
+ *   用户的要求就是把它们关联起来（"这样删除的时候简单点"）：
+ *   一条用例 = 一行原文 + 一个 YAML，删就是一键。
+ *
+ * ★ YAML 只读，原文可改
  *   用例 YAML 是"判据的唯一真相"，跑出来的结论都拿它对照。
  *   在网页上随手改一改，旧记录就会变成"新判据配旧结论"，等于自欺。
  *   原始 case 可以改 —— 它是需求记录，不是判据。
  */
-async function viewCaseFile(name) {
-  const [c, raw] = await Promise.all([
-    api('/api/case/' + encodeURIComponent(name)),
-    api('/api/rawcase/' + encodeURIComponent(name)).catch(() => ({ found: false })),
-  ]);
-  const lines = c.content.split('\n');
-  const body = lines.map((ln, i) => {
-    const n = String(i + 1).padStart(4, ' ');
-    // 极简高亮：注释、键、列表符。不做完整 YAML 语法解析 —— 那要引入高亮库，
-    // 而我们看的是"哪一行写了什么"，够用了。
-    let html = esc(ln);
-    if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
-    else html = html
-      .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
-      .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
-    return `<span class="ln"><i>${n}</i>${html}</span>`;
-  }).join('\n');
+async function viewCase(key) {
+  const d = await api('/api/cases/' + encodeURIComponent(key));
+  const y = d.yaml || {};
 
-  const rawBlock = raw && raw.found
-    ? `<div class="codebox"><pre style="white-space:pre-wrap">${esc(raw.raw_text)}</pre></div>
-       <div class="sub" style="margin:6px 0 0">录入于 ${esc(raw.updated_at || '—')}</div>`
-    : `<div class="hint warn">这条用例还没录原始 case。
-         原始 case 是<b>你当初写的测试步骤和预期结果</b>，它和 YAML 里的判据
-         不是一回事 —— 前端要对着你的原话看结论，就必须把它录进来。</div>`;
+  // 原始 case 原文：原样显示（用 pre + 保留换行），不做任何"美化"
+  // —— 用户要看到的是自己当初写的字，不是被重排过的版本。
+  const rawHtml = (d.raw_text || '').trim()
+    ? `<div class="codebox"><pre style="white-space:pre-wrap">${esc(d.raw_text)}</pre></div>`
+    : `<div class="hint warn">这条用例还没有原文。
+        它本该来自你手写的那份 txt —— 可以用「从文件夹同步」重新导入，
+        或者直接点「编辑原文」贴进来。</div>`;
 
-  main.innerHTML = `<h1>${esc(c.name)}</h1>
-    <div class="sub"><span class="mono">${esc(c.path)}</span> · ${(c.size / 1024).toFixed(1)} KB</div>
+  // YAML：极简高亮（注释 / 列表符 / 键）。不引高亮库，看的是"哪行写了什么"。
+  let yamlHtml;
+  if (y.exists) {
+    const body = y.content.split('\n').map((ln, i) => {
+      const n = String(i + 1).padStart(4, ' ');
+      let html = esc(ln);
+      if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
+      else html = html
+        .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
+        .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
+      return `<span class="ln"><i>${n}</i>${html}</span>`;
+    }).join('\n');
+    yamlHtml = `<div class="codebox collapsed"><pre>${body}</pre></div>
+      <div class="sub" style="margin-top:6px">
+        <span class="mono">${esc(y.path)}</span> · ${(y.size / 1024).toFixed(1)} KB ·
+        改判据请直接编辑文件后重跑 —— 网页改会让旧记录变成「新判据配旧结论」。
+      </div>`;
+  } else {
+    yamlHtml = `<div class="hint">这条用例还没拆解成 YAML <b>（还没法跑）</b>。
+      YAML 是执行判据（每步的落点、坑、断言），要由拆解流程生成。
+      原文已经在库里了，随时可以拿来拆。</div>`;
+  }
+
+  // 这条用例的历史运行
+  const runs = d.runs || [];
+  const runRows = runs.map((r) => `<tr class="clickable" data-run="${r.run_id}">
+      <td class="mono">#${r.run_id}</td>
+      <td>${badge(r.status)}</td>
+      <td>${r.steps_done == null ? '—' : r.steps_done}/${r.steps_total == null ? '?' : r.steps_total}</td>
+      <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
+      <td>${fmtDur(r.elapsed_s)}</td>
+      <td>${esc(r.started_at || '')}</td>
+      <td style="color:var(--dim);font-size:12.5px">${esc((r.summary || '').slice(0, 46))}</td>
+    </tr>`).join('');
+
+  main.innerHTML = `${backBar('用例库')}
+    <div class="kb-bar">
+      <h1 style="margin:0">${esc(d.title || '（未命名）')}
+        <span class="mono" style="font-size:15px;color:var(--dim)">#${esc(d.case_key)}</span></h1>
+      <span style="flex:1"></span>
+      ${d.priority ? `<span class="prio">${esc(d.priority)}</span>` : ''}
+      <button class="danger sm" id="case-del">删除这条用例</button>
+    </div>
+    <div class="sub">
+      原文 ${(d.raw_text || '').length} 字
+      ${d.source_path ? `· 来源 <span class="mono">${esc(d.source_path)}</span>` : ''}
+      ${d.updated_at ? `· 更新于 ${esc(d.updated_at)}` : ''}
+    </div>
 
     <div class="kb-bar" style="margin:18px 0 10px">
       <b>原始 case（你写的测试步骤 / 预期结果）</b>
       <span style="flex:1"></span>
-      <button class="ghost sm" id="raw-edit">${raw && raw.found ? '修改' : '录入'}</button>
-      ${raw && raw.found ? '<button class="danger sm" id="raw-del">删除原文</button>' : ''}
+      <button class="ghost sm" id="raw-edit">编辑原文</button>
     </div>
-    <div id="raw-box">${rawBlock}</div>
+    <div id="raw-box">${rawHtml}</div>
 
     <div class="kb-bar" style="margin:22px 0 10px">
       <b>用例 YAML（执行判据，只读）</b>
       <span style="flex:1"></span>
-      <button class="danger sm" id="case-del">删除这个用例</button>
+      ${y.exists ? `<a class="ghost sm btnlink" href="/api/case/${encodeURIComponent(y.name)}"
+        target="_blank">单独打开</a>` : ''}
     </div>
-    <div class="codebox"><pre>${body}</pre></div>
-    <div class="sub" style="margin-top:6px">改判据请直接编辑文件后重跑 —— 网页改会让旧记录变成「新判据配旧结论」。</div>`;
+    ${yamlHtml}
 
+    <h2 style="margin-top:26px">这条用例的运行记录</h2>
+    <table><thead><tr><th>#</th><th>结果</th><th>步数</th><th>自动化率</th>
+      <th>耗时</th><th>开始时间</th><th>摘要</th></tr></thead>
+    <tbody>${runRows || '<tr><td colspan="7" class="empty">还没跑过</td></tr>'}</tbody></table>`;
+
+  bindBack();
+
+  // 行点击走全局委托（tr[data-run]），不再单独绑。
   main.querySelector('#raw-edit').addEventListener('click', async () => {
-    const v = await promptText(raw && raw.found ? '修改原始 case' : '录入原始 case',
+    const v = await promptText('编辑原始 case',
       '把用户当初写的测试步骤和预期结果原样贴进来。不要改写成执行判据 —— YAML 那边才是判据。',
-      raw && raw.found ? raw.raw_text : '');
+      d.raw_text || '');
     if (v == null) return;
     if (!v.trim()) { toast('内容不能为空'); return; }
     try {
-      await api('/api/rawcase/' + encodeURIComponent(name),
-                { method: 'POST', body: { raw_text: v } });
+      await api('/api/cases/' + encodeURIComponent(key) + '/raw',
+        { method: 'POST', body: { raw_text: v } });
       toast('已保存');
-      await viewCaseFile(name);
+      await viewCase(key);
     } catch (e) { toast('保存失败：' + e.message); }
   });
 
-  const rd = main.querySelector('#raw-del');
-  if (rd) {
-    rd.addEventListener('click', async () => {
-      const m = modal('删除原始 case',
-        `<div class="warn-text">只删「原始 case 原文」，<b>YAML 文件不动</b>。</div>
-         <div class="meta">不可恢复。之后可以重新录入。</div>`,
-        `<button class="ghost" data-cancel>取消</button>
-         <button class="danger solid" data-ok>确认删除</button>`);
-      m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
-      m.el.querySelector('[data-ok]').addEventListener('click', async () => {
-        try {
-          await api('/api/rawcase/' + encodeURIComponent(name), { method: 'DELETE' });
-          m.close();
-          toast('已删除原始 case 原文');
-          await viewCaseFile(name);
-        } catch (e) { m.close(); toast('删除失败：' + e.message); }
-      });
-    });
-  }
-
   main.querySelector('#case-del').addEventListener('click',
-    () => confirmDeleteCase(name));
+    () => confirmDeleteCase(key));
 }
 
 /* ---------- 视图：视觉模型 ----------
@@ -634,11 +695,14 @@ function caseInfoHtml(run) {
     return `<span class="ln"><i>${n}</i>${html}</span>`;
   }).join('\n');
 
+  // 跳到这条用例的详情页。用例现在按**编号**索引（run.case_name 存的就是编号），
+  // 不是按 YAML 文件名 —— 用文件名跳过去会 404。
+  const caseKey = run.case_name || '';
   const head = `<div class="casebar">
       ${fname ? `<span class="mono">${esc(fname)}</span>` : ''}
       ${pkg ? `<span class="mono dim">${esc(pkg)}</span>` : ''}
       ${snap ? '<span class="tag ok">跑的时候那份</span>' : ''}
-      ${fname ? `<a class="ghost-link" data-casefile="${esc(fname)}">在用例库看当前版本</a>` : ''}
+      ${caseKey ? `<a class="ghost-link" data-casekey="${esc(caseKey)}">看这条用例当前版本</a>` : ''}
       <span style="flex:1"></span>
       ${snap ? `<span class="muted">${lines.length} 行</span>` : ''}
     </div>`;
@@ -675,15 +739,17 @@ async function viewRuns(caseName) {
           title="删除这条记录和它的日志/截图/xml">删除</button>
       </td>
     </tr>`).join('');
-  main.innerHTML = `<h1>${title}</h1>
+  main.innerHTML = `${backBar(caseName ? '用例库' : '总览')}
+    <h1>${title}</h1>
     <div class="sub">${runs.length} 次运行</div>
     <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>步数</th>
       <th>自动化率</th><th>耗时</th><th>开始时间</th><th>摘要</th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="9" class="empty">还没有运行</td></tr>'}</tbody></table>`;
 
-  main.querySelectorAll('tr[data-run]').forEach((tr) => {
-    tr.addEventListener('click', () => go('run', { id: tr.dataset.run }));
-  });
+  bindBack();
+
+  bindBack();
+  // 行点击交给全局委托（tr[data-run]），这里不再单独绑 —— 两边都绑会跳两次。
   main.querySelectorAll('button[data-delrun]').forEach((b) => {
     b.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -827,7 +893,7 @@ async function viewRun(runId) {
     </div>`;
   }).join('');
 
-  main.innerHTML = `<div class="kb-bar">
+  main.innerHTML = `${backBar('记录列表')}<div class="kb-bar">
       <h1 style="margin:0">运行 #${run.run_id} · 用例 <span class="mono">${esc(run.case_name)}</span></h1>
       <span style="flex:1"></span>
       <button class="danger sm" id="run-del">删除这条记录</button>
@@ -870,13 +936,37 @@ async function viewRun(runId) {
     });
   });
 
-  // 删掉这条记录。删完回列表 —— 停在已删条目的详情页上没意义，
+  // 删掉这条记录。删完回上一页 —— 停在已删条目的详情页上没意义，
   // 而且下一次刷新会 404，看起来像"页面坏了"。
   main.querySelector('#run-del').addEventListener('click',
-    () => confirmDeleteRun(Number(run.run_id), () => viewRuns(run.case_name || '')));
+    () => confirmDeleteRun(Number(run.run_id),
+      () => goBack(() => go('runs', {}, { replace: true }))));
+  bindBack();
 }
 
 /* ---------- 路由 ---------- */
+
+/* 浏览历史栈。
+ *
+ * 为什么不直接用 history.back()：go() 用的是 replaceState（不新增历史条目），
+ * 所以浏览器后退根本退不到上一个视图。而用户要的"回到来的那一页" ——
+ * 从用例库进的详情就回用例库，从某用例的记录列表进的详情就回那个列表 ——
+ * 只有自己记一份栈才对得上。
+ */
+const NAV = [];
+
+const _sameView = (a, b) => a.view === b.view && (a.case || '') === (b.case || '')
+  && a.runId === b.runId && (a.name || '') === (b.name || '');
+
+function _hashOf(st) {
+  const extra = {};
+  if (st.case) extra.case = st.case;
+  if (st.name) extra.name = st.name;
+  const q = extra.case ? '?case=' + encodeURIComponent(extra.case)
+    : extra.name ? '?name=' + encodeURIComponent(extra.name) : '';
+  return `#${st.view}${st.runId ? '/' + st.runId : ''}${q}`;
+}
+
 async function route() {
   main.innerHTML = '<div class="empty">加载中…</div>';
   // 侧栏高亮
@@ -888,7 +978,7 @@ async function route() {
     if (STATE.view === 'run') await viewRun(STATE.runId);
     else if (STATE.view === 'runs') await viewRuns(STATE.case);
     else if (STATE.view === 'cases') await viewCases();
-    else if (STATE.view === 'casefile') await viewCaseFile(STATE.name);
+    else if (STATE.view === 'case') await viewCase(STATE.case);
     else if (STATE.view === 'vision') await viewVision();
     else await viewDashboard();
   } catch (e) {
@@ -896,14 +986,44 @@ async function route() {
   }
 }
 
-function go(view, extra = {}) {
-  STATE = {
+/* opts.replace=true 表示"换内容但不记历史"（比如删完就地刷新） */
+function go(view, extra = {}, opts = {}) {
+  const next = {
     view, case: extra.case || '', runId: extra.runId, name: extra.name,
   };
-  const q = extra.case ? '?case=' + encodeURIComponent(extra.case)
-    : extra.name ? '?name=' + encodeURIComponent(extra.name) : '';
-  history.replaceState(STATE, '', `#${view}${extra.runId ? '/' + extra.runId : ''}${q}`);
+  if (!opts.replace && !_sameView(STATE, next)) NAV.push({ ...STATE });
+  STATE = next;
+  history.replaceState(STATE, '', _hashOf(STATE));
   route();
+}
+
+/* 返回。栈空时退到 fallback（一般是仪表盘）—— 别让按钮点了没反应。 */
+function goBack(fallback) {
+  const prev = NAV.pop();
+  if (prev && prev.view) {
+    STATE = prev;
+    history.replaceState(STATE, '', _hashOf(STATE));
+    route();
+    return;
+  }
+  if (fallback) fallback();
+  else go('dashboard', {}, { replace: true });
+}
+
+/* 二级页面顶部的返回条。
+ *
+ * ★ 文案带上"回哪里"，而不是光秃秃一个「返回」——
+ *   用户要能预期点了会去哪，尤其是在两个列表之间跳来跳去的时候。
+ */
+function backBar(label) {
+  return `<div class="backbar">
+    <button class="ghost sm" id="nav-back">← 返回${label ? esc(label) : ''}</button>
+  </div>`;
+}
+
+function bindBack() {
+  const b = main.querySelector('#nav-back');
+  if (b) b.addEventListener('click', () => goBack());
 }
 
 /* 事件委托：侧栏、表格行、用例文件链接 */
@@ -916,9 +1036,10 @@ document.addEventListener('click', (e) => {
     if (v === 'vision') return go('vision');
     return go('dashboard');
   }
-  // 用例文件（用例库的表格行、详情页的"在用例库打开"）
-  const cf = e.target.closest('[data-casefile]');
-  if (cf) return go('casefile', { name: cf.dataset.casefile });
+  // 用例详情（用例库的行、记录详情里的"看当前版本"）—— 按**编号**跳
+  const ck = e.target.closest('[data-casekey]');
+  if (ck) return go('case', { case: ck.dataset.casekey });
+  // 用例的记录列表（仪表盘的用例行）—— 这里的 data-case 存的是 YAML 名
   const cnav = e.target.closest('[data-case]');
   if (cnav && !cnav.dataset.run) {
     return go('runs', { case: cnav.dataset.case });

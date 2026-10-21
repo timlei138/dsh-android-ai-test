@@ -41,6 +41,7 @@ shot_before、changed）反而要挤进 data_json 里，查询就废了。
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -146,21 +147,33 @@ CREATE TABLE IF NOT EXISTS findings (
 --
 -- 为什么进库不进文件：
 --   文件要额外管目录、编码、命名冲突、跟 YAML 改名同步；
---   而它天然是"一条用例一份"，跟 case_name 一一对应，正好是表。
+--   而它天然是"一条用例一份"，正好是表。
+--   用户本来就是散在两个文件夹里的 txt，导入一次之后由库管，
+--   网页里改的就是库里的那份，不会出现"文件夹一份、库里一份"两个真相。
 --
--- 一个 case_name 可能有多条记录吗？
---   不会 —— case_name 是主键。改了就 REPLACE，永远保留最新那份。
+-- 一个 case_key 可能有多条记录吗？
+--   不会 —— case_key 是主键。改了就 REPLACE，永远保留最新那份。
 --   历史版本不需要留：YAML 已经存了每次运行的快照，那才是判据的真相；
 --   原始用例是"需求原话"，需求变了就以新的为准。
-CREATE TABLE IF NOT EXISTS raw_cases (
-    case_name   TEXT PRIMARY KEY,  -- 跟 runs.case_name 对齐（YAML 文件名，不含扩展名）
+--
+-- ⚠️ 主键是**编号**（"167" / "03"），不是 YAML 文件名。
+--   原始用例里绝大多数还没有 YAML，用 YAML 名当键就装不进来。
+--   编号是两边都有的唯一线索：文件名 xx_日历_<编号>.txt、
+--   YAML 名 联想日历_<编号>_<题目>.yaml。见 cases/importer.py。
+CREATE TABLE IF NOT EXISTS cases (
+    case_key    TEXT PRIMARY KEY,  -- 编号，如 "167" / "03"
+    title       TEXT,              -- 展示名（原文里没有题目时可由 YAML 补）
+    priority    TEXT,              -- P0/P1/P2/P3，原文里带的就存
     raw_text    TEXT NOT NULL,     -- 用户原文，原样存，不加工
+    source_path TEXT,              -- 从哪个 txt 导进来的（留痕，不参与逻辑）
+    yaml_name   TEXT,              -- 关联的 YAML 文件名（不含目录），空=还没拆解
     updated_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_case   ON runs(case_name, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_cases_yaml  ON cases(yaml_name);
 """
 
 
@@ -216,6 +229,43 @@ def _migrate(con: sqlite3.Connection) -> None:
             # 加列失败不该让整个库打不开 —— 老数据还能看。
             # 但要让调用方知道，所以不做静默 pass，由上层报。
             pass
+
+    _migrate_raw_cases(con)
+
+
+def _migrate_raw_cases(con: sqlite3.Connection) -> None:
+    """raw_cases(按 YAML 名) -> cases(按编号)。
+
+    为什么要搬：raw_cases 用 YAML 文件名当主键，而**绝大多数原始用例还没有
+    YAML** —— 那 56 条根本装不进去。改成按编号当键才能全都收进来。
+
+    搬完把老表删掉。留着的坏处是两份数据、两个真相，下次改的时候必然有人
+    用错那个 —— 与其留个坑，不如一次清干净（老表只有测试期录的几条）。
+    """
+    have = {r["name"] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "raw_cases" not in have:
+        return
+    try:
+        for r in con.execute(
+                "SELECT case_name, raw_text, updated_at FROM raw_cases").fetchall():
+            key = case_number(r["case_name"] or "")
+            if not key or not (r["raw_text"] or "").strip():
+                continue
+            exists = con.execute("SELECT 1 FROM cases WHERE case_key = ?",
+                                 (key,)).fetchone()
+            if exists:
+                continue      # 新表已有（导过一遍了），不覆盖
+            con.execute(
+                "INSERT INTO cases(case_key, title, priority, raw_text,"
+                " source_path, updated_at) VALUES(?,?,?,?,?,?)",
+                (key, "", "", r["raw_text"], "(迁移自 raw_cases)",
+                 r["updated_at"]))
+        con.execute("DROP TABLE raw_cases")
+        con.commit()
+    except sqlite3.Error:
+        # 迁移失败就留着老表，别把库弄坏 —— 下次 connect 会再试一次。
+        pass
 
 
 # ---------- 写入 -----------------------------------------------------------
@@ -452,52 +502,165 @@ def get_run(run_id: int, *, db: str | Path | None = None) -> dict[str, Any] | No
         con.close()
 
 
-# ── 原始用例（用户写的那份需求原话）─────────────────────────────
-# 存在 raw_cases 表，一个 case_name 一份。见 _SCHEMA 里那张表的说明。
+# ── 用例（原始需求原话 + 关联的 YAML）────────────────────────────
+#
+# 为什么原始 case 和 YAML **绑在同一行**里（用户要求）：
+#   它们是同一条用例的两面 —— 原文是"要什么"，YAML 是"怎么判"。
+#   分两张表存，删除时就得先查关联再删两处，还要处理"只删了一半"；
+#   绑在一起，删用例 = 删这一行 + 删那个文件，不会漏。
 
-def save_raw_case(case_name: str, raw_text: str, *,
+_NUM_RE = re.compile(r"(\d+)")
+
+
+def case_number(name: str) -> str:
+    """从文件名 / YAML 名里取用例编号。
+
+    '联想日历_167_首次进入课程表引导与空态.yaml' -> '167'
+    '13_日历_167.txt'                          -> '167'
+    '03_日历_03.txt'                           -> '03'
+
+    ★ 取**最后一个**数字段而不是第一个：
+      '13_日历_167.txt' 里第一个数字是排序前缀 13，第二个才是编号 167。
+      取错了会把 13 号和 167 号认成同一条 —— 而且是静默认错。
+    """
+    stem = Path(name).stem
+    parts = stem.split("_")
+    for seg in reversed(parts):
+        m = _NUM_RE.fullmatch(seg.strip())
+        if m:
+            return m.group(1)
+    m = _NUM_RE.search(stem)
+    return m.group(1) if m else ""
+
+
+def save_case(case_key: str, *, title: str = "", priority: str = "",
+              raw_text: str = "", source_path: str = "",
+              db: str | Path | None = None) -> str:
+    """写入/更新一条用例。返回 "created" / "updated" / "skipped"。
+
+    ## 为什么空文本不覆盖
+
+    手滑清空会把原来那份删掉，而"清空"和"从来没有"在前端看起来一样。
+    但**新建**时允许空文本（编号在、原文还没录），所以分两种情况：
+      · 新行 + 空文本 -> 建成 (空壳)，backend 仍会写一行，raw_text 存空串
+      · 已有行 + 空文本 -> 不动它，报 skipped
+
+    ## 为什么 yaml_name 不在这个函数里
+
+    YAML 关联是**扫描目录**得出的，跟"人改了原文"是两件事。
+    混在一起写，人一保存原文就会把刚链好的 YAML 冲掉。
+    单独 set_case_yaml。
+    """
+    text = (raw_text or "").strip()
+    con = connect(db)
+    try:
+        row = con.execute("SELECT raw_text FROM cases WHERE case_key = ?",
+                          (case_key,)).fetchone()
+        if row is None:
+            con.execute(
+                "INSERT INTO cases(case_key, title, priority, raw_text,"
+                " source_path, updated_at) VALUES(?,?,?,?,?,?)",
+                (case_key, title or "", priority or "", text,
+                 source_path or "", _fmt_ts(time.time())))
+            con.commit()
+            return "created"
+        if not text:
+            return "skipped"      # 已有原文，空文本不覆盖
+        con.execute(
+            "UPDATE cases SET raw_text = ?, title = ?, priority = ?,"
+            " source_path = ?, updated_at = ? WHERE case_key = ?",
+            (text, title or (row["title"] if "title" in row.keys() else ""),
+             priority or "", source_path or "", _fmt_ts(time.time()), case_key))
+        con.commit()
+        return "updated"
+    finally:
+        con.close()
+
+
+def get_case(case_key: str, *,
+             db: str | Path | None = None) -> dict[str, Any] | None:
+    """取一条用例；没有则 None（**不要返回空串冒充有**）。"""
+    con = connect(db)
+    try:
+        row = con.execute("SELECT * FROM cases WHERE case_key = ?",
+                          (case_key,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def list_cases(*, db: str | Path | None = None) -> list[dict[str, Any]]:
+    """全部用例，按编号排序。数字键按数值排，不然 100 会排在 20 前面。"""
+    con = connect(db)
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM cases")]
+        rows.sort(key=lambda r: (len(r["case_key"]), r["case_key"]))
+        return rows
+    finally:
+        con.close()
+
+
+def set_case_yaml(case_key: str, yaml_name: str | None, *,
+                  db: str | Path | None = None) -> int:
+    """把用例关联到某个 YAML 文件（或解除关联，yaml_name=None）。返回影响行数。"""
+    con = connect(db)
+    try:
+        cur = con.execute("UPDATE cases SET yaml_name = ? WHERE case_key = ?",
+                          (yaml_name or None, case_key))
+        con.commit()
+        return cur.rowcount or 0
+    finally:
+        con.close()
+
+
+def set_case_title(case_key: str, title: str, *,
+                   db: str | Path | None = None) -> int:
+    """只改展示名。返回影响行数。
+
+    单独一个函数是因为"补标题"和"改原文"是两件事：
+    原文没题目时（`测试用例 联想日历_168 前提：…`），题目由 YAML 名补出来，
+    那时不该动 raw_text。
+    """
+    con = connect(db)
+    try:
+        cur = con.execute("UPDATE cases SET title = ? WHERE case_key = ?",
+                          (title or "", case_key))
+        con.commit()
+        return cur.rowcount or 0
+    finally:
+        con.close()
+
+
+def save_case_raw(case_key: str, raw_text: str, *,
                   db: str | Path | None = None) -> bool:
-    """存/覆盖一条原始用例。返回 True 表示是新写入。
+    """只改原始 case 原文（网页里编辑用）。返回 True 表示内容真的变了。
 
-    空文本不存 —— 否则手滑清空就把原来那份删掉了，
-    而"清空"和"从来没有"在前端看起来一样。
+    空文本不写 —— 理由同 save_case。
     """
     text = (raw_text or "").strip()
     if not text:
         return False
     con = connect(db)
     try:
-        had = con.execute("SELECT 1 FROM raw_cases WHERE case_name = ?",
-                          (case_name,)).fetchone() is not None
-        con.execute(
-            "INSERT OR REPLACE INTO raw_cases(case_name, raw_text, updated_at) "
-            "VALUES(?,?,?)",
-            (case_name, text, _fmt_ts(time.time())))
+        cur = con.execute(
+            "UPDATE cases SET raw_text = ?, updated_at = ? WHERE case_key = ?",
+            (text, _fmt_ts(time.time()), case_key))
         con.commit()
-        return not had
+        return (cur.rowcount or 0) > 0
     finally:
         con.close()
 
 
-def get_raw_case(case_name: str, *,
-                 db: str | Path | None = None) -> dict[str, Any] | None:
-    """取一条原始用例；没有则 None（**不要返回空串冒充有**）。"""
+def delete_case(case_key: str, *, db: str | Path | None = None) -> int:
+    """删掉一条用例，返回删了几行（0/1）。
+
+    ⚠️ 只删库里的行，**不碰磁盘上的 YAML** ——
+       删文件有"删错了不可恢复"的后果，得由调用方（webui）显式做，
+       而且要在真正 unlink 之前先确认路径在用例目录内。
+    """
     con = connect(db)
     try:
-        row = con.execute(
-            "SELECT raw_text, updated_at FROM raw_cases WHERE case_name = ?",
-            (case_name,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        con.close()
-
-
-def delete_raw_case(case_name: str, *, db: str | Path | None = None) -> int:
-    """删掉一条原始用例，返回删了几行（0/1）。"""
-    con = connect(db)
-    try:
-        cur = con.execute("DELETE FROM raw_cases WHERE case_name = ?",
-                          (case_name,))
+        cur = con.execute("DELETE FROM cases WHERE case_key = ?", (case_key,))
         con.commit()
         return cur.rowcount or 0
     finally:

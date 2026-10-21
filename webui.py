@@ -64,6 +64,8 @@ else:
 
 from android_agent.reporting import store as st  # noqa: E402
 from android_agent.cases.paths import cases_dir as _cases_dir  # noqa: E402
+from android_agent.cases.paths import raw_case_dirs  # noqa: E402
+from android_agent.cases import importer  # noqa: E402
 
 STATIC = _HERE / "webui"
 
@@ -158,12 +160,100 @@ def _find_case_file(name: str) -> Path | None:
 
 
 def _case_key(name: str) -> str:
-    """文件名 -> raw_cases 表里的 case_name（去掉 .yaml）。
+    """文件名 -> 用例编号（"167"）。见 store.case_number 的说明。"""
+    return st.case_number(name)
 
-    和 runs.case_name 保持一致 —— 那里存的就是 YAML 文件名去掉扩展名，
-    两边不一致的话"这条用例的原始需求"就查不出来了。
+
+def _run_stats_by_case() -> dict[str, dict]:
+    """编号 -> 跑过几次 / 最近一次结论。
+
+    ★ runs.case_name 存的就是**编号**（'167'），不是 YAML 文件名。
+      别拿 YAML 的 stem 去对 —— 那必然对不上，而且不报错，
+      表现为"跑过 16 次"的用例在列表里显示"未跑过"。
     """
-    return Path(name).stem
+    out: dict[str, dict] = {}
+    for row in st.stats().get("cases", []):
+        out[str(row["case_name"])] = row
+    return out
+
+
+def _cases_payload() -> dict:
+    """用例库列表：库里全部用例 + 关联状态 + 跑过几次。"""
+    rows = st.list_cases()
+    by_case = _run_stats_by_case()
+    cdir = Path(_cases_dir())
+
+    items = []
+    for c in rows:
+        yname = c.get("yaml_name") or ""
+        run = by_case.get(str(c["case_key"]), {})
+        ypath = cdir / yname if yname else None
+        items.append({
+            "case_key": c["case_key"],
+            "title": c.get("title") or "",
+            "priority": c.get("priority") or "",
+            "raw_chars": len(c.get("raw_text") or ""),
+            "yaml_name": yname,
+            "yaml_exists": bool(ypath and ypath.is_file()),
+            "yaml_size": (ypath.stat().st_size if ypath and ypath.is_file() else 0),
+            "runs": run.get("n") or 0,
+            "last_status": run.get("last_status") or "",
+            "last_at": run.get("last_at") or "",
+            "source_path": c.get("source_path") or "",
+            "updated_at": c.get("updated_at") or "",
+        })
+
+    # 目录里有、但库里没关联上的 YAML（比如 _test_invalid 那种夹具，
+    # 或者编号没对上的）。**列出来而不是藏起来** —— 否则页面上
+    # "看不到这个文件"和"这个文件不存在"分不清。
+    known = {i["yaml_name"] for i in items if i["yaml_name"]}
+    orphans = []
+    if cdir.is_dir():
+        for f in sorted(cdir.glob("*.yaml")):
+            if f.name in known:
+                continue
+            orphans.append({"name": f.name,
+                            "size": f.stat().st_size,
+                            "mtime": _fmt_mtime(f.stat().st_mtime)})
+
+    return {
+        "items": items,
+        "dir": str(cdir),
+        "raw_dirs": [str(p) for p in raw_case_dirs()],
+        "orphan_yaml": orphans,
+        "total": len(items),
+        "with_yaml": sum(1 for i in items if i["yaml_exists"]),
+    }
+
+
+def _case_detail(key: str) -> dict | None:
+    """单条用例：原文 + 关联的 YAML 全文 + 这条用例的历史运行。"""
+    c = st.get_case(key)
+    if not c:
+        return None
+    cdir = Path(_cases_dir())
+    yname = c.get("yaml_name") or ""
+    ypath = cdir / yname if yname else None
+    yaml = {"name": "", "path": "", "content": "", "size": 0, "exists": False}
+    if ypath and ypath.is_file():
+        try:
+            content = ypath.read_text(encoding="utf-8")
+        except OSError as e:
+            content = f"(读不出来：{e})"
+        yaml = {"name": ypath.name, "path": str(ypath), "content": content,
+                "size": ypath.stat().st_size, "exists": True}
+
+    runs = st.list_runs(case_name=str(c["case_key"])) if c["case_key"] else []
+    return {
+        "case_key": c["case_key"],
+        "title": c.get("title") or "",
+        "priority": c.get("priority") or "",
+        "raw_text": c.get("raw_text") or "",
+        "source_path": c.get("source_path") or "",
+        "updated_at": c.get("updated_at") or "",
+        "yaml": yaml,
+        "runs": runs,
+    }
 
 
 def _safe_under(path: Path, roots: list[Path]) -> bool:
@@ -473,17 +563,24 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- 用例文件 ---
         #
-        # 和旧 skill 一样：列出 cases 目录，点进去看 YAML 原文。
-        # 我们比旧 skill 多一层 —— 运行记录会带 case_yaml 快照，
-        # 所以详情页能显示"跑的时候那份"，而不只是"现在这份"。
+        # 用例库：**原始 case 和 YAML 是一体的**（用户要求）。
+        #
+        # 数据来源变了：以前是"扫 cases 目录下有几个 YAML 就列几个"，
+        # 现在是"库里有几条用例就列几条" —— 因为原始 case 已经导入库，
+        # 而其中绝大多数（63 里的 56 条）还没有 YAML。
+        # 只扫目录的话，那 56 条永远不会出现在页面上。
         if path == "/api/cases":
-            items = _case_files()
-            # 标上"有没有录原始用例"，列表里才好一眼看出来 / 提供录入入口。
-            # 逐条查库：条数是个位数，不值得为它搞批量接口。
-            for it in items:
-                it["has_raw"] = st.get_raw_case(_case_key(it["name"])) is not None
-            return self._json({"items": items, "dir": str(_cases_dir())})
+            return self._json(_cases_payload())
 
+        # 单条用例：原文 + 关联的 YAML 全文 + 跑过几次
+        if path.startswith("/api/cases/"):
+            key = path[len("/api/cases/"):]
+            one = _case_detail(key)
+            if not one:
+                return self._err(f"没有这个用例：{key}", 404)
+            return self._json(one)
+
+        # 单个 YAML 原文（用例详情里已经并进去了，这个留着给外部/测试用）
         if path.startswith("/api/case/"):
             name = path[len("/api/case/"):]
             fp = _find_case_file(name)
@@ -496,22 +593,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"name": fp.name, "path": str(fp),
                                "content": content,
                                "size": fp.stat().st_size})
-
-        # 原始用例（用户写的「测试步骤 + 预期结果」原文）
-        #
-        # ⚠️ 和 /api/case/<name> 是**两样东西**，别混：
-        #   /api/case/         YAML 原文（判据、landing、pitfalls —— 改写过的执行结构）
-        #   /api/rawcase/      用户当初写的需求原话（"打开日历，点更多→课程表"）
-        # 前端两个都显示，因为用户要对着自己的原话看跑得对不对。
-        if path.startswith("/api/rawcase/"):
-            key = _case_key(path[len("/api/rawcase/"):])
-            rec = st.get_raw_case(key)
-            if not rec:
-                # 200 + found:false，不是 404 —— "这条用例没录原文"是正常状态，
-                # 前端要据此显示"还没录"，而不是弹个错误。
-                return self._json({"case_name": key, "found": False,
-                                   "raw_text": "", "updated_at": ""})
-            return self._json({"case_name": key, "found": True, **rec})
 
         # --- 视觉模型配置 ---
         if path == "/api/vision":
@@ -666,29 +747,39 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/vision/test":
             return self._json(_test_vision())
 
-        # 保存原始用例（用户写的需求原话）
+        # 保存原始 case 原文（网页里编辑）
         #
-        # 为什么要留这个写入口：这条东西**只能人来录**（它是"用户当初
-        # 说了什么"，任何自动推导都只是猜）。不录的话前端就只能显示
-        # YAML 里改写过的 desc，那正是这次要避免的。
-        if path.startswith("/api/rawcase/"):
-            key = _case_key(path[len("/api/rawcase/"):])
+        # 为什么留这个写入口：原文是"用户当初写了什么"，任何自动推导都只是猜。
+        # 现在原文归库管了，这里改的就是正本。
+        if path.startswith("/api/cases/") and path.endswith("/raw"):
+            key = path[len("/api/cases/"):-len("/raw")]
             if not key:
-                return self._err("要带上用例名")
+                return self._err("要带上用例编号")
             data = self._body()
             if data is None:
                 return self._err("请求体不是合法 JSON")
             text = str(data.get("raw_text") or "")
             if not text.strip():
-                return self._err("原始用例不能为空")
+                return self._err("原文不能为空")
+            if not st.get_case(key):
+                return self._err(f"没有这个用例：{key}", 404)
             try:
-                created = st.save_raw_case(key, text)
+                st.save_case_raw(key, text)
             except Exception as e:  # noqa: BLE001
                 return self._err(f"存不进去：{e}", 500)
-            rec = st.get_raw_case(key) or {}
-            return self._json({"ok": True, "case_name": key,
-                               "created": created,
+            rec = st.get_case(key) or {}
+            return self._json({"ok": True, "case_key": key,
                                "updated_at": rec.get("updated_at") or ""})
+
+        # 从文件夹重新同步原始 case（可指定 overwrite 覆盖已有原文）
+        if path == "/api/cases/import":
+            data = self._body() or {}
+            ow = bool(data.get("overwrite"))
+            try:
+                res = importer.import_all(overwrite=ow)
+            except Exception as e:  # noqa: BLE001
+                return self._err(f"导入失败：{e}", 500)
+            return self._json({"ok": True, **res})
 
         return self._err("没有这个接口", 404)
 
@@ -750,39 +841,57 @@ class Handler(BaseHTTPRequestHandler):
                                "skipped": ev["skipped"]})
 
 
-        # --- 删一条原始用例（单独删，保留 YAML）---
-        if path.startswith("/api/rawcase/"):
-            key = _case_key(path[len("/api/rawcase/"):])
-            n = st.delete_raw_case(key)
-            return self._json({"ok": True, "deleted": n, "case_name": key})
+        # --- 删一条用例（原始 case + 关联的 YAML，一起走）---
+        #
+        # ★ 用户要求的就是这个：case 和 YAML 关联起来，删除时"简单点"。
+        #   以前是"删 YAML"和"删原始 case"两个接口，删完一半还可能失败；
+        #   现在一条用例就是一行 + 一个文件，一次删干净。
+        #
+        # ★ 仍然**不连坐历史记录**（见 docstring）。
+        if path.startswith("/api/cases/"):
+            key = path[len("/api/cases/"):]
+            c = st.get_case(key)
+            if not c:
+                return self._err(f"没有这个用例：{key}", 404)
 
-        # --- 删用例（YAML 文件 + 原始需求）---
+            deleted_file = ""
+            yname = c.get("yaml_name") or ""
+            if yname and str(qs.get("yaml", ["1"])[0]) not in ("0", "false"):
+                fp = _find_case_file(yname)
+                if fp and fp.is_file():
+                    try:
+                        fp.unlink()
+                        deleted_file = fp.name
+                    except OSError as e:
+                        # ★ 文件删不掉就**不删库里的行**。
+                        #   反过来做的话，页面上用例没了、磁盘上文件还在，
+                        #   而库里再没有任何线索指向它 —— 成了孤儿文件。
+                        return self._err(
+                            f"YAML 删不掉（{e.strerror or e}），"
+                            "为免留下孤儿文件，这次没有删任何东西", 500)
+
+            n = st.delete_case(key)
+            # 历史记录保留。告诉前端还剩几条，免得以为删干净了。
+            # runs.case_name 存的是编号，直接用 key 查。
+            left = len(st.list_runs(case_name=str(key), limit=1000))
+            return self._json({"ok": True, "case_key": key,
+                               "deleted": n, "deleted_yaml": deleted_file,
+                               "runs_kept": left})
+
+        # --- 只删 YAML、保留用例行（拆掉关联）---
         if path.startswith("/api/case/"):
             name = path[len("/api/case/"):]
             fp = _find_case_file(name)
-            if not fp:
+            if not fp or not fp.is_file():
                 return self._err(f"没有这个用例文件：{name}", 404)
-            # 校验文件名没被编码绕过（_find_case_file 已经限定在 cases 目录内，
-            # 这里再确认一次它不是个目录、也不是软链出去的）
-            if not fp.is_file():
-                return self._err("不是文件", 400)
             try:
                 fp.unlink()
             except OSError as e:
                 return self._err(f"删不掉：{e.strerror or e}", 500)
-
-            key = _case_key(name)
-            raw_n = 0
-            if str(qs.get("raw", ["1"])[0]) not in ("0", "false"):
-                raw_n = st.delete_raw_case(key)
-
-            # 历史记录保留（见上面 docstring）。但要告诉前端还有几条，
-            # 免得用户以为删干净了。
-            left = len(st.list_runs(case_name=key, limit=1000))
-            return self._json({"ok": True, "case_name": key,
-                               "deleted_file": fp.name,
-                               "raw_deleted": raw_n,
-                               "runs_kept": left})
+            key = st.case_number(name)
+            st.set_case_yaml(key, None)
+            return self._json({"ok": True, "case_key": key,
+                               "deleted_yaml": fp.name})
 
         return self._err("没有这个接口", 404)
 
@@ -858,6 +967,24 @@ def main() -> int:
             "  echo '{\"case_name\":\"168\"}' | python run_case_json.py")
     else:
         say(f"  已有 {_n} 条运行记录")
+
+    # 用例库为空时自动从文件夹导一次。
+    #
+    # ★ 只在**空库**时导，不在每次启动时导：原文导入后归库管，
+    #   每次启动都扫一遍会把人改过的内容冲掉。
+    #   要重新同步走页面上的「从文件夹同步」或 POST /api/cases/import。
+    try:
+        if not st.list_cases():
+            _imp = importer.import_all()
+            say(f"用例库: 已从文件夹导入 {_imp['files']} 条"
+                f"（关联 YAML {_imp['linked']} 个）")
+            for _d in _imp["scanned_dirs"]:
+                say(f"  扫描: {_d}")
+        else:
+            say(f"用例库: 已有 {len(st.list_cases())} 条")
+    except Exception as exc:  # noqa: BLE001
+        # 导入失败不该让服务起不来 —— 页面上照样能看到运行记录。
+        say(f"  ⚠️ 用例导入失败：{exc}")
 
     url = f"http://{args.host}:{args.port}/"
 

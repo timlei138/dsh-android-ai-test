@@ -113,6 +113,27 @@ def cases_dir() -> Path:
     return assets_dir() / "storage" / "cases"
 
 
+#: 原始用例（用户手写、还没拆成 YAML 的 txt）默认所在的两处。
+#:
+#: 为什么放在仓库外面：那是**用户自己的资料目录**，不是本工具的产物。
+#: 工具只读它、导入一次，之后原文归数据库管（见 store.cases 表）。
+_DEFAULT_RAW_CASE_DIRS = (Path(r"D:\dsh\cal_cases"), Path(r"D:\dsh\cases"))
+
+
+def raw_case_dirs() -> list[Path]:
+    """原始用例的扫描目录。不存在的直接跳过，不报错。
+
+    ANDROID_RAW_CASE_DIRS 可以用 os.pathsep 分隔覆盖 —— 换机器、换目录时
+    不用改代码。没设就用约定的那两个。
+    """
+    env = os.environ.get("ANDROID_RAW_CASE_DIRS")
+    if env:
+        cand = [Path(p.strip()) for p in env.split(os.pathsep) if p.strip()]
+    else:
+        cand = list(_DEFAULT_RAW_CASE_DIRS)
+    return [p for p in cand if p.is_dir()]
+
+
 def knowledge_dir() -> Path:
     return assets_dir() / "knowledge"
 

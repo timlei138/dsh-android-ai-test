@@ -71,25 +71,55 @@ def _mkrun(name, shots=(), log=None):
 
 
 print("=" * 70)
-print("1) 原始 case：一个用例一份，存进库")
+print("1) 用例：原文和 YAML 绑在一行里")
 print("=" * 70)
 
-ck("没有时返回 None（不拿空串冒充有）",
-   st.get_raw_case("nope", db=db) is None)
-ck("首次写入返回 True",
-   st.save_raw_case("c1", "1. 打开日历\n2. 点更多→课程表\n预期：进入课程表页",
-                    db=db) is True)
-r = st.get_raw_case("c1", db=db) or {}
+ck("没有时返回 None（不拿空串冒充有）", st.get_case("999", db=db) is None)
+ck("首次写入是 created",
+   st.save_case("999", title="测试用例", priority="P1",
+                raw_text="1. 打开日历\n2. 点更多→课程表\n预期：进入课程表页",
+                source_path="D:/x/999_日历_999.txt", db=db) == "created")
+r = st.get_case("999", db=db) or {}
 ck("读回内容一致", "点更多" in r.get("raw_text", ""), f"{r}")
+ck("标题和优先级都存住了",
+   r.get("title") == "测试用例" and r.get("priority") == "P1", f"{r}")
+ck("来源路径留痕", "999_日历_999.txt" in (r.get("source_path") or ""), f"{r}")
 ck("带更新时间", bool(r.get("updated_at")), f"{r}")
-ck("再次写入是覆盖（返回 False，不新增行）",
-   st.save_raw_case("c1", "新内容", db=db) is False)
+
+ck("再写是 updated（不新增行）",
+   st.save_case("999", raw_text="新内容", db=db) == "updated")
 ck("★ 空文本不覆盖（手滑清空不该丢数据）",
-   st.save_raw_case("c1", "   ", db=db) is False
-   and "新内容" in (st.get_raw_case("c1", db=db) or {}).get("raw_text", ""))
-ck("删除返回 1", st.delete_raw_case("c1", db=db) == 1)
-ck("删完读不到", st.get_raw_case("c1", db=db) is None)
-ck("再删返回 0", st.delete_raw_case("c1", db=db) == 0)
+   st.save_case("999", raw_text="   ", db=db) == "skipped"
+   and "新内容" in (st.get_case("999", db=db) or {}).get("raw_text", ""))
+
+# ★ 关联 YAML
+ck("★ 关联 YAML 返回 1",
+   st.set_case_yaml("999", "联想日历_999_某某.yaml", db=db) == 1)
+ck("★★ 关联后能读出来",
+   (st.get_case("999", db=db) or {}).get("yaml_name") == "联想日历_999_某某.yaml")
+ck("★ 改原文不会把关联冲掉（两件事分开写）",
+   st.save_case_raw("999", "又改了", db=db) is True
+   and (st.get_case("999", db=db) or {}).get("yaml_name") == "联想日历_999_某某.yaml")
+ck("解除关联", st.set_case_yaml("999", None, db=db) == 1
+   and not (st.get_case("999", db=db) or {}).get("yaml_name"))
+
+ck("空文本改原文返回 False", st.save_case_raw("999", "  ", db=db) is False)
+ck("删除返回 1", st.delete_case("999", db=db) == 1)
+ck("删完读不到", st.get_case("999", db=db) is None)
+ck("再删返回 0", st.delete_case("999", db=db) == 0)
+
+print()
+print("=" * 70)
+print("1b) 编号解析：取最后一个数字段")
+print("=" * 70)
+ck("★★ '13_日历_167.txt' 取 167 而不是 13（排序前缀不能当编号）",
+   st.case_number("13_日历_167.txt") == "167", st.case_number("13_日历_167.txt"))
+ck("'03_日历_03.txt' -> 03", st.case_number("03_日历_03.txt") == "03")
+ck("YAML 名取编号",
+   st.case_number("联想日历_167_首次进入课程表引导与空态.yaml") == "167",
+   st.case_number("联想日历_167_首次进入课程表引导与空态.yaml"))
+ck("纯数字名也能解析", st.case_number("167") == "167")
+ck("没有数字返回空串（不瞎猜）", st.case_number("nope.yaml") == "")
 
 print()
 print("=" * 70)
@@ -170,13 +200,12 @@ print("=" * 70)
 print("4) ★★ 删用例不连坐历史（这条最容易做错）")
 print("=" * 70)
 
-# 直接验两个函数的语义边界：delete_raw_case 只碰 raw_cases，
-# delete_run 只碰 runs 三张表。删用例的 HTTP 层只是调它们 + unlink 文件。
+# 直接验语义边界：delete_case 只碰 cases 表，delete_run 只碰 runs 三张表。
+# 删用例的 HTTP 层只是调它们 + unlink 文件。
 rid3 = _mkrun("casedel")
-st.save_raw_case("casedel", "原始需求原文", db=None)  # 真库，验完会清
-ck("删 raw case 只删原文",
-   st.delete_raw_case("casedel") == 1
-   and st.get_raw_case("casedel") is None)
+st.save_case("555", raw_text="原始需求原文", db=db)
+ck("删用例只删那一行",
+   st.delete_case("555", db=db) == 1 and st.get_case("555", db=db) is None)
 ck("★★ 记录还在（删用例不连坐）", st.get_run(rid3, db=db) is not None)
 st.delete_run(rid3, db=db)
 
@@ -439,21 +468,29 @@ app = (ROOT / "webui" / "app.js").read_text(encoding="utf-8")
 
 ck("后端有 do_DELETE", "def do_DELETE" in src)
 ck("★ 删记录接口", 'path.startswith("/api/run/")' in src)
-ck("★ 删用例接口", 'path.startswith("/api/case/")' in src)
-ck("★ 删原始 case 接口", 'path.startswith("/api/rawcase/")' in src)
-ck("原始 case 有写入口（只能人录）", "def do_POST" in src
-   and "save_raw_case" in src)
-ck("用例列表标了 has_raw", '"has_raw"' in src)
+ck("★★ 删用例接口（原文 + YAML 一起，用户要的那种简单）",
+   'path.startswith("/api/cases/")' in src and "st.delete_case(key)" in src)
+ck("★ 删 YAML 失败时不删库里的行（免得留孤儿文件）",
+   "为免留下孤儿文件" in src)
+ck("★ 改原文接口", 'path.endswith("/raw")' in src and "save_case_raw" in src)
+ck("★ 从文件夹同步接口", '"/api/cases/import"' in src)
+ck("用例列表带关联 YAML 状态", '"yaml_exists"' in src)
+ck("用例列表带跑过几次", '"last_status"' in src)
+# ⚠️ runs.case_name 存的是编号，不是 YAML 名。拿 stem 去对必然空，且不报错。
+ck("★★ 统计按编号对（runs.case_name 存的是编号）",
+   '_run_stats_by_case' in src and 'by_case.get(str(c["case_key"])' in src,
+   "拿 YAML stem 去对会整列显示未跑过")
 
 ck("前端有删记录确认框", "function confirmDeleteRun" in app)
-ck("前端有删用例确认框", "function confirmDeleteCase" in app)
+ck("前端有删用例确认框", "async function confirmDeleteCase" in app)
 ck("★ 删记录的勾选框默认勾上（否则截图永远清不掉）",
    'id="del-ev" checked' in app)
-ck("★ 用例库行上有删除按钮", "data-del=" in app)
+ck("★ 用例库行上有删除按钮", "data-delcase=" in app)
 ck("★ 记录列表行上有删除按钮", "data-delrun=" in app)
 ck("详情页也有删除按钮", 'id="run-del"' in app)
-ck("用例详情页展示原始 case", "/api/rawcase/" in app)
-ck("没录原文时明确说没有（不拿 YAML 顶替）", "还没录原始 case" in app)
+ck("用例详情页展示原始 case", "d.raw_text" in app)
+ck("★ 用例详情页同时展示关联的 YAML", "d.yaml" in app and "y.content" in app)
+ck("没 YAML 时明确说还没拆解", "还没拆解成 YAML" in app)
 
 print()
 print("=" * 70)
@@ -461,9 +498,11 @@ print("11) 顺手修的两个前端 bug")
 print("=" * 70)
 
 # bug 1：用例库的"最近结论/跑过"两列永远是空的
-ck("★ 用例库按 case_name 对 stats（不是 case_id）",
-   "byName[stem]" in app and "byId[c.case_id]" not in app,
-   "之前建索引用 case_name、查却用 case_id，两列永远空且不报错")
+#   第一次是"建索引一个键、查另一个键"；现在改成后端算好、前端直接用，
+#   前端不再自己建索引，这一类错就没地方藏了。
+ck("★ 用例库直接用后端算好的 runs/last_status（前端不再自建索引）",
+   "c.runs" in app and "c.last_status" in app and "byId[c.case_id]" not in app,
+   "之前建索引用一种键、查用另一种，两列永远空且不报错")
 
 # bug 2：表格行里的按钮会把点击冒泡成"打开这一行"
 ck("★ 表格行按钮不再触发打开行",
