@@ -227,6 +227,10 @@ a:hover{text-decoration:underline}
 .tag{font-size:11.5px; padding:1px 8px; border-radius:999px; font-weight:600}
 .tag.ok{background:var(--pass-bg); color:var(--pass)}
 .tag.warn{background:var(--block-bg); color:var(--block)}
+/* 用例已被删掉、但这条记录还在。灰一点 —— 它不是错误，只是说明来源没了。 */
+.tag.gone{background:#eef1f5; color:#64748b}
+/* 删除确认框里"这些不受影响"那一行，用绿色把它和"将被删除"分开 */
+.noimpact{color:var(--pass)}
 .ghost-link{color:var(--accent); cursor:pointer; text-decoration:none}
 .ghost-link:hover{text-decoration:underline}
 .hint.warn{background:var(--block-bg); border-color:#f2d9a8; color:#7a4b00}

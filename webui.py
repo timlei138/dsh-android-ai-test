@@ -551,7 +551,14 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._err("run_id 不是数字")
             run = st.get_run(rid)
-            return self._json(run) if run else self._err("没有这次运行", 404)
+            if not run:
+                return self._err("没有这次运行", 404)
+            # ★ 用例可能已经被删掉了（用户允许"删用例但保留记录"）。
+            #   记录本身完全自足 —— 判据在 case_yaml 快照里、证据在磁盘上，
+            #   都不依赖用例还活着。但页面上那个"看当前版本"的链接会变成死链，
+            #   所以先把"还在不在"告诉前端，让它决定是给链接还是给一句话。
+            run["case_exists"] = st.get_case(str(run.get("case_name") or "")) is not None
+            return self._json(run)
 
         if path == "/api/compare":
             try:
@@ -847,12 +854,27 @@ class Handler(BaseHTTPRequestHandler):
         #   以前是"删 YAML"和"删原始 case"两个接口，删完一半还可能失败；
         #   现在一条用例就是一行 + 一个文件，一次删干净。
         #
-        # ★ 仍然**不连坐历史记录**（见 docstring）。
+        # ★★★ 用户后来补了一条硬要求，这个接口必须守住 ★★★
+        #   「删除 case 的时候要确保已经跑过的记录没有影响」
+        #
+        #   所以这里只做两件事：删 cases 那一行、unlink 那个 YAML 文件。
+        #   **绝不**碰 runs / actions / findings，也**绝不**碰任何证据文件
+        #   （log / clicks.jsonl / 截图 / dump.xml）。
+        #
+        #   记录为什么能不受影响 —— 它本来就不依赖这个用例：
+        #     · 判据：跑的时候已经把 YAML 全文快照进 runs.case_yaml
+        #     · 证据：路径存在 runs/actions 里，文件在 tmp/ 下，与用例无关
+        #   下面 runs_kept 报的是"这些记录一条没动"，不是"我帮你保住了"。
         if path.startswith("/api/cases/"):
             key = path[len("/api/cases/"):]
             c = st.get_case(key)
             if not c:
                 return self._err(f"没有这个用例：{key}", 404)
+
+            # 删之前先把受影响的记录数记下来。删完再数就是 0 了 ——
+            # 那等于"事后编一个数字"，没法用它证明记录没被动过。
+            runs_before = st.list_runs(case_name=str(key), limit=1000)
+            ids_before = [r["run_id"] for r in runs_before]
 
             deleted_file = ""
             yname = c.get("yaml_name") or ""
@@ -871,12 +893,22 @@ class Handler(BaseHTTPRequestHandler):
                             "为免留下孤儿文件，这次没有删任何东西", 500)
 
             n = st.delete_case(key)
-            # 历史记录保留。告诉前端还剩几条，免得以为删干净了。
-            # runs.case_name 存的是编号，直接用 key 查。
-            left = len(st.list_runs(case_name=str(key), limit=1000))
-            return self._json({"ok": True, "case_key": key,
-                               "deleted": n, "deleted_yaml": deleted_file,
-                               "runs_kept": left})
+
+            # ★ 自检：删完之后把同样的记录再查一遍，逐条核对还在、内容没变。
+            #   这不是"相信 delete_case 只删了一张表"——是**验**它只删了一张表。
+            #   万一哪天有人在 store.delete_case 里加了级联，这里会当场发现。
+            after = {r["run_id"]: r for r in st.list_runs(case_name=str(key), limit=1000)}
+            lost = [i for i in ids_before if i not in after]
+            changed = [i for i in ids_before
+                       if i in after and after[i].get("status") != next(
+                           r.get("status") for r in runs_before if r["run_id"] == i)]
+            return self._json({
+                "ok": True, "case_key": key,
+                "deleted": n, "deleted_yaml": deleted_file,
+                "runs_kept": len(ids_before),
+                "runs_lost": lost,
+                "runs_changed": changed,
+            })
 
         # --- 只删 YAML、保留用例行（拆掉关联）---
         if path.startswith("/api/case/"):

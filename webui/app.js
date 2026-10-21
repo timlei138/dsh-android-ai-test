@@ -407,6 +407,7 @@ async function confirmDeleteCase(key) {
   catch (e) { toast('读不到这条用例：' + e.message); return; }
 
   const hasYaml = d.yaml && d.yaml.exists;
+  const nRuns = (d.runs || []).length;
   const m = modal('删除用例', `
     <div class="warn-text">确定删除用例 <b>${esc(key)}</b>
       ${d.title ? '「' + esc(d.title) + '」' : ''} 吗？</div>
@@ -415,11 +416,17 @@ async function confirmDeleteCase(key) {
       ${hasYaml ? `· 关联的 YAML <span class="mono">${esc(d.yaml.name)}</span><br>`
     : '<span style="color:var(--dim)">· 这条还没有 YAML，无需删文件</span><br>'}
       <br>
-      <b>历史测试记录会保留</b>${d.runs && d.runs.length
-    ? `（这条用例还有 ${d.runs.length} 条记录）` : ''} ——
-      记录里存着跑的时候那份 YAML 快照，删了用例仍然能复核当时的判据。
-      需要清理记录请到「测试记录」里逐条删。<br>
-      <b class="danger-text">文件和原文都不可恢复。</b></div>`,
+      <b class="noimpact">${nRuns
+    ? `${nRuns} 条已跑过的记录完全不受影响`
+    : '这条用例还没跑过，没有记录会受影响'}</b>
+      ${nRuns ? `<br>
+      · 记录本身、断言结果、动作账本 —— 一条不删<br>
+      · 日志 / 点击账本 / 截图 / dump.xml —— 一个文件不动<br>
+      · 每条记录里存着<b>跑的时候那份 YAML 快照</b>，判据仍然可复核<br>
+      <span style="color:var(--dim)">删完打开这些记录，看到的内容和现在一模一样。</span>` : ''}
+      <br>
+      <span style="color:var(--dim)">要清理这些记录，请到「测试记录」里逐条删（那会问你要不要连截图一起删）。</span><br>
+      <b class="danger-text">用例原文和 YAML 文件不可恢复。</b></div>`,
     `<button class="ghost" data-cancel>取消</button>
      <button class="danger solid" data-ok>确认删除</button>`);
   m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
@@ -431,9 +438,16 @@ async function confirmDeleteCase(key) {
       const r = await api('/api/cases/' + encodeURIComponent(key),
         { method: 'DELETE' });
       m.close();
-      toast(`已删除用例 ${key}`
-        + (r.deleted_yaml ? `，含 YAML 文件` : '')
-        + (r.runs_kept ? `；保留了 ${r.runs_kept} 条历史记录` : ''));
+      // ★ 后端会回一个自检结果：删完之后记录还在不在、内容有没有变。
+      //   真有记录丢了，绝不能还用"已删除"这种轻描淡写的话盖过去。
+      if ((r.runs_lost || []).length || (r.runs_changed || []).length) {
+        toast(`⚠️ 用例已删，但记录自检异常：丢失 ${(r.runs_lost || []).length} 条、`
+          + `内容变化 ${(r.runs_changed || []).length} 条 —— 请立刻检查！`);
+      } else {
+        toast(`已删除用例 ${key}`
+          + (r.deleted_yaml ? '，含 YAML 文件' : '')
+          + (r.runs_kept ? `；${r.runs_kept} 条历史记录不受影响` : ''));
+      }
       // 删完回列表。用 replace 不记历史 —— 那条用例已经不在了，
       // 退回它的详情页只会 404。
       go('cases', {}, { replace: true });
@@ -698,11 +712,17 @@ function caseInfoHtml(run) {
   // 跳到这条用例的详情页。用例现在按**编号**索引（run.case_name 存的就是编号），
   // 不是按 YAML 文件名 —— 用文件名跳过去会 404。
   const caseKey = run.case_name || '';
+  // ★ 用例可能已经被删了（用户允许"删用例、留记录"）。
+  //   这时**不能**给"看当前版本"的链接 —— 点了会 404，看起来像页面坏了。
+  //   判据本来就在上面的快照里，记录是自足的，所以这里只需要说清楚。
+  const caseGone = run.case_exists === false;
   const head = `<div class="casebar">
       ${fname ? `<span class="mono">${esc(fname)}</span>` : ''}
       ${pkg ? `<span class="mono dim">${esc(pkg)}</span>` : ''}
       ${snap ? '<span class="tag ok">跑的时候那份</span>' : ''}
-      ${caseKey ? `<a class="ghost-link" data-casekey="${esc(caseKey)}">看这条用例当前版本</a>` : ''}
+      ${caseGone
+    ? '<span class="tag gone" title="用例已删除，但这条记录和它的判据快照都还在">用例已删除</span>'
+    : caseKey ? `<a class="ghost-link" data-casekey="${esc(caseKey)}">看这条用例当前版本</a>` : ''}
       <span style="flex:1"></span>
       ${snap ? `<span class="muted">${lines.length} 行</span>` : ''}
     </div>`;
@@ -711,8 +731,9 @@ function caseInfoHtml(run) {
     return `<h2>原始用例</h2>
       ${head}
       <div class="hint warn">⚠️ 这次运行早于"记录用例快照"功能，库里有文件名但没有内容。<br>
-        为了不把<b>现在</b>的判据当<b>当时</b>的判据，这里不显示内容；
-        点上面的链接可以去用例库看当前版本。</div>`;
+        为了不把<b>现在</b>的判据当<b>当时</b>的判据，这里不显示内容；${caseGone
+    ? '用例也已经删除，当前版本无处可看。'
+    : '点上面的链接可以去用例库看当前版本。'}</div>`;
   }
 
   return `<h2>原始用例</h2>
