@@ -355,6 +355,51 @@ def parse_clickable(xml_path: str | Path, *, fg_package: str = "") -> tuple[list
     return out, rotation
 
 
+def _xml_text_all(xml_path: str | None, limit: int = 400) -> str:
+    """把一屏 XML 里**所有**文字（text / content-desc）去重后拼成一段。
+
+    和 `parse_clickable` 的分工：那个给"能点什么"（导航用），
+    这个给"屏幕上写着什么"（**断言/证据用**）。
+
+    ## 为什么要有这个
+
+    `summarize_xml` 的默认 nav 模式只留 clickable / scrollable 节点，
+    不可点的文字全部丢掉。而断言最常验的恰恰是这类文字：
+
+        弹框标题「日历需要使用以下权限」   -> rid=alertTitle，不可点
+        分组小标题「必要权限」「可选权限」 -> 纯 TextView，不可点
+
+    真机实测（用例 03）：这些文字一直**在屏幕上**，执行器也是照着它们
+    把「同意」点掉的，可断言时证据池里没有，于是判成"没出现过" —— FAIL。
+    屏幕上明明写着却说不在，是最伤人的一类假失败。
+
+    ## 为什么不直接给 LLM 看全量
+
+    每屏几十上百个节点全塞进 prompt 纯浪费（实测一屏 XML 6826 字符）。
+    这里只提文字、只进证据池，不参与 prompt。
+
+    limit 是保命用的上限：个别页面（日历月视图）文字节点上百条，
+    全拼进去会让证据池膨胀得没边。400 条足够判任何一条断言。
+    """
+    if not xml_path:
+        return ""
+    try:
+        raw = Path(xml_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'(?:text|content-desc)="([^"]+)"', raw):
+        v = m.group(1).strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        parts.append(v)
+        if len(parts) >= limit:
+            break
+    return "\n".join(parts)
+
+
 class DirectDevice:
     """直接操作设备：全程 in-process。
 
@@ -1035,6 +1080,25 @@ class DirectDevice:
         scr = self.observe()
         return {"ok": True, "activity": scr.activity, "package": scr.package,
                 "next": scr.clickable,
+                # ★ 整屏文字（含**不可点**的标签）单独给一份。
+                #
+                #   为什么必须给：`next` / summarize_xml 的默认 nav 模式
+                #   只保留 clickable / scrollable 节点 —— 而断言最常看的
+                #   恰恰是不可点的文字（弹框标题、分组小标题、提示语）。
+                #   common.summarize_xml 的文档自己就写着：
+                #     「mode=full …断言"页面上出现了什么文字"时必须用这个，
+                #       否则会漏判（nav 不含不可点的文本节点）」
+                #
+                #   真机实测（用例 03，run#30~#32）：首次启动的权限说明框，
+                #   标题 alertTitle=「日历需要使用以下权限」、分组「必要权限」
+                #   「可选权限」全是不可点 TextView，于是断言全报"没出现"，
+                #   判成 FAIL —— 可弹框明明在屏幕上，执行器还照着它的内容点了
+                #   「同意」。这种假失败会让人去修一个没坏的东西。
+                #
+                #   为什么不干脆把 observe 改成 mode="full"：那会把每屏几十个
+                #   布局节点塞进 LLM 上下文（每轮都带，实测一屏 6826 字符）。
+                #   这里只把**文字**提出来喂证据池，不参与 prompt，两头都要。
+                "screen_text": _xml_text_all(scr.xml_path),
                 "evidence": {"png": scr.shot_path, "xml": scr.xml_path},
                 "rotation": scr.rotation}
 

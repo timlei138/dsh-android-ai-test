@@ -1554,6 +1554,28 @@ def _screen_text(out: dict[str, Any]) -> str:
     for n in (out.get("next") or []):
         for k in ("t", "text", "d", "desc", "label"):
             _add(n.get(k))
+    # ★★ 语义节点里的文字也要收 —— 这是"当屏所有文案"的主体。
+    #
+    #   `next` 只有**可点项**。而断言最常看的恰恰是不可点的文字：
+    #   弹框标题、分组小标题、提示语。漏掉它们，`text=` 判据就会
+    #   把"明明写在屏幕上"判成"没出现"。
+    #
+    #   真机实测（用例 03，run#30/#31）：清数据后首次启动的权限说明框，
+    #   标题「日历需要使用以下权限」在 alertTitle 上，「必要权限」「可选权限」
+    #   是分组标题 —— 全是不可点 TextView。于是：
+    #       a2（按钮 button1/button2，走 seen_rids）PASS
+    #       a1/a3/a4（文案，走 seen_screens）FAIL —— 报"没见过该控件"
+    #   可执行器明明看见了整个弹框，还把它的内容当理由点掉了。
+    #   这种**假失败**比漏判更糟：会让人去改一个根本没坏的东西。
+    #
+    #   工具层一直有 `nodes`（summarize_xml 压过的语义节点，含不可点文字），
+    #   这里直接用上。`_brief_nodes` 的注释也写着"保留有文字的节点"，
+    #   等于两边本来就约定好了，只是这里没接上。
+    for n in (out.get("nodes") or []):
+        if not isinstance(n, dict):
+            continue
+        for k in ("t", "text", "d", "desc", "label"):
+            _add(n.get(k))
     # 工具层若直接给了整屏文案，直接用
     for k in ("nodes_text", "text", "all_text", "screen_text"):
         v = out.get(k)
@@ -2258,9 +2280,31 @@ def act_node(state: ChildState) -> dict[str, Any]:
         # act 后设备会重新观察并落盘，新的 XML 路径在这里
         "obs_xml_path": getattr(res, "xml_path", "") or state.get("obs_xml_path", ""),
         "obs_fresh": bool(res.next),          # 画面是否来自 act 返回
-        "seen_rids": _seen_rids(res.next),
-        "seen_texts": _seen_texts(res.next),
-        "seen_screens": [_screen_text({"next": res.next})],
+        # ★★★ 证据池要同时收「动作前」和「动作后」两屏 ★★★
+        #
+        #   原来只收 res.next（动作**之后**那一屏）。于是"点之前屏幕上有什么"
+        #   从来没被留档 —— 而这个系统恰恰是靠"过程中出现过"来判断言的。
+        #
+        #   真机实测（用例 03，run#30）踩得很清楚：清数据后首次启动弹出的
+        #   「日历需要使用以下权限」说明框，执行器明明看见了（看得见按钮，
+        #   才点得中 button1），可它是在动作**之前**那一屏上；点完框就没了，
+        #   res.next 里当然没有它。末尾判 a1~a4 时全是"没见过该控件/没出现该文案"
+        #   —— 结论判成 FAIL，但产品行为其实完全正确（弹框文案、5 个权限申请
+        #   都对得上）。**假失败**比漏判更糟：它会让人去修一个不存在的问题。
+        #
+        #   动作前的画面就在 state 里（决策就是基于它做的），直接用：
+        #     · obs_clickable    —— 可点项，补 seen_rids / seen_texts
+        #     · obs_nodes_text   —— 整屏文字（含不可点标签），补 seen_screens
+        #       「必要权限」「可选权限」这类分组标题是不可点的 TextView，
+        #       只会出现在整屏文字里，收 obs_clickable 是收不到的。
+        #
+        #   这几个字段都是 operator.add 累加，返回两个列表就是拼接，不会覆盖。
+        "seen_rids": (_seen_rids(state.get("obs_clickable"))
+                      + _seen_rids(res.next)),
+        "seen_texts": (_seen_texts(state.get("obs_clickable"))
+                       + _seen_texts(res.next)),
+        "seen_screens": [s for s in (state.get("obs_nodes_text"),
+                                     _screen_text({"next": res.next})) if s],
         "round_in_step": state.get("round_in_step", 0) + 1,
         "visited": [f"{state.get('last_activity')} -> {res.activity}"],
         # 轨迹：记下这一步实际点了哪个控件 —— 回写 YAML 用。
@@ -3652,14 +3696,19 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
                                 got = str(n.get("t") or n.get("text") or "")
                                 break
                     if not got:
-                        # 控件压根没带文案：只能靠整屏文案兜底
+                        # 控件压根没带文案（或没进可点列表）：只能靠整屏文案兜底。
+                        # ★ 这里必须把"兜底命中"和"真没出现"分开写。
+                        #   原来两种情况都记「没见过该控件」，于是会出现
+                        #   `text ✔ alertTitle=…（没见过该控件）` 这种自相矛盾的
+                        #   备注 —— 判是过了，但排查的人会以为证据缺失。
                         ok = _text_seen(want)
+                        how = ("（控件没进可点列表，整屏文案里出现过）" if ok
+                               else "（整屏文案里也没有）")
                     else:
                         ok = got == want
+                        how = f"（实际「{got}」）"
                     results.append(ok)
-                    notes.append(
-                        f"text {'✔' if ok else '✘'} {rid}={want}"
-                        + (f"（实际「{got}」）" if got else "（没见过该控件）"))
+                    notes.append(f"text {'✔' if ok else '✘'} {rid}={want}{how}")
                 else:
                     ok = _text_seen(want)
                     results.append(ok)
