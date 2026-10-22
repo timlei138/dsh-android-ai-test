@@ -21,6 +21,7 @@ YAML 的形状（比 CaseSpec 丰富得多，这里做一次转换）：
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -597,6 +598,85 @@ def purge_stale_case_yaml(p: Path, raw: Any, *, keep: bool = False) -> list[str]
     return [f"{p.name} 含旧机制（{reasons}）已删除，将按首次执行重新生成"]
 
 
+def load_case_json(p: Path) -> tuple[Any, list[str]]:
+    """读 JSON 用例（我们的新格式）。返回 (CaseSpec, warnings)。
+
+    ## 为什么单独一条路
+
+    用户：「你自己调整。不用管YAML之前的格式。我们要的是一个高效的。有用的JSON格式。」
+
+    YAML 那条路上挂着一堆历史包袱（旧机制清理、未知字段白名单、
+    locate_seq 残留……）。JSON 是我们自己产出的，结构确定，
+    直接按字段取就行 —— **不猜、不兜底、不静默忽略**。
+
+    ## 和 YAML 的两处关键差别
+
+    ① `asserts[].step` 是**必填**。断言绑不到步骤，判定时就取不到
+       该步的证据快照，只能拿最后一屏硬判 —— 那是错的源头。
+       所以这里缺了就记 warning，明确告诉调用方"这条验不了"。
+
+    ② `asserts[].verify_action` / `pitfalls` 会被读进来并透传 ——
+       它们正是上一轮跑出来的经验（怎么看见的、踩过什么坑），
+       下次跑直接照做，这就是"高质量 JSON 对重跑有意义"的落地。
+    """
+    from ..agent.nodes import AssertSpec, Precondition, StepSpec
+    from ..agent.runner import CaseSpec
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    warns: list[str] = []
+
+    case_id = str(raw.get("case_id") or p.stem)
+    title = str(raw.get("title") or p.stem)
+    package = str(raw.get("package") or "")
+    if not package:
+        warns.append("package 缺失 —— 无法判定被测 App，强证据会全部失效")
+
+    steps: list[StepSpec] = []
+    for i, s in enumerate(raw.get("steps") or [], 1):
+        sid = str(s.get("id") or f"s{i}")
+        steps.append(StepSpec(
+            id=sid,
+            desc=str(s.get("desc") or s.get("do") or ""),
+            landing=s.get("landing"),
+            pitfalls=list(s.get("pitfalls") or []),
+            locate=s.get("locate") or s.get("target"),
+        ))
+
+    asserts: list[AssertSpec] = []
+    for i, a in enumerate(raw.get("asserts") or [], 1):
+        aid = str(a.get("id") or f"a{i}")
+        st = str(a.get("step") or "").strip()
+        if not st:
+            warns.append(f"{aid} 没有 step —— 判定时取不到该步证据，只能拿最后一屏")
+        item = AssertSpec(
+            id=aid,
+            desc=str(a.get("desc") or ""),
+            check=a.get("check") or a.get("expect") or "",
+            step=st,
+        )
+        # ★ 上一轮跑出来的经验，原样带进执行
+        for k in ("verify_action", "pitfalls", "knowledge", "result"):
+            if a.get(k):
+                setattr(item, k, a[k])
+        asserts.append(item)
+
+    preconds: list[Precondition] = []
+    for pc in raw.get("preconditions") or []:
+        preconds.append(Precondition(**pc))
+
+    spec = CaseSpec(
+        case_id=case_id, title=title, package=package,
+        steps=steps, asserts=asserts, preconditions=preconds,
+        knowledge_files=list(raw.get("knowledge_files") or []),
+        start_assert=raw.get("start_assert"),
+        perm_action=raw.get("perm_action"), perm_name=raw.get("perm_name"),
+        per_step_pitfalls=bool(raw.get("per_step_pitfalls", True)),
+        case_confidence=dict(raw.get("case_confidence") or {}),
+        engine=str(raw.get("engine") or "langgraph"),
+    )
+    return spec, warns
+
+
 def load_case(path: str | Path, *, keep_stale: bool = True) -> tuple[Any, list[str]]:
     """读一个 YAML 用例。返回 (CaseSpec, warnings)。
 
@@ -615,6 +695,15 @@ def load_case(path: str | Path, *, keep_stale: bool = True) -> tuple[Any, list[s
     from ..agent.runner import CaseSpec
 
     p = Path(path)
+    # ★ JSON 用例（用户定的新格式，替代 YAML）
+    #
+    # 「你自己调整。不用管YAML之前的格式。我们要的是一个高效的。有用的JSON格式。」
+    #
+    # 走单独一条路，不套 YAML 那套（旧机制清理 / 未知字段白名单都是给
+    # YAML 历史包袱准备的，JSON 是我们自己造的，结构本来就确定）。
+    if p.suffix.lower() == ".json":
+        return load_case_json(p)
+
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
     # ★ 含旧机制（坐标 / locate_seq）的用例 YAML —— 删掉，当首次执行。
@@ -804,9 +893,11 @@ def find_case(name: str) -> Path | None:
     d = cases_dir()
     if not d.is_dir():
         return None
-    for f in sorted(d.glob("*.yaml")):
-        if name in f.stem:
-            return f
+    # ★ 先找 JSON（我们的新格式），没有再退回 YAML（历史遗留）
+    for pat in ("*.json", "*.yaml"):
+        for f in sorted(d.glob(pat)):
+            if name in f.stem:
+                return f
     return None
 
 

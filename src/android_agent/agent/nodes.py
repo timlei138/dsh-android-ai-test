@@ -428,6 +428,9 @@ class ChildState(TypedDict, total=False):
     # 执行器在**重判落定之后**点它一下，把界面退回原来的样子，
     # 后面的断言才不会拿到错屏。空字符串 = 不用关。
     assert_fix_close: NotRequired[str]
+    # ★ 每条断言「这次是怎么看见的」——回写 JSON 用（用户要的三样之一）。
+    #   a13 记成「点开课程背景色看重板→数色块→关回去」，下次直接照做。
+    verify_actions: NotRequired[Annotated[list[dict[str, Any]], operator.add]]
 
     # ★ 目标查找的有界重试（用户要求）。
     #
@@ -597,6 +600,11 @@ class ChildState(TypedDict, total=False):
     start_mismatch: str | None           # 起点不符说明（有值则先纠正起点）
     start_fix_rounds: int                # 纠正起点的尝试轮次（防死循环）
     knowledge_asked: list[str]           # 已检索过的关键词（防同一词反复查）
+    # ★ 这一轮**真正查到的知识**（用户要求写回 JSON 的三样之一）：
+    #   「或者知识卡查询到的知识」
+    # 早先查到就塞进 action["knowledge"] 用一次，下一轮就被覆盖 ——
+    # 跑完想不起来当时查到了什么，回写时无从下手。这里单独攒一份。
+    knowledge_used: Annotated[list[dict[str, Any]], operator.add]
 
     # 累积结论（短记录，operator.add）
     findings: Annotated[list[dict[str, Any]], operator.add]
@@ -616,6 +624,10 @@ class ChildState(TypedDict, total=False):
     status: str
     summary: str
     session_id: int
+    # ★ 这一轮回写出来的用例（在 finish 之前由 learn 节点产出）。
+    #   用户：「要回写 JSON。高质量的 JSON 对重新跑有意义」
+    learned: NotRequired[dict[str, Any]]
+    learned_path: NotRequired[str]
 
     # ★ 非空 = 整条用例立即终止（不再跑后续步骤）。
     #
@@ -2959,9 +2971,13 @@ def knowledge_node(state: ChildState) -> dict[str, Any]:
         hit = knowledge_mod.search(_ctx().skill_root, files, kw, limit=40)
 
     asked.append(kw)
-    # 清掉 need_knowledge，防止再次路由回本节点
+    # ★ 把「查了什么、查到什么」单独攒一份，供最后回写 JSON 用
+    #   （用户要求的三样之一：「或者知识卡查询到的知识」）。
+    #   只留前 1200 字：回写要的是"下次能用上的结论"，不是整篇原文。
     return {"action": {**action, "need_knowledge": "", "knowledge": hit},
-            "knowledge_asked": asked}
+            "knowledge_asked": asked,
+            "knowledge_used": [{"keyword": kw,
+                                "content": str(hit or "")[:1200]}]}
 
 
 def vision_node(state: ChildState) -> dict[str, Any]:
@@ -4619,6 +4635,14 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
             "assert_fix_note": str(_na.get("why_insufficient") or ""),
             # 模型说点开之后怎么关回去（下一轮重判落定后点它）
             "assert_fix_close": str(_na.get("close_with") or "").strip(),
+            # 记一笔"这次为了看见它做了什么"，最后回写进 JSON
+            "verify_actions": [{
+                "assert_id": a["id"],
+                "verify_target": str(_na.get("verify_target") or a["desc"]),
+                "why_insufficient": str(_na.get("why_insufficient") or ""),
+                "open": _pick.get("sig") or "",
+                "close": str(_na.get("close_with") or "").strip(),
+            }],
             # ★ 交给执行器的"任务卡"：要验什么、缺什么、该找什么元素
             "assert_fix_task": {
                 "assert_id": a["id"],
@@ -4819,6 +4843,152 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
         # 留给下一条断言用的"AI 最后意见"，换条时清掉。
         "assert_ai_last": actual if v.get("ai_recheck") else "",
     }
+
+
+def build_learned_case(state: ChildState) -> dict[str, Any]:
+    """把这一轮的实际情况**回写成一份更好的用例 JSON**（用户的要求）。
+
+    用户原话：
+      「要回写 JSON。高质量的 JSON 对重新跑有意义」
+      「实际步骤。坑的步骤就不要了。但总结成为了验证这个点或者走到验证这一步
+        碰到的坑。或者知识卡查询到的知识。」
+      「最后生成 JSON 的时候可以把无用的步骤剔除。如果有坑归纳到这一步的坑里。
+        这样才能稳定吧」
+
+    ## 产出什么
+    一份和输入同构、但**带着答案**的用例：
+      · steps   —— 只留**真正走通**的步骤；没走通/没必要的剔掉
+      · asserts —— 每条挂上
+          verify_action  这次是怎么看见它的（"点开课程背景色再返回"）
+          pitfalls       走/验这个点时踩的坑（下次直接避开）
+          knowledge      查到的知识（下次不用再查）
+
+    ## 为什么不用模型来写
+    这些都是**已经发生过的事实**，代码全都有（action_trace / findings /
+    issues / knowledge_used）。让模型再复述一遍只会引入编造 ——
+    用户反复强调过「不要自动聪明」。所以这里只做**归纳**，不做生成。
+
+    ## 什么算"无用的步骤"
+    判据只有一条：**这一步没有任何证据表明它推进过**。
+    （状态 give_up、或从头到尾没有一次成功的动作。）
+    注意它和"这一屏验证失败"是两回事：验证失败是产品的结论，
+    步骤本身是有效的，必须留着 —— 剔掉会让下次重跑漏掉这一段。
+    """
+    task = state.get("task") or {}
+    findings = state.get("findings") or []
+    issues = [str(i) for i in (state.get("issues") or [])]
+    trace = state.get("action_trace") or []
+
+    # --- 每条断言的实际结果 ---
+    res_of: dict[str, dict[str, Any]] = {}
+    for f in findings:
+        if f.get("kind") == "assert":
+            res_of[str(f.get("id"))] = f
+
+    # --- 哪些步骤真的走通过 ---
+    # 放弃的步骤一定算没走通；其余看有没有成功的动作记录。
+    gave_up = {str(f.get("id")) for f in findings
+               if f.get("kind") == "step" and f.get("status") == "give_up"}
+    acted: dict[str, list[dict[str, Any]]] = {}
+    for t in trace:
+        sid = str(t.get("step") or "")
+        if sid:
+            acted.setdefault(sid, []).append(t.get("action") or {})
+
+    steps_out: list[dict[str, Any]] = []
+    for s in (task.get("steps") or []):
+        sid = str(s.get("id") or "")
+        if sid in gave_up or not acted.get(sid):
+            continue                     # 没推进过的步骤：剔掉
+        item: dict[str, Any] = {"id": sid, "desc": s.get("desc") or ""}
+        if s.get("locate"):
+            item["locate"] = s["locate"]
+        if s.get("landing"):
+            item["landing"] = s["landing"]
+        # 实际动作用结构化记录替换（比原来的描述更贴近真相）
+        item["actions"] = acted[sid]
+        # 这一步专属的坑：从 issues 里挑提到这一步的
+        mine = [i for i in issues
+                if sid in i or f"步骤 {sid}" in i or f"{sid} " in i]
+        if mine:
+            item["pitfalls"] = mine[:6]
+        steps_out.append(item)
+
+    # --- 每条断言的"怎么看见的" ---
+    va_of: dict[str, list[dict[str, Any]]] = {}
+    for v in (state.get("verify_actions") or []):
+        va_of.setdefault(str(v.get("assert_id") or ""), []).append(v)
+
+    # --- 断言：挂上验证动作 / 坑 / 知识 ---
+    asserts_out: list[dict[str, Any]] = []
+    for a in (task.get("asserts") or []):
+        aid = str(a.get("id") or "")
+        r = res_of.get(aid) or {}
+        item: dict[str, Any] = {
+            "id": aid,
+            "desc": a.get("desc") or "",
+            "step": a.get("step") or "",
+            "result": r.get("status") or "",
+        }
+        if a.get("check"):
+            item["check"] = a["check"]
+        # 这次是靠什么看见的 —— a13 就是"点开课程背景色、看完关回去"，下次照做
+        _va = va_of.get(aid) or []
+        if _va:
+            v0 = _va[0]
+            item["verify_action"] = {
+                "open": v0.get("open") or "",
+                "close": v0.get("close") or "",
+                "why": v0.get("why_insufficient") or "",
+            }
+        elif a.get("verify_action"):
+            item["verify_action"] = a["verify_action"]
+        if a.get("pitfalls"):
+            item["pitfalls"] = list(a["pitfalls"])
+        if r.get("actual"):
+            item["actual"] = str(r.get("actual"))[:400]
+        asserts_out.append(item)
+
+    return {
+        "case_id": task.get("case_id"),
+        "title": task.get("title"),
+        "package": task.get("package"),
+        "status": state.get("status") or "",
+        "steps": steps_out,
+        "asserts": asserts_out,
+        "knowledge": [k for k in (state.get("knowledge_used") or [])][:8],
+    }
+
+
+def learn_node(state: ChildState) -> dict[str, Any]:
+    """在 finish **之前**把这一轮的经验回写成 JSON。
+
+    放在 finish 之前（而不是之后）是因为 finish 之后 state 就不再往前传了，
+    拿不到 action_trace / knowledge_used 这些东西。
+
+    产出写进 run 目录的 case_learned.json，同时写回用例库
+    （用户要的「高质量的 JSON 对重新跑有意义」—— 下次直接读它）。
+    """
+    try:
+        learned = build_learned_case(state)
+    except Exception as exc:  # noqa: BLE001
+        # 回写失败**不能**影响结论 —— 用例跑完的结果比这份副产物重要得多
+        return {"issues": [f"回写用例失败：{exc}"]}
+    out: dict[str, Any] = {}
+    try:
+        ctx = _ctx()
+        # 放在 report.json 旁边 —— 那里就是本次 run 的目录
+        path = Path(ctx.report_path).parent / "case_learned.json"
+        path.write_text(json.dumps(learned, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        out["learned_path"] = str(path)
+        print(f"  [learn] 回写用例 -> {path.name}"
+              f"（步骤 {len(learned.get('steps') or [])}，"
+              f"断言 {len(learned.get('asserts') or [])}）", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        out["issues"] = [f"回写文件失败：{exc}"]
+    out["learned"] = learned
+    return out
 
 
 def finish_child_node(state: ChildState) -> dict[str, Any]:
@@ -6087,6 +6257,7 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
     b.add_node("check", step_check_node)
     b.add_node("assert", assert_node)
     b.add_node("verdict", assert_verdict_node)
+    b.add_node("learn", learn_node)
     b.add_node("finish", finish_child_node)
 
     b.add_edge(START, "prep")
@@ -6094,7 +6265,7 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
     b.add_conditional_edges("start_check", route_after_start_check,
                             {"decide": "decide", "plan": "plan",
                              "prep_apply": "prep_apply",
-                             "finish": "finish"})
+                             "finish": "learn"})
     # prep_apply 的两种来路：
     #   · 从 start_check 来（起点刚达成）-> 还要复核起点
     #   · 从 plan 来（每步开始前）      -> 回到 plan 继续这一步
@@ -6109,7 +6280,7 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
                              "check": "check"})
     b.add_conditional_edges("observe", route_after_observe,
                             {"strong_target": "strong_target", "decide": "decide",
-                             "assert": "assert", "finish": "finish"})
+                             "assert": "assert", "finish": "learn"})
     b.add_conditional_edges("decide", route_after_decide,
                             {"knowledge": "knowledge", "vision": "vision",
                              "act": "act", "check": "check"})
@@ -6126,14 +6297,17 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
                              "start_check": "start_check"})
     b.add_conditional_edges("vision", route_after_vision,
                             {"observe": "observe", "start_check": "start_check",
-                             "finish": "finish"})
+                             "finish": "learn"})
     b.add_conditional_edges("check", route_after_check,
                             {"plan": "plan", "assert": "assert"})
     b.add_conditional_edges("assert", route_after_assert,
-                            {"verdict": "verdict", "finish": "finish"})
+                            {"verdict": "verdict", "finish": "learn"})
     b.add_conditional_edges("verdict", route_after_verdict,
                             {"assert": "assert", "act": "act",
-                             "plan": "plan", "finish": "finish"})
+                             "plan": "plan", "finish": "learn"})
+    # ★ 所有"该收尾了"的路都先去 learn：回写一份更好的用例，再 finish 出结论。
+    #   用户：「要回写 JSON。高质量的 JSON 对重新跑有意义」
+    b.add_edge("learn", "finish")
     b.add_edge("finish", END)
 
     return b.compile(checkpointer=checkpointer)
