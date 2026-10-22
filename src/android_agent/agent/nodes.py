@@ -1541,6 +1541,21 @@ def _step_evidence_of(state: ChildState, out: dict[str, Any]) -> list[dict[str, 
     idx = int(state.get("step_index") or 0)
     steps = (state.get("task") or {}).get("steps") or []
     sid = str(steps[idx].get("id") or "") if idx < len(steps) else ""
+    # ★ AI 为了验证某条断言而多做的动作，画面归到**该断言绑定的那一步**。
+    #
+    # 用户：「打开又关闭。AI如果为了验证某个条件多加的步骤应该也记录下来
+    #        并截图。dump xml 和普通路径一样。」
+    #
+    # 走的是和普通步骤完全一样的落盘（dump.xml + shot.png + 控件清单），
+    # 唯一区别是 `step` 标签 —— 只有这样重判时才取得到"点开之后"那一屏。
+    _fix = state.get("assert_fix_task") or {}
+    _bind = str(_fix.get("bind_step") or "")
+    if _fix and _bind:
+        sid = _bind
+        for i, s in enumerate(steps):
+            if str(s.get("id") or "") == _bind:
+                idx = i
+                break
     if not sid:
         return []
     # 截图：observe 会给 evidence.png；act 只给 xml_path，
@@ -2652,12 +2667,23 @@ def act_node(state: ChildState) -> dict[str, Any]:
         # 权限意图**必须在动作之前**传给工具层，否则本次动作触发的弹窗接不住。
         # 留空 = 默认 grant（工具层抢 6 秒窗口自动点「允许」）。
         task = state.get("task") or {}
+        # ★ 这一次 act 是不是"为了验证某个点"而做的？
+        #
+        # 用户要的东西：「为了验证个点我执行了多少步。每一步都记录。」
+        #
+        # clicks.jsonl 的 step 字段要能区分两种身份：
+        #   · 被测流程的步骤（如 s4）—— 原用例的一部分
+        #   · 验证动作（如 a13）—— 为了看清 a13 临时做的
+        # 记成 a13 之后，事后按验证点一筛就知道"为了验它我动了几次"。
+        _fix_task = state.get("assert_fix_task") or {}
+        _trace_step = (str(_fix_task.get("assert_id") or "")
+                       if _fix_task else _step_id(state))
         res = dev.act(int(action["next_x"]), int(action["next_y"]),
                       why=str(action.get("why", "")),
                       expect=action.get("expect"),
                       perm_action=task.get("perm_action"),
                       perm=task.get("perm_name"),
-                      step=_step_id(state))
+                      step=_trace_step)
     except ToolError as exc:
         # 动作可能已执行 -> 不能盲目重试；直接如实记录并停下
         return {"issues": [f"act 失败：{exc}"],
@@ -2739,10 +2765,18 @@ def act_node(state: ChildState) -> dict[str, Any]:
         #   模型摸索出来的点击是**猜测**，把它固化成"经验"会让下次更错
         #   （168 实测：模型在 s1 里点了 s0 遗留的「同意」按钮，
         #    回写就把 s1 的 iv_more 改成了 rid=button1）。
-        "action_trace": [{"step": _step_id(state),
-                          "by": "code" if action.get("_strong") else "model",
-                          "action": _trace_of_tap(
-                              action, state.get("obs_clickable") or [])}],
+        "action_trace": [{
+            # ★ 补证据的动作：归到断言绑定的那一步，并标 kind=verify。
+            #
+            # 用户：「B 这也是一步隐形的流程步骤。」
+            # 所以它既进 action_trace（回写时能还原出"为看它点了什么"），
+            # 又不混进被测流程的正常步骤里 —— 靠 kind 区分。
+            "step": str((state.get("assert_fix_task") or {}).get("bind_step")
+                        or _step_id(state)),
+            "kind": "verify" if state.get("assert_fix_task") else "",
+            "by": "code" if action.get("_strong") else "model",
+            "action": _trace_of_tap(
+                action, state.get("obs_clickable") or [])}],
         "issues": ([] if not res.error else [f"act 报错：{res.error}"]),
         "progress": [_tick(
             "act",
@@ -4289,11 +4323,21 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
 
     结论：True=成立 / False=不成立 / None=代码判不了（交回模型）
 
-    只判**能确定**的：activity / 控件在不在 / 文案 / 包名。
-    涉及"能不能点""长什么样"的，一律返回 None —— 那要看图。
+    ★★ 已停用（用户决定：「chek现在除了很多问题先去掉」）★★
+
+    判据这套东西在真机上反复出错：
+      · a4 判 iv_add_hint "不在"，实际就在（判据和真实界面脱节）
+      · a13 要数色块，判据根本写不出来
+      · 同 Activity 多 Fragment 时，activity 判据完全失效
+    而且它判错时会**盖过 AI 的结论**（见下面的"判定纠正"），
+    于是错得更理直气壮。
+
+    现在断言一律交 AI 现场判断。这个函数留着但**永远返回"判不了"**，
+    调用方那套"代码纠正 AI"的逻辑自然失效，不用拆。
+
+    ⚠️ 别在这里重新启用——除非有一套在真机上验证过、不会误判的判据。
     """
-    if check is None or check == "":
-        return None, "无判据"
+    return None, "判据已停用，断言一律交 AI 现场判断"
 
     # 字符串形式：沿用 --expect 语法（activity=A,rid=B）
     if isinstance(check, str):
@@ -4646,6 +4690,15 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
             # ★ 交给执行器的"任务卡"：要验什么、缺什么、该找什么元素
             "assert_fix_task": {
                 "assert_id": a["id"],
+                # ★ 这个补动作产出的画面，归到**断言绑定的那一步**名下。
+                #
+                # 用户：「打开又关闭。AI如果为了验证某个条件多加的步骤应该也记录下来
+                #        并截图。dump xml 和普通路径一样。」
+                #
+                # 不记正确的话会出这种错（run 78 实测）：a13 绑 s4，补动作却是
+                # 在 s5 之后执行的，截图被打上 s5 的标签；重判 a13 时按 s4 取
+                # 证据，拿到的还是**色板没展开**的旧图 —— 点开了也白点。
+                "bind_step": str(a.get("step") or ""),
                 "verify_target": str(_na.get("verify_target") or a["desc"]),
                 "why_insufficient": str(_na.get("why_insufficient") or ""),
                 "related_elements": [
@@ -4781,30 +4834,35 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
     #   报告里的 issues 会写明"模型回复无法解析"，主 Agent 能一眼看出
     #   这是执行问题还是产品问题 —— 这个区分正是用户反复强调的。
     tool_failed = False
-    # ★★ 补证据看完，把界面关回去 ★★
+    # ★★ 补过证据之后，点「取消/关闭」把那一层收掉 ★★
     #
-    # 「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。不然继续不下去了。
-    #   我说了要像个人类测试员一样」
+    # ⚠️ 这里**绝对不许按 back**（run 79 的教训，代价是一整轮跑崩）。
     #
-    # 人类点开色板看完会点「取消」退回编辑弹窗，再继续下一步。
-    # 这里就点模型在 need_action.close_with 里说的那个按钮。
-    # 判断条件只有"模型给过 close_with 且这次确实补过证据"——
-    # 不比较指纹、不搞返回栈，复杂度就这么多。
+    # 早先点不到关闭按钮时回退到 dev.key("back")。但 back 是**不可控的导航**：
+    # 它退到哪取决于当时的导航栈，代码毫不知情。
+    # 实测（run 79）：a6 补证据补满 → 关回去时按了 back →
+    #   人从 TimetableActivity 退到 AllInOneActivity →
+    #   s4 的强证据 cv_empty_content#1 找不到 →
+    #   模型乱试 → 再按 back → 退到桌面 launcher →
+    #   a7~a14 全部对着桌面判，整轮报废。
+    #
+    # 一条 back 引发的雪崩，比"没关回去"严重得多。
+    # 所以现在的策略是：**点得到就点，点不到就原地不动**。
+    # 画面停在色板那一层没关系 —— 下一条断言取的是它自己那一步的证据，
+    # 不会因为"多开了一层"就判错。
     _close = str(state.get("assert_fix_close") or "").strip()
     if _close and _fix_rounds > 0:
-        # 按**文字**点那个关闭按钮。用 xpath 精确匹配，命中多个就退回用返回键 ——
-        # 和 click_xpath 的既有约定一致（宁可退回，也不赌点哪个）。
         _esc = _close.replace('"', '\\"')
         _expr = f'//*[@text="{_esc}"]'
         try:
             _r = dev.click_xpath(_expr)
             if _r is None:
-                dev.key("back", why=f"补完证据，用返回键退回（{a['id']}）",
-                        step=_step_id(state))
-                print(f"  [assert] {a['id']} 没找到「{_close}」唯一命中，改用返回键",
+                # 找不到就**什么都不做**。不按 back，不猜坐标。
+                print(f"  [assert] {a['id']} 没找到「{_close}」唯一命中，保持画面不动",
                       file=sys.stderr)
+                issues.append(f"{a['id']} 补证据后没找到「{_close}」，画面未收，保持原样")
             else:
-                print(f"  [assert] {a['id']} 补完证据，已点「{_close}」退回",
+                print(f"  [assert] {a['id']} 补完证据，已点「{_close}」收回",
                       file=sys.stderr)
         except ToolError as exc:
             issues.append(f"{a['id']} 补证据后点「{_close}」失败：{exc}")
@@ -4890,14 +4948,23 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
     gave_up = {str(f.get("id")) for f in findings
                if f.get("kind") == "step" and f.get("status") == "give_up"}
     acted: dict[str, list[dict[str, Any]]] = {}
+    verify_of: dict[str, list[dict[str, Any]]] = {}
     for t in trace:
         sid = str(t.get("step") or "")
-        if sid:
+        if not sid:
+            continue
+        # ★ 补证据的动作（kind=verify）单独放一支：
+        #   用户：「B 这也是一步隐形的流程步骤。」——它要进 steps，
+        #   但必须和被测流程的动作区分开，否则下次重跑会把它当被测步骤执行。
+        if str(t.get("kind") or "") == "verify":
+            verify_of.setdefault(sid, []).append(t.get("action") or {})
+        else:
             acted.setdefault(sid, []).append(t.get("action") or {})
 
     steps_out: list[dict[str, Any]] = []
     for s in (task.get("steps") or []):
         sid = str(s.get("id") or "")
+        # 只有"验证动作"没有正常动作的步骤不算推进过（如 s0 被放弃）
         if sid in gave_up or not acted.get(sid):
             continue                     # 没推进过的步骤：剔掉
         item: dict[str, Any] = {"id": sid, "desc": s.get("desc") or ""}
@@ -4907,6 +4974,9 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
             item["landing"] = s["landing"]
         # 实际动作用结构化记录替换（比原来的描述更贴近真相）
         item["actions"] = acted[sid]
+        # ★ 隐形流程：为了验证而额外点的东西（如点开色板）。下次直接照做。
+        if verify_of.get(sid):
+            item["verify_actions"] = verify_of[sid]
         # 这一步专属的坑：从 issues 里挑提到这一步的
         mine = [i for i in issues
                 if sid in i or f"步骤 {sid}" in i or f"{sid} " in i]
@@ -4915,11 +4985,28 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
         steps_out.append(item)
 
     # --- 每条断言的"怎么看见的" ---
+    #
+    # 用户：「为了验证个点我执行了多少步。每一步都记录。」
+    #
+    # 所以断言上挂的是**一串步骤**，不是一句概述：
+    #   a13
+    #     ├─ 第1步 tap rid=llCourseColor（为什么：色板没展开）
+    #     │        截图 shots/step30/shot.png
+    #     │        XML  shots/step30/dump.xml
+    #     └─ 第2步 重判 → 看到 10 个色块
+    # 每步都带截图和 XML 路径，事后可以逐个核对。
     va_of: dict[str, list[dict[str, Any]]] = {}
     for v in (state.get("verify_actions") or []):
         va_of.setdefault(str(v.get("assert_id") or ""), []).append(v)
 
-    # --- 断言：挂上验证动作 / 坑 / 知识 ---
+    # 点击账本里那些"为验证而做"的动作（clicks.jsonl 的 step 记的是断言 id）
+    click_of: dict[str, list[dict[str, Any]]] = {}
+    for t in trace:
+        sid = str(t.get("step") or "")
+        if str(t.get("kind") or "") == "verify" and sid:
+            click_of.setdefault(sid, []).append(t)
+
+    # --- 断言：挂上验证步骤 / 坑 / 知识 ---
     asserts_out: list[dict[str, Any]] = []
     for a in (task.get("asserts") or []):
         aid = str(a.get("id") or "")
@@ -4932,17 +5019,29 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
         }
         if a.get("check"):
             item["check"] = a["check"]
-        # 这次是靠什么看见的 —— a13 就是"点开课程背景色、看完关回去"，下次照做
+
+        # ★ 为了验证它，实际执行了几步、每步做了什么、证据在哪
         _va = va_of.get(aid) or []
         if _va:
-            v0 = _va[0]
-            item["verify_action"] = {
-                "open": v0.get("open") or "",
-                "close": v0.get("close") or "",
-                "why": v0.get("why_insufficient") or "",
-            }
+            vsteps: list[dict[str, Any]] = []
+            for n, v in enumerate(_va, 1):
+                s: dict[str, Any] = {
+                    "n": n,
+                    "why": v.get("why_insufficient") or "",
+                    "open": v.get("open") or "",
+                }
+                if v.get("close"):
+                    s["close"] = v["close"]
+                if v.get("shot"):
+                    s["shot"] = v["shot"]
+                if v.get("xml"):
+                    s["xml"] = v["xml"]
+                vsteps.append(s)
+            item["verify_steps"] = vsteps
+            item["verify_count"] = len(vsteps)
         elif a.get("verify_action"):
-            item["verify_action"] = a["verify_action"]
+            item["verify_steps"] = [a["verify_action"]]
+
         if a.get("pitfalls"):
             item["pitfalls"] = list(a["pitfalls"])
         if r.get("actual"):
@@ -4978,17 +5077,72 @@ def learn_node(state: ChildState) -> dict[str, Any]:
     try:
         ctx = _ctx()
         # 放在 report.json 旁边 —— 那里就是本次 run 的目录
-        path = Path(ctx.report_path).parent / "case_learned.json"
+        run_dir = Path(ctx.report_path).parent
+        # ★ 从点击账本把"每一步的截图/XML 路径"补进来。
+        #
+        # 用户：「为了验证个点我执行了多少步。每一步都记录。」
+        # 点击账本（clicks.jsonl）里每条都有 shot_before/shot_after、
+        # xml_before/xml_after —— 这是最可靠的原始记录，直接读它，
+        # 不指望 assert 那一刻还记得住路径。
+        _fill_evidence_from_ledger(learned, run_dir / "clicks.jsonl")
+        path = run_dir / "case_learned.json"
         path.write_text(json.dumps(learned, ensure_ascii=False, indent=2),
                         encoding="utf-8")
         out["learned_path"] = str(path)
+        _n = sum(int(a.get("verify_count") or 0)
+                 for a in (learned.get("asserts") or []))
         print(f"  [learn] 回写用例 -> {path.name}"
               f"（步骤 {len(learned.get('steps') or [])}，"
-              f"断言 {len(learned.get('asserts') or [])}）", file=sys.stderr)
+              f"断言 {len(learned.get('asserts') or [])}，"
+              f"验证动作 {_n} 次）", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001
         out["issues"] = [f"回写文件失败：{exc}"]
     out["learned"] = learned
     return out
+
+
+def _fill_evidence_from_ledger(learned: dict[str, Any], ledger: Path) -> None:
+    """把 clicks.jsonl 里为验证而做的动作，补进各断言的 verify_steps。
+
+    账本里 `step` 字段写成断言 id（如 a13）的就是验证动作 ——
+    这是 act_node 刻意打的标记（见那里的注释）。
+    每条带 shot_before/shot_after 和 xml_before/xml_after，
+    取"动作之后"那一份：那才是看见了新东西的那一屏。
+    """
+    if not ledger.exists():
+        return
+    by_assert: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = str(o.get("step") or "")
+            if not sid.startswith("a"):
+                continue
+            tgt = o.get("target") or {}
+            by_assert.setdefault(sid, []).append({
+                "action": o.get("action") or "",
+                "target": tgt.get("rid") or tgt.get("text") or "",
+                "why": str(o.get("why") or "")[:200],
+                "changed": bool(o.get("changed")),
+                "shot": o.get("shot_after") or o.get("shot_before") or "",
+                "xml": o.get("xml_after") or o.get("xml_before") or "",
+            })
+    except OSError:
+        return
+    for a in (learned.get("asserts") or []):
+        got = by_assert.get(str(a.get("id") or ""))
+        if not got:
+            continue
+        # 账本是"实际做了什么"，比断言阶段记的意图更可信：以它为准，
+        # 但保留意图里的 why（账本的 why 已经带上了模型说的理由）。
+        a["verify_steps"] = got
+        a["verify_count"] = len(got)
 
 
 def finish_child_node(state: ChildState) -> dict[str, Any]:
