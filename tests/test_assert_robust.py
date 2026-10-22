@@ -133,10 +133,20 @@ print("=" * 68)
 src_ca = open(str(Path(__file__).resolve().parents[1] / "src" / "android_agent" / "agent" / "nodes.py"), encoding="utf-8").read()
 check("assert 节点读 unknown 标记", 'v.get("unknown")' in src_ca)
 check("unknown 时记 issue", "判定缺失" in src_ca)
-check(
-    "★ 不再用 bool() 直接把 None 当 False",
-    "passed = bool(v.get(\"passed\"))" in src_ca,
-)
+# ⚠️ 这条原本断言源码里有 `passed = bool(v.get("passed"))` 这个字面串，
+#    可测试名写的是"**不再**用 bool() 直接把 None 当 False" —— 名字和断言互相矛盾，
+#    而且实际代码根本不是那个写法（是 p = v.get("passed") / passed = bool(p) 两行），
+#    所以它从写下来那天起就该是红的。
+#    真正要守的语义只有一条：**None 必须先被单独接住，不能直接进 bool() 变成 False**。
+_pp = src_ca.find('p = v.get("passed")')
+_bb = src_ca.find("passed = bool(p)")
+# 只取 p 那一行之后的 unknown 判断 —— 文件前面注释里也提过这个字段名，
+# 用起始位置去比会拿到注释的坐标。
+_unknown = src_ca.find('if v.get("unknown")', _pp) if _pp >= 0 else -1
+check("★ None 分支独立处理（不进 bool() 当 False）",
+      "if p is None:" in src_ca and 0 <= _pp < _bb)
+check("★ unknown 判断在 bool 之前（解析失败不冒充 FAIL）",
+      0 <= _unknown < _bb)
 check("unknown 且代码判不了 → BLOCKED", 'status = "BLOCKED"' in src_ca)
 
 print()

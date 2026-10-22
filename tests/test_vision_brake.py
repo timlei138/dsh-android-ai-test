@@ -15,7 +15,7 @@
 
 ① 额度：assets/tools/vision.py 的 --max-tokens 默认 500，
    推理模型把额度全花在 reasoning 上，返回空文本（ok 仍为 true）
-② 没刹车：vision_node 失败后只写 issues，**action 里的
+② 没刹车：视觉失败后只写 issues，**action 里的
    vision_question 还在**，路由于是又送回 vision —— 死循环
 
 只修 ① 不够：换个大图/换个模型还会再犯。
@@ -80,12 +80,12 @@ base_action = {"step_done": False,
 st = {"action": dict(base_action), "last_shot": "/x/shot.png",
       "vision_failures": nd.VISION_MAX_FAILURES,
       "vision_error": "返回空文本（reasoning 吃光额度）"}
-out = nd.vision_node(st)
+out = nd._handle_vision(st, {}, st["action"])
 act = out.get("action") or {}
 ck("★ 到上限后 action 里没有 vision_question",
    "vision_question" not in act, str(act))
-ck("★ 所以路由不会再回 vision",
-   nd.route_after_decide({"action": act}) != "vision",
+ck("★ 所以路由不会再回去看图（回 check 重来一轮）",
+   nd.route_after_decide({"action": act}) == "check",
    nd.route_after_decide({"action": act}))
 ck("★ 明确告知模型为什么停",
    any("停止看图" in str(i) for i in (out.get("issues") or [])),
@@ -96,7 +96,7 @@ ck("保留 step_done 字段", "step_done" in act)
 # 没到上限：给一次重试机会
 st2 = {"action": dict(base_action), "last_shot": "",
        "vision_failures": 0}
-out2 = nd.vision_node(st2)
+out2 = nd._handle_vision(st2, {}, st2["action"])
 ck("第一次失败时计数变 1", out2.get("vision_failures") == 1,
    str(out2.get("vision_failures")))
 ck("第一次失败仍保留 vision_question（允许重试）",
@@ -109,7 +109,7 @@ print("=" * 70)
 print("3) 没有截图 ≠ 没问题，必须计数")
 print("=" * 70)
 st3 = {"action": dict(base_action), "last_shot": ""}
-o = nd.vision_node(st3)
+o = nd._handle_vision(st3, {}, st3["action"])
 ck("★ 无截图时不再返回空 dict（原来就是这里静默）",
    o != {}, "以前 return {} 让 22 次失败完全隐身")
 ck("无截图也算一次失败", o.get("vision_failures") == 1)
@@ -119,8 +119,15 @@ print()
 print("=" * 70)
 print("4) 没问问题时不打扰")
 print("=" * 70)
-o = nd.vision_node({"action": {"step_done": True}, "last_shot": "/x.png"})
-ck("没有 vision_question 就返回空（不新增失败计数）", o == {}, str(o))
+# ⚠️ 新实现里"要不要看图"由 decide_node 判（action.vision_question 非空才进来），
+#    _handle_vision 假定自己只会被在那种情况下调用。所以这里验入口那一条：
+_dsrc0 = (ROOT / "src" / "android_agent" / "agent" / "nodes.py").read_text(
+    encoding="utf-8")
+_dn = _dsrc0[_dsrc0.find("def decide_node("):]
+_dn = _dn[:_dn.find("\ndef _handle_knowledge")]
+ck("没问问题时不会走进视觉分支",
+   'if action.get("vision_question"):' in _dn,
+   "decide 里要先判 vision_question，否则每轮都会去调视觉模型")
 
 print()
 print("=" * 70)
@@ -128,19 +135,23 @@ print("5) 成功之后失败计数要清零")
 print("=" * 70)
 # 用一个假的 ask_image 模拟成功（不真调网络）
 #
-# ⚠️ 不能只替换 nd.ask_image —— vision_node 里还先调了 _ctx()，
+# ⚠️ ask_image 现在是 _handle_vision 里的局部 import（from .vision import ask_image），
+#    所以打桩要打 android_agent.agent.vision.ask_image。
+# ⚠️ 不能只替换 ask_image —— _handle_vision 里还先调了 _ctx()，
 #    而子 Agent 上下文没注入时它直接抛 RuntimeError（这一层在
 #    ask_image 之前）。所以 _ctx 也要一起打桩，否则测的根本不是
 #    成功路径，而是"忘了注入 context"。
-_orig = nd.ask_image
+from android_agent.agent import vision as _vmod  # noqa: E402
+
+_orig = _vmod.ask_image
 _orig_ctx = nd._ctx
 nd._ctx = lambda: type("C", (), {"python": sys.executable,
                                  "skill_root": str(ROOT / "assets")})()
-nd.ask_image = lambda *a, **k: "菜单里有：课程表、纵览、年视图、设置"
+_vmod.ask_image = lambda *a, **k: "菜单里有：课程表、纵览、年视图、设置"
 try:
     st4 = {"action": dict(base_action), "last_shot": "/x/shot.png",
            "vision_failures": 1, "vision_error": "上次空返回"}
-    o = nd.vision_node(st4)
+    o = nd._handle_vision(st4, {}, st4["action"])
     ck("★ 成功后 vision_failures 归零", o.get("vision_failures") == 0,
        str(o.get("vision_failures")))
     ck("答案挂到 action.vision 上",
@@ -148,7 +159,7 @@ try:
        str(o.get("action", {}).get("vision"))[:40])
     ck("vision_error 清空", o.get("vision_error") == "")
 finally:
-    nd.ask_image = _orig
+    _vmod.ask_image = _orig
     nd._ctx = _orig_ctx
 
 print()
@@ -182,8 +193,8 @@ print("=" * 70)
 #   实测连问 21 次、烧掉 95 秒，而且因为视觉是"成功"的，
 #   上面那个失败闸门压根没触发 —— 修了失败路径，坏的是成功路径。
 
-ck("vision_node 成功后写 last_vision（会活过下一轮 observe）",
-   "last_vision" in inspect.getsource(nd.vision_node))
+ck("看图成功后写 last_vision（会活过下一轮 observe）",
+   "last_vision" in inspect.getsource(nd._handle_vision))
 ck("state 里有 last_vision",
    "last_vision" in nd.ChildState.__annotations__)
 

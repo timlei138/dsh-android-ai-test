@@ -19,10 +19,10 @@
 是否变了。现在**整块移除**，因为：
 
   · `StepSpec.pitfalls` 是 `list[str]` —— 引用锚（dict 形式）会变成
-    **模型读不到的字典**，坑等于白写。`case_spec_check.py` 已把它判成 DEAD。
+    **模型读不到的字典**，坑等于白写。`list[str]` 就属于这类。
   · 引用锚本质是**知识卡的维护职责**，不该塞进用例的步骤坑里。
     步骤坑只回答一个问题：*走到这步，我该知道什么？*
-  · 用例 YAML 由 `case_spec_check.py` 管格式；`case_expect` 也不再是 YAML 字段
+  · 用例格式由 JSON 载入器管（`cases/loader.py`）；YAML 已整体删除
     （`AssertSpec` 只有 id/desc/check），所以"是否照抄原文"改为**人审**。
 
 用法
@@ -95,14 +95,14 @@ def quote_hash(text: str) -> str:
 
 
 def check_case_specs() -> int:
-    """已废弃 —— 用例 YAML 的格式与引用锚检查交给 case_spec_check.py。
+    """已废弃 —— 用例 YAML 已整体删除，这里不再做格式检查。
 
     保留函数壳是为了让 `main()` 的调用点不必改动（且旧调用方不会 AttributeError），
     但它**什么都不做**，永远返回 0。
 
     为什么废弃：
       · 引用锚（`from` + `quote_hash`）是 dict，而 `StepSpec.pitfalls` 是
-        `list[str]` —— 模型读不到这种坑，`case_spec_check.py` 已判 DEAD。
+        `list[str]` —— 模型读不到这种坑，一律不认。
       · 引用锚属于知识卡的维护职责，不该塞进用例的步骤坑。
     """
     return 0
@@ -167,11 +167,11 @@ def check_case_expectations() -> int:
     存在意义是防**静默失真**（182 曾把 6 条预期压缩成 3 条泛化描述）。
     但 `AssertSpec` 只有 `id` / `desc` / `check` 三个字段，没有 `case_expect`：
 
-      · 写进 YAML 会被 `case_spec_check.py` 判成 DEAD 字段
+      · 这类字段模型读不到，写了也白写
       · 所以"断言是否忠于原文"这件事，**YAML 层面已无从比对**
 
     ⇒ 改为**人审**：`assertions[].desc` 必须能对应回用例原文的一条预期。
-      `case_spec_check.py` 会强制 `assertions` 非空、每条有 id/desc/check。
+      JSON 用例要求 `asserts` 每条都有 id/desc/check，且 step 必填。
     """
     return 0
 
@@ -293,8 +293,8 @@ def main() -> int:
     # 旧版这里有「引用锚过期」和「case_expect 是否照抄原文」两项，现已移除：
     #   · 引用锚是 dict，而 StepSpec.pitfalls 是 list[str]，模型读不到 → 已废弃
     #   · case_expect 不再是 YAML 字段（AssertSpec 只有 id/desc/check）→ 无从比对
-    # 用例 YAML 的格式与字段合法性由 `case_spec_check.py` 全权负责。
-    print("\n（用例 YAML 的格式检查请用 tools/case_spec_check.py）")
+    # 用例格式由 JSON 载入器负责（YAML 已删）。
+    print("\n（用例只支持 JSON，见 assets/storage/cases/）")
 
     print()
     if total:

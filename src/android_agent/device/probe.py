@@ -112,10 +112,10 @@ def _center(n: dict) -> tuple[int, int]:
 
 def cmd_logic(case: str) -> int:
     """把"解析"这一层单独验一遍 —— 不连设备，毫秒级。"""
-    from ..cases import loader as case_yaml
+    from ..cases import loader as cases_loader
     from ..agent import nodes as ca
 
-    got = case_yaml.load_case_by_name(case)
+    got = cases_loader.load_case_by_name(case)
     spec = got[0] if isinstance(got, tuple) else got
     task = getattr(spec, "task", spec)
     precs = (task.get("preconditions") if isinstance(task, dict)
@@ -357,10 +357,10 @@ def cmd_prep(case: str) -> int:
 
     设备没走到位时会明确告诉你"控件不在"，而不是让你等 80 轮才发现。
     """
-    from ..cases import loader as case_yaml
+    from ..cases import loader as cases_loader
     from ..agent import nodes as ca
 
-    got = case_yaml.load_case_by_name(case)
+    got = cases_loader.load_case_by_name(case)
     spec = got[0] if isinstance(got, tuple) else got
     task = getattr(spec, "task", spec)
     precs = (task.get("preconditions") if isinstance(task, dict)

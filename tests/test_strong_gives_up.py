@@ -40,8 +40,8 @@ import android_agent.agent.nodes as N  # noqa: E402
 from android_agent.agent.nodes import (  # noqa: E402
     STRONG_MAX_SAME_TARGET,
     _ask_model,
+    _resolve_strong_target,
     _strong_tries,
-    strong_target_node,
 )
 from android_agent.device.ledger import ClickLedger  # noqa: E402
 
@@ -108,18 +108,26 @@ st = {
                       {"r": "other", "t": "", "c": [50, 50]}],
     "obs_xml_path": str(xml),
 }
-out = strong_target_node(st)
-act = out.get("action") or {}
-ck("命中唯一 -> 给出动作", act.get("next_x") == 1777, str(act.get("next_x")))
-ck("命中唯一 -> 不问模型", not out.get("fallback_reason"),
-   str(out.get("fallback_reason"))[:60])
-ck("记为代码直点", (out.get("strong_hits") or [{}])[0].get("by") == "code")
+# ⚠️ strong_target_node 已随旧图删除（15 -> 8 节点）。它做的事现在由
+#    _resolve_strong_target 承担，plan/act 都调它 —— 所以直接测这个解析器。
+x, y, why = _resolve_strong_target("rid=save_view", st)
+ck("命中唯一 -> 给出坐标", x == 1777 and y == 202, f"({x},{y})")
+
+x2, y2, why2 = _resolve_strong_target("text=不存在的按钮", st)
+ck("找不到 -> 不给坐标", x2 is None, str(why2)[:60])
+
+# ★ 两个同名控件时必须拒绝，不能"取第一个"糊弄
+x3, y3, why3 = _resolve_strong_target(
+    "text=完成",
+    {**st, "obs_clickable": [{"r": "a", "t": "完成", "c": [10, 10]},
+                              {"r": "b", "t": "完成", "c": [20, 20]}]})
+ck("★ 命中多个 -> 拒绝（绝不取第一个）", x3 is None, str(why3)[:60])
 
 # ══════════════════════════════════════════════════════════════════
 # ② 点了 N 次没进展 -> 必须交出去
 # ══════════════════════════════════════════════════════════════════
 print()
-print("② 点了没进展 -> 转交模型（这是 176 的解法）")
+print("② 点了没进展 -> 数得出来，该转交模型（这是 176 的解法）")
 
 lg = ClickLedger(Path(tempfile.mkdtemp()) / "stuck.jsonl")
 for _ in range(STRONG_MAX_SAME_TARGET):
@@ -129,22 +137,18 @@ for _ in range(STRONG_MAX_SAME_TARGET):
               changed=False)
 use_ledger(lg)
 
-out2 = strong_target_node(st)
-ck("★ 没进展 -> 不再给动作", not (out2.get("action") or {}).get("next_x"),
-   str((out2.get("action") or {}).get("next_x")))
-ck("★ 没进展 -> 转交模型", bool(out2.get("fallback_reason")),
-   str(out2.get("fallback_reason"))[:70])
-ck("★ 记为模型接手",
-   (out2.get("strong_hits") or [{}])[0].get("by") == "model")
+# 没进展由 _strong_tries 计数决定，plan 据此转交模型。
+n2 = _strong_tries(st, "s3", "rid=save_view")
+ck("★ 没进展次数被数出来", n2 >= STRONG_MAX_SAME_TARGET, str(n2))
+ck("★ 超过阈值 -> 该转交模型", n2 >= STRONG_MAX_SAME_TARGET)
 
 # 第一次点的时候不该移交（否则强证据就没意义了）
 lg1 = ClickLedger(Path(tempfile.mkdtemp()) / "one.jsonl")
 for _ in range(STRONG_MAX_SAME_TARGET - 1):
     lg1.record(step="s3", target={"rid": "save_view"}, changed=False)
 use_ledger(lg1)
-out1b = strong_target_node(st)
-ck("只点了 1 次 -> 还继续直点", (out1b.get("action") or {}).get("next_x") == 1777,
-   str((out1b.get("action") or {}).get("next_x")))
+n1b = _strong_tries(st, "s3", "rid=save_view")
+ck("只点了 1 次 -> 还在阈值内，继续直点", n1b < STRONG_MAX_SAME_TARGET, str(n1b))
 
 # ══════════════════════════════════════════════════════════════════
 # ③ 交出去时，必须带上 YAML 里的坑

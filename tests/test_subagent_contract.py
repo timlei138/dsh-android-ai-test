@@ -122,8 +122,8 @@ print("=" * 70)
 for mod in ("android_agent.agent.runner", "android_agent.agent.nodes",
             "android_agent.agent.vision", "android_agent.agent.child_runner",
             "android_agent.device.direct", "android_agent.device.lock",
-            "android_agent.cases.loader", "android_agent.report.writeback",
-            "android_agent.report.generate"):
+            "android_agent.cases.loader", "android_agent.cases.importer",
+            "android_agent.reporting.store"):
     try:
         __import__(mod)
         ck(f"import {mod.split('.')[-1]}", True)

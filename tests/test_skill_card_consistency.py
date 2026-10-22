@@ -193,11 +193,14 @@ ck("★ 强调「没有判据 ≠ 已完成」",
    "没有判据" in runner and "不等于" in runner)
 ck("★ 说明强证据直点是按屏判断（不是一次放弃）",
    "按屏判断" in runner)
-ck("★ 说明权限只记账不进 YAML",
-   "不写进 YAML" in runner or "不进 YAML" in runner
-   or "不写进 YAML" in _corpus or "不进 YAML" in _corpus)
-ck("★ 说明只有代码直点才回写 YAML",
-   "只有代码直点" in runner)
+# ⚠️ 这两条原来是"不写进 YAML" / "只有代码直点才回写 YAML" ——
+#    YAML 和回写机制都已整体删除，那两句话现在**找不到也不该找**。
+#    留着等于逼技能卡继续教不存在的东西，所以改成守新的事实：
+#    ① 权限只记账、不写进用例；② 摸出来的路径不会自动改写用例。
+ck("★ 说明权限只记账、不写进用例",
+   "不写进用例" in runner or "不写进用例" in _corpus)
+ck("★ 说明摸出来的路径不会写进用例（不是自动回写）",
+   "不会写进用例" in runner or "不会自动改写" in _corpus)
 ck("说明落点必须是稳定终态", "稳定终态" in runner)
 ck("说明 activity 短名子串匹配的坑", "子串" in runner)
 

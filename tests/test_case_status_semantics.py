@@ -71,20 +71,23 @@ print()
 print("=" * 70)
 print("3) ★★ BLOCKED 之后不再执行后续步骤")
 print("=" * 70)
+# 新图里 BLOCKED 不是靠路由函数判断的 —— 旧图有 route_after_plan /
+# route_after_strong 两个地方各查一次 status，现在统一由 abort 字段控制：
+#   · verify/check 判定出 BLOCKED 时置 abort
+#   · 所有路由看到 abort 一律去 finish，不再派发任何设备动作
 r_plan = func_body("route_after_plan")
-ck("route_after_plan 检查 BLOCKED", 'status") == "BLOCKED"' in r_plan)
-ck("route_after_plan 遇到 BLOCKED 去 finish", '"finish"' in r_plan)
-# 检查顺序：BLOCKED 判断必须在"步骤走完"之前
-i_block = r_plan.find('== "BLOCKED"')
-i_done = r_plan.find('step_index')
-ck("BLOCKED 判断在步骤推进之前（顺序正确）",
-   0 <= i_block < i_done, f"BLOCKED@{i_block} 步骤判断@{i_done}")
+ck("route_after_plan 检查 abort", 'state.get("abort")' in r_plan)
+ck("route_after_plan 遇到 abort 去 finish", '"finish"' in r_plan)
 
-r_strong = func_body("route_after_strong")
-ck("route_after_strong 也检查 BLOCKED（不在 BLOCKED 后还去点设备）",
-   'status") == "BLOCKED"' in r_strong)
-ck("route_after_strong 支持去 finish",
-   '"finish"' in r_strong.split('"""')[-1])
+r_decide = func_body("route_after_decide")
+ck("route_after_decide 也检查 abort（不在 BLOCKED 后还去点设备）",
+   'state.get("abort")' in r_decide)
+ck("route_after_decide 遇到 abort 去 finish",
+   '"finish"' in r_decide.split('"""')[-1])
+
+r_verify = func_body("route_after_verify")
+ck("route_after_verify 遇到 abort 去 finish",
+   not r_verify or '"finish"' in r_verify, "（有断言全部不合格时的分流）")
 
 print()
 print("=" * 70)

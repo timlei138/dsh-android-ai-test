@@ -41,7 +41,7 @@ D:\dsh\langgraph-poc\start-webui.cmd -Port 8771 -NoBrowser
 - 页面上看：用例库 / 运行记录 / 断言结果（代码判还是模型判）/ 自动化率 /
   动作时间轴（含截图）/ 视觉模型配置
 - 回答"上次这个用例过没过、这次为什么变了"就靠它（历史在
-  `assets/storage/runs.db`，每次运行带 YAML 快照）
+  `assets/storage/runs.db`，每次运行存整份报告快照）
 
 开服务需要你启动进程。**别自己去猜 DSH 的端口或界面** —— 这个模式下的
 webui 就是上面那个测试结果界面，不是 DSH 自己的对话界面。
@@ -56,9 +56,9 @@ webui 就是上面那个测试结果界面，不是 DSH 自己的对话界面。
 用户多次实测的结论：
 - 脚本写错就得改，改完再跑，**一轮几分钟** —— 比直接观察效率低得多
 - 脚本里写死的字段是**猜的**，跟执行器真正用的判据（`landing` / `check`）不是一回事
-- 拿脚本"验证过"的结论去写 YAML，等于把猜测固化成判据
+- 拿脚本"验证过"的结论去写用例，等于把猜测固化成判据
 
-拆解需要的设备事实（界面长什么样、控件 rid 是什么），要么来自已有 YAML / 知识卡，
+拆解需要的设备事实（界面长什么样、控件 rid 是什么），要么来自已有用例 / 知识卡，
 要么**派子 Agent 跑一次观察**，要么问用户。别自己先探一遍。
 
 ## 第一步：先看有没有沉淀好的用例
@@ -71,7 +71,7 @@ webui 就是上面那个测试结果界面，不是 DSH 自己的对话界面。
 ```
 glob("**/storage/cases/*168*")        # 优先：按编号找
 glob("**/storage/cases/*联想日历*")   # 只知道 App 名时
-glob("**/storage/cases/*.yaml")       # 都不确定就列全部
+glob("**/storage/cases/*.json")       # 都不确定就列全部
 ```
 
 - **命中 1 个** → 直接派发，`case_name` 传名字片段（如 `"168"`）
@@ -97,7 +97,7 @@ curl -X POST http://127.0.0.1:8770/api/cases \
 - 入库后 WebUI 用例库就能看到，**不用再往 `D:\dsh\cal_cases` 放 txt 文件**
   （那两个目录只是最初的导入来源，不是用例的正主）
 
-YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
+报告的 `case_confidence.level == verified` 表示这条用例已经跑通过多次，可信度高。
 
 ## 第二步（没现成用例时）：现场拆解
 
@@ -110,28 +110,31 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
   "package": "com.zui.calendar",
   "preconditions": [
     {"kind": "nav", "desc": "拉起 App 回到首页作为起点",
-     "do": ["am start -n com.zui.calendar/.AllInOneActivity"]}
+     "do": ["am start -n com.zui.calendar/.AllInOneActivity"],
+     "target": "activity=.AllInOneActivity"}
   ],
   "steps": [
     {
       "id": "s1",
-      "do": "点右上角「更多」",
-      "locate": {"rid": "iv_more"},
-      "landing": {"activity": ".timetable.display.TimetableActivity"}
+      "desc": "点右上角「更多」，在菜单里选「课程表」",
+      "target": "rid=iv_more",
+      "landing": "activity=.timetable.display.TimetableActivity"
     }
   ],
   "asserts": [
-    {"id": "a1", "desc": "进入课程表页面",
+    {"id": "a1", "step": "s1", "desc": "进入课程表页面",
      "check": {"activity": ".timetable.display.TimetableActivity"}}
   ]
 }
 ```
 
-> ⚠️ **`do` 字符串和数组都收**（`"am start ..."` 或 `["cmd1", "cmd2"]`）；
-> 多条命令必须用数组，否则会被当成一条。
+> ⚠️ **`do` 必须是数组**（`["cmd1", "cmd2"]`）。写成字符串会被当成一条命令。
 >
-> `locate` 和 `target` 是**同一个字段的两个名字**（加载器两个都收），
-> 内联传参时写 `locate: {"rid": "..."}` 就行。
+> `target` / `landing` / `check` 都是**字符串表达式**：
+> `rid=xxx` / `activity=.Foo` / `text=xxx` / `xpath=...` / `album=any`。
+>
+> `asserts[].step` **必填** —— 绑定到哪一步，验证就在那一步做完时进行。
+> 不填的话加载器会告警，这条断言等于验不了。
 
 ### `pm clear` 只在"首次使用"场景才用
 
@@ -215,26 +218,23 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
 3. **不许凭空造：字段不能新编，强证据的值必须来自真实记录**
 
-   用户原话：「YAML 文件不能凭空添加字段。所有强证据的值必须来自
+   用户原话：「用例文件不能凭空添加字段。所有强证据的值必须来自
    真实的记录。不能凭空捏造。」
 
    两件事，两套机制：
 
-   **① 字段不能新编。** 每层都有白名单，写不认识的字段会报警，
-   而且那个字段**根本不生效**：
+   **① 字段不能新编。** JSON 用例**只认下面这些键**，写别的进不去：
 
    | 层 | 能用 |
    |---|---|
-   | 顶层 | `meta` `steps` `assertions` `preconditions` `confidence` `playbook` |
-   | `meta` | `case_id` `title` `package` `knowledge_files` `derived_from` `source` `note` |
-   | `steps[]` | `id` `desc` `target` `locate` `landing` `know` `pitfalls` `do` `expect` `verify` `on_fail` |
-   | `steps[].know` | `where` `why_this` `locate` `source` `files` |
-   | `assertions[]` | `id` `desc` `check` `note` `result` |
-   | `preconditions[]` | `kind` `desc` `do` `undo` `skip_if` `assert_start` `target` `hint` `expect` |
+   | 顶层 | `case_id` `title` `package` `preconditions` `steps` `asserts` `knowledge_files` |
+   | `steps[]` | `id` `desc` `target`（或 `locate`） `landing` `pitfalls` `do` |
+   | `asserts[]` | `id` `step` `desc` `check` |
+   | `preconditions[]` | `kind`（`data`/`env`/`nav`） `desc` `do` `undo` `skip_if` `assert_start` `target` `hint` |
 
-   > 想记点什么但没有字段？**写进 `desc` / `note` / `pitfalls`**，
+   > 想记点什么但没有字段？**写进 `desc` / `pitfalls`**，
    > 别新造一个键 —— 新键不会被执行器读，等于没写。
-   > 真需要新字段，先改 `loader.py` 的白名单和 schema，**再**用。
+   > 真需要新字段，先改 `cases/loader.py`，**再**用。
 
    **② 强证据的值必须见过。** `rid` / `activity` / `package` / `text`
    是"这个控件在不在"的唯一依据，写错一个就会把功能正确的判成 FAIL。
@@ -252,7 +252,7 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
    ```
 
    > ⚠️ 实测教训：`EditCourseActivity`、`btnDelete`、`TimetableGuideActivity`
-   > 一度被写进 YAML 却**从未真实出现过**（那两条路径从没跑通过）。
+   > 一度被写进用例 却**从未真实出现过**（那两条路径从没跑通过）。
    > 这种值哪怕看起来合理，也是在拿猜测当证据 —— 跑起来必然误判。
    >
    > ⚠️ 反过来也别矫枉过正：报"没找到"不等于一定是错的，
@@ -267,14 +267,14 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
    **能 → 代码硬判，而且要比对到"值"这一层**：
 
-   ```yaml
-   # ✗ 错：预期是"默认 4 节"，却只判控件在 —— 显示 6 节也一样过
-   check: {nodes_present: [{rid: tv_morning_slot_count}]}
-   # ✓ 对：直接比数值
-   check: {node_text: {rid: tv_morning_slot_count, equals: "4节"}}
-   ```
+  ```json
+  // ✗ 错：预期是"默认 4 节"，却只判控件在 —— 显示 6 节也一样过
+  {"check": {"node_present": {"rid": "tv_morning_slot_count"}}}
+  // ✓ 对：判到"值"这一层
+  {"check": {"node_text": {"rid": "tv_morning_slot_count", "equals": "4节"}}}
+  ```
 
-   **不能 → `check: null`，整条交给 AI**，别写个"看起来有判据"的假 check：
+   **不能 → `check` 留空，整条交给 AI**，别写个"看起来有判据"的假 check：
 
    | 预期里有这类词 | 为什么代码判不了 |
    |---|---|
@@ -284,9 +284,9 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
    | **跳出去之后是哪个界面** | 外部界面不受我们控制，写死必误报 |
    | 颜色数 / 有几种 / 长什么样 | 数量、外观要看图 |
 
-   > ⚠️ `check: null` 时，**`desc` 是 AI 唯一的指令**。
+   > ⚠️ `check` 为空时，**`desc` 是 AI 唯一的指令**。
    > 把"要验什么、怎么算过"写进 `desc`，别只写"功能正常"。
-   > （`AssertSpec` 只有 `id`/`desc`/`check` 三个字段，没有额外传话的位置。）
+   > （`AssertSpec` 只有 `id`/`step`/`desc`/`check`，没有额外传话的位置。）
 
    > 交 AI 不等于丢证据：AI 判定那一刻拿得到 activity、可点控件列表、
    > 见过的 rid 和截图 —— 比单判 activity 更全。
@@ -354,7 +354,7 @@ YAML 里 `confidence: verified` 表示已经跑通过多次，可信度高。
 
 **两种模板，二选一照抄 —— 不要混用**（同时给 `case_name` 和结构会打架）。
 
-有现成 YAML 时：
+有现成用例时：
 
 ```
 subagent(
@@ -372,9 +372,9 @@ subagent(
 )
 ```
 
-⚠️ **`case_name` 方式默认会回写 YAML**（`writeback=true`）—— 只改每步的
-`locate`（点哪个控件），不动 `landing`/`asserts`。这是有意的自我校准。
-如果你只想看看、不想落盘，在派发时明确加一句"用 `writeback=false` 跑"。
+⚠️ **跑完会生成 `case_learned.json`**：记录这次每一步的实测证据（点在哪、
+界面变没变、断言判了什么）。那是**经验沉淀**，供下次参考，
+不会覆盖你写的 `landing` / `asserts`。
 
 现场拆的（把上面那份 JSON 原样贴进去）：
 
@@ -420,7 +420,7 @@ subagent(
 | 字段 | 怎么用 |
 |---|---|
 | `steps_done` | **= 0 表示一步都没跑**。这时不许产出"功能正常/不正常"的结论 |
-| `engine` | `autopilot` = 没调模型，只验了 YAML 结构，**不是用例结论** |
+| `engine` | `autopilot` = 没调模型，只验了用例结构，**不是用例结论** |
 | `status` | 见下表 |
 
 ### ★ 三个状态的含义（转述时不能混）
@@ -468,7 +468,7 @@ BLOCKED 只说明"没走到/没跑完"，要么是路径变了，要么是设备
 ## 常见误判（别踩）
 
 - **`steps_done=0` + `BLOCKED`** → 没跑起来，不是功能有问题
-- **`engine=autopilot` 的 PASS** → 只说明 YAML 结构没问题，功能没验证
+- **`engine=autopilot` 的 PASS** → 只说明用例结构没问题，功能没验证
 - **设备锁屏/掉线** → 表现为"点了没反应"，看 `issues` 里有没有设备相关字样
 - **`content.some is not a function`** → 工具层 bug，不是你的问题，
   把原始报错转给用户

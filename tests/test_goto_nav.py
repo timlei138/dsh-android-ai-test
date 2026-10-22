@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.stdout.reconfigure(encoding="utf-8")
 
-import android_agent.cases.loader as case_yaml  # noqa: E402
+import android_agent.cases.loader as cases_loader  # noqa: E402
 import android_agent.agent.nodes as ca  # noqa: E402
 
 CASES = Path(__file__).resolve().parents[1] / "assets" / "storage" / "cases"
@@ -42,43 +42,36 @@ def check(name: str, cond: bool, got: object = "") -> None:
 
 
 print("=== 1) 带 goto 的用例真的产出了 nav 前提 ===")
-# ⚠️ 早先遍历 assets/storage/cases/*.yaml 统计"至少 8 个 goto"。
-# 但用例 YAML 会被**主动清理**（含旧坐标/locate_seq 的会删掉重生成），
+# ⚠️ 早先遍历用例目录统计"至少 8 个 goto"。
+# 但用例文件会被**主动清理**（含旧坐标/locate_seq 的会删掉重生成），
 # 目录随时可能为空 —— 那样这个测试就变成"看运气过"，
 # 而且它其实想测的是**解析逻辑**，不是"仓库里有几个用例"。
 # 改成喂一份内置样例：逻辑对不对与仓库现状无关，才不会假过也不会假挂。
-_SAMPLE = """
-meta:
-  case_id: sample_goto
-  title: goto 解析样例
-  package: com.demo
-preconditions:
-  - type: goto
-    desc: 进课程表
-    do: 点 iv_more 再点 课程表
-    target:
-      activity: .timetable.display.TimetableActivity
-  - type: goto
-    desc: 无需导航（已在首页）
-    do: 无
-    target:
-      activity: .AllInOneActivity
-steps:
-  - id: s1
-    desc: 点导入
-    target: rid=btnImport
-    landing: activity=.Picker
-assertions:
-  - id: a1
-    desc: 到选择器
-    check: activity=.Picker
-"""
+_SAMPLE = """{
+  "case_id": "sample_goto",
+  "title": "goto 解析样例",
+  "package": "com.demo",
+  "preconditions": [
+    {"kind": "nav", "desc": "进课程表", "do": ["点 iv_more", "点 课程表"],
+     "hint": "点 iv_more 再点 课程表",
+     "target": "activity=.timetable.display.TimetableActivity"},
+    {"kind": "nav", "desc": "无需导航（已在首页）", "do": [],
+     "hint": "无", "target": "activity=.AllInOneActivity"}
+  ],
+  "steps": [
+    {"id": "s1", "desc": "点导入", "target": "rid=btnImport",
+     "landing": "activity=.Picker"}
+  ],
+  "asserts": [
+    {"id": "a1", "desc": "到选择器", "step": "s1", "check": "activity=.Picker"}
+  ]
+}"""
 
-tmp_sample = Path(__file__).resolve().parents[1] / "tmp" / "_goto_sample.yaml"
+tmp_sample = Path(__file__).resolve().parents[1] / "tmp" / "_goto_sample.json"
 tmp_sample.parent.mkdir(parents=True, exist_ok=True)
 tmp_sample.write_text(_SAMPLE, encoding="utf-8")
 
-spec, _ = case_yaml.load_case(tmp_sample)
+spec, _ = cases_loader.load_case(tmp_sample)
 navs = [pc for pc in spec.preconditions if pc.kind == "nav"]
 total_nav = len(navs)
 check("goto 被接住（不是消失）", total_nav == 2, [pc.kind for pc in spec.preconditions])

@@ -112,8 +112,7 @@ def _pick_device() -> str | None:
     return usable[0] if len(usable) == 1 else None
 
 
-def _run_locked(*, spec, answer, serial, skill_root, spec_in,
-                engine, ypath, yaml_ref, warns):
+def _run_locked(*, spec, answer, serial, skill_root, spec_in, engine):
     """真正执行用例。**只在持有设备锁时调用。**
 
     单独抽出来，是为了让 `with` 的范围一眼看清：从起点检查到断言，
@@ -128,17 +127,6 @@ def _run_locked(*, spec, answer, serial, skill_root, spec_in,
         # ★ 引擎走参数进来（不是事后给 report 赋值）——
         #   报告文件是 finish 节点写的、run_case 再读回来，事后赋值改不到文件里。
         engine=engine,
-        # ★ 回写/生成目标：
-        #   · 从 YAML 加载的用例 -> 回写（只改和实际不一致的地方）
-        #   · 没有 YAML（首次跑）-> 跑完自动生成一份
-        #   两种都由 runner 按 case_yaml_path 是否为 None 自动分流。
-        #   ⚠️ 用 ypath 判，不要用 yaml_ref：回退跑的时候 yaml_ref 有值
-        #      （case_name 还在）但文件不存在，用 yaml_ref 判会当成"有文件"。
-        case_yaml_path=(str(ypath) if ypath else None),
-        writeback=bool(spec_in.get("writeback", True)),
-        # ★ 未采纳的判据字段必须进报告。
-        #   只 print 到 stdout 等于没有 —— 主 Agent 读的是报告。
-        yaml_warnings=list(warns) if ypath else [],
     )
 
 
@@ -181,50 +169,40 @@ def main() -> int:
 
     try:
         # ★ 两种入口：
-        #   case_yaml / case_name -> 吃现成的用例 YAML
-        #   否则                  -> 吃主 Agent 现场拆的 steps/asserts JSON
-        _yaml_ref = spec_in.get("case_yaml") or spec_in.get("case_name")
-        # 回写目标：先置空，只有真从 YAML 加载了才填（见下方 if _yaml_ref）
-        ypath = None
-        _from_yaml = False
-        # ★ 必须先初始化：没走 YAML 的分支不会赋值，
-        #   后面 `warns if _yaml_ref else []` 仍会引用它 —— 会 UnboundLocalError。
+        #   case_name -> 从用例库按名字加载 JSON 用例
+        #   否则      -> 吃主 Agent 现场拆的 steps/asserts JSON
+        #
+        # ⚠️ YAML 入口已整体删除（用户：「删除所有的YAML文件」）。
+        _case_ref = spec_in.get("case_name") or spec_in.get("case_json")
+        _from_file = False
         warns: list[str] = []
-        if _yaml_ref:
+        if _case_ref:
             from android_agent.cases.loader import load_case, load_case_by_name
-            if spec_in.get("case_name") and not spec_in.get("case_yaml"):
-                try:
-                    spec, warns, ypath = load_case_by_name(
-                        str(spec_in["case_name"]))
-                    _from_yaml = True
-                except FileNotFoundError:
-                    # ★ 没 YAML 但有 steps -> 照跑，跑完 runner 会"首次生成" YAML。
-                    #
-                    #   以前这里直接抛出去变成 BLOCKED「没有 YAML 无法执行」，
-                    #   于是形成死循环：没 YAML 不能跑 -> 跑完才生成 -> 永远不生成。
-                    #   （用户实测踩到：第一次报没 YAML，第二次重跑才行。）
-                    if not spec_in.get("steps"):
-                        raise
-                    print(f"[yaml] 还没沉淀 YAML（{spec_in['case_name']}），"
-                          f"用现场拆的 steps 跑；跑完会自动生成一份", flush=True)
-                    ypath = None
-            else:
-                from pathlib import Path as _P
-                ypath = _P(str(_yaml_ref))
-                spec, warns = load_case(ypath)
-                _from_yaml = True
-            if _from_yaml:
-                # 未采纳的字段**必须报出来** —— 静默忽略正是最容易出问题的地方
+            try:
+                if spec_in.get("case_json"):
+                    spec, warns = load_case(str(spec_in["case_json"]))
+                else:
+                    spec, warns, _ = load_case_by_name(str(_case_ref))
+                _from_file = True
+            except FileNotFoundError:
+                # ★ 库里还没有这份用例但有 steps -> 用现场拆的照跑。
+                #
+                #   以前这里直接抛出去变成 BLOCKED「没有用例无法执行」，
+                #   于是形成死循环：没文件不能跑 -> 跑完才生成 -> 永远不生成。
+                if not spec_in.get("steps"):
+                    raise
+                print(f"[case] 还没沉淀用例（{_case_ref}），"
+                      f"用现场拆的 steps 跑", flush=True)
+            if _from_file:
                 for w in warns:
-                    print(f"[yaml] ⚠️ 未采纳：{w}", flush=True)
-                # 允许调用方覆盖（如只跑某一步做调试）
+                    print(f"[case] ⚠️ 未采纳：{w}", flush=True)
                 if spec_in.get("perm_action"):
                     spec.perm_action = spec_in["perm_action"]
-                print(f"[yaml] 用例来自 {ypath.name}（{len(spec.steps)} 步 / "
+                print(f"[case] 用例 {spec.case_id}（{len(spec.steps)} 步 / "
                       f"{len(spec.asserts)} 断言 / {len(warns)} 条未采纳）",
                       flush=True)
-        # 没走 YAML（没给 case_name，或给了但还没沉淀）-> 用现场拆的 steps 构造
-        if not _from_yaml:
+        # 没走文件 -> 用现场拆的 steps 构造
+        if not _from_file:
             spec = CaseSpec(
                 case_id=str(spec_in.get("case_id") or "case"),
                 title=str(spec_in.get("title") or "未命名用例"),
@@ -298,8 +276,7 @@ def main() -> int:
     try:
         report = _run_locked(
             spec=spec, answer=_answer, serial=serial, skill_root=skill_root,
-            spec_in=spec_in, engine=_engine, ypath=ypath,
-            yaml_ref=_yaml_ref, warns=(warns if _from_yaml else []))
+            spec_in=spec_in, engine=_engine)
     finally:
         # 无论成功、异常、崩溃都要放锁 —— 否则下次直接死锁
         _lock.release()
@@ -358,18 +335,6 @@ def main() -> int:
                     except json.JSONDecodeError:
                         pass
         _rep = report.to_dict()
-        # ★ 记下这次跑的是哪个用例文件、当时那份内容。
-        #
-        # 只存路径不够 —— YAML 会被改（168 的 a3 判据就改过），
-        # 旧记录点开看到"新判据 + 旧结论"等于自欺。
-        # 所以在跑完这一刻把内容**快照**下来。
-        _yaml_path = str(ypath) if ypath else ""
-        _yaml_text = ""
-        if ypath:
-            try:
-                _yaml_text = _P(ypath).read_text(encoding="utf-8")
-            except OSError:
-                _yaml_text = ""      # 读不到就不存内容，路径照样存
         # 报告里的 steps_done 是"做了几步"，总步数在 summary 的
         # 「步骤 7/7」里 —— store 自己会去抠。
         run_id = _store.save_run(
@@ -383,8 +348,6 @@ def main() -> int:
                 "report": str(report_path),
                 "run_dir": str(_run_dir),
             },
-            case_yaml_path=_yaml_path,
-            case_yaml=_yaml_text,
         )
         print(f"[report] 已落库 run_id={run_id}", file=sys.stderr, flush=True)
     except Exception as _e:  # noqa: BLE001

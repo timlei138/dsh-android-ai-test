@@ -162,16 +162,18 @@ def main() -> None:
     dev = MockDevice()
     ctx = FakeCtx(RawMock(dev))
 
+    # ⚠️ 新图只有 8 个节点，knowledge 不再是独立节点 —— 模型请求查知识时
+    #    由 decide_node 内部的 _handle_knowledge 在这一轮里查完。
+    #    所以这里跟踪的是那个函数，不是图节点。
     visited: list[str] = []
-    orig = ca.knowledge_node
+    orig = ca._handle_knowledge
 
-    def spy(state):
+    def spy(state, out, action):
         visited.append("knowledge")
-        return orig(state)
+        return orig(state, out, action)
 
-    ca.knowledge_node = spy
+    ca._handle_knowledge = spy
     graph = ca.build_child_graph(ctx, InMemorySaver())
-    graph.nodes["knowledge"].func = spy  # 替换已注册的节点函数
 
     ca.set_context(ctx)
     cfg = {"configurable": {"thread_id": "kn-test"}}
@@ -192,8 +194,8 @@ def main() -> None:
 
     print(f"  中断轮次: {loops}")
 
-    print("\n=== 1. knowledge 分支被走通 ===")
-    check("knowledge 节点被访问", len(visited) >= 1, f"{len(visited)} 次")
+    print("\n=== 1. 查知识这条分支被走通 ===")
+    check("查知识被触发", len(visited) >= 1, f"{len(visited)} 次")
 
     print("\n=== 2. 模型第二轮确实收到了命中 ===")
     decides = [p for p in seen if p.get("kind") == "decide"]
@@ -211,7 +213,7 @@ def main() -> None:
            f"没有检索命中；各轮来源={['注入' if p['knowledge'].startswith('###') else '检索' for p in with_know]}"))
 
     print("\n=== 3. 不会无限检索 ===")
-    check("knowledge 访问次数受控", len(visited) <= 3, f"{len(visited)} 次")
+    check("查知识次数受控", len(visited) <= 3, f"{len(visited)} 次")
 
     print("\n=== 4. 最终结论 ===")
     check("跑到终态（无中断）", "__interrupt__" not in cur)

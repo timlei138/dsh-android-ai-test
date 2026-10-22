@@ -49,15 +49,6 @@ os.environ["ANDROID_SKILL_ROOT"] = str(ROOT / "assets")
 
 from android_agent.reporting import store as st  # noqa: E402
 
-YAML_TEXT = """# 测试用例
-case_id: 999
-title: 快照测试
-package: com.ex.app
-steps:
-  - id: s0
-    target: rid=ok
-"""
-
 REPORT = {
     "status": "PASS", "summary": "步骤 1/1，预期 1/1 已验证",
     "case_id": "999", "steps_done": 1, "engine": "langgraph",
@@ -67,29 +58,18 @@ REPORT = {
 }
 
 print("=" * 70)
-print("1) 用例快照能落库、能读回来（需求 2 的地基）")
+print("1) 运行记录能落库、能读回来")
 print("=" * 70)
 
-rid = st.save_run(case_name="999", report=REPORT, ledger_rows=[],
-                  case_yaml_path="D:/x/999_快照测试.yaml",
-                  case_yaml=YAML_TEXT, db=DB)
+rid = st.save_run(case_name="999", report=REPORT, ledger_rows=[], db=DB)
 run = st.get_run(rid, db=DB)
 ck("run_id 拿到了", rid > 0)
-ck("★ case_yaml_path 存下来了",
-   run["case_yaml_path"] == "D:/x/999_快照测试.yaml", str(run["case_yaml_path"]))
-ck("★ case_yaml 快照存下来了", run["case_yaml"] == YAML_TEXT,
-   repr((run["case_yaml"] or "")[:40]))
-ck("快照内容确实是 YAML 不是 JSON",
-   run["case_yaml"].lstrip().startswith("# 测试用例"))
+ck("★ report_json 存下来了", bool(run.get("report_json")))
 
-# 列表页不该拖着一堆 YAML 走
+# 列表页不该拖着一大坨 report_json 走
 items = st.list_runs(db=DB)
-ck("★ list_runs 不带 case_yaml（列表页用不上）",
-   "case_yaml" not in items[0])
-ck("★ list_runs 带 has_yaml 标记", items[0]["has_yaml"] == 1,
-   str(items[0].get("has_yaml")))
-ck("list_runs 带 case_yaml_path",
-   items[0]["case_yaml_path"] == "D:/x/999_快照测试.yaml")
+ck("★ list_runs 不带 report_json（列表页用不上）",
+   "report_json" not in items[0])
 
 print()
 print("=" * 70)
@@ -175,17 +155,15 @@ except Exception as e:  # noqa: BLE001
     old = {}
     print(f"          {type(e).__name__}: {e}")
 ck("★ 老库能打开", ok_old)
-ck("老记录 case_yaml 是 None（不是空串，前端能区分）",
-   old["case_yaml"] is None, repr(old["case_yaml"]))
-ck("★ 升级后新列存在", "case_yaml_path" in old)
+ck("老记录能读出 run_dir 列（升级后新增）", "run_dir" in old)
 
 # 升级后再存新记录，必须能写进去
 try:
     rid2 = st.save_run(case_name="new", report=REPORT, ledger_rows=[],
-                       case_yaml=YAML_TEXT, db=old_db)
-    ck("★ 升级后的老库能写新字段", st.get_run(rid2, db=old_db)["case_yaml"] == YAML_TEXT)
+                       paths={"run_dir": "D:/x/run1"}, db=old_db)
+    ck("★ 升级后的老库能写记录", st.get_run(rid2, db=old_db)["run_dir"] == "D:/x/run1")
 except Exception as e:  # noqa: BLE001
-    ck("★ 升级后的老库能写新字段", False, f"{type(e).__name__}: {e}")
+    ck("★ 升级后的老库能写记录", False, f"{type(e).__name__}: {e}")
 
 # 迁移要幂等（每次 connect 都跑）
 for _ in range(3):

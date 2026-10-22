@@ -50,7 +50,7 @@ def _fmt_pitfall(p) -> str:
     """pitfall 现在**只允许纯字符串**（StepSpec.pitfalls 是 list[str]）。
 
     旧的 `{text, from, quote_hash}` 写法已废弃 —— 那种 dict 模型读不到，
-    `case_spec_check.py` 会判 DEAD。这里保留 dict 分支只是为了
+    校验器会判 DEAD（该脚本已随 YAML 删除）。这里保留 dict 分支只是为了
     渲染历史文件时不炸，渲染结果与字符串一致（丢掉引用锚）。
     """
     if isinstance(p, dict):

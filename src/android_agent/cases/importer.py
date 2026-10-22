@@ -75,7 +75,7 @@ def _first_step_title(text: str, limit: int = 20) -> str:
     return ""
 
 
-def parse_raw(text: str, *, fallback_title: str = "") -> dict[str, str]:
+def parse_raw(text: str) -> dict[str, str]:
     """从原文里抠出 标题 / 优先级。抠不出来就留空，绝不瞎猜。
 
     两批文件格式不一样：
@@ -105,32 +105,22 @@ def parse_raw(text: str, *, fallback_title: str = "") -> dict[str, str]:
             out["priority"] = prio.group(1)
 
     if not out["title"]:
-        # 原文没题目：先退到 YAML 名，再退到第一条步骤，都没有就留空
-        out["title"] = fallback_title or _first_step_title(body)
+        # 原文没题目：退到第一条步骤，都没有就留空
+        out["title"] = _first_step_title(body)
     return out
 
 
-def yaml_title(yaml_name: str) -> str:
-    """`联想日历_167_首次进入课程表引导与空态.yaml` -> `首次进入课程表引导与空态`。
-
-    原文没题目时拿它补 —— YAML 是拆解时人工起的名字，比空着强。
-    """
-    stem = Path(yaml_name).stem
-    parts = stem.split("_", 2)
-    return parts[2] if len(parts) >= 3 else ""
 
 
-def scan(dirs: list[Path],
-         yaml_titles: dict[str, str] | None = None) -> list[dict[str, str]]:
+def scan(dirs: list[Path]) -> list[dict[str, str]]:
     """扫目录，返回每条原始用例的解析结果。同编号后者不覆盖前者。
 
     目录顺序有意义：先扫到的赢。`cal_cases` 排在前面是因为那是主库，
     `cases` 是后来那批课程表的补充。
 
-    yaml_titles：编号 -> YAML 名里的题目。原文没题目时优先用它 ——
-    那是拆解时人给的名字，比从步骤里抠的更准。
+    ⚠️ YAML 关联已删除（用户：「删除所有的YAML文件」「数据库可以全部清理掉」）。
+       以前会用 YAML 文件名里的题目兜底，现在只用原文本。
     """
-    titles = yaml_titles or {}
     seen: dict[str, dict[str, str]] = {}
     for d in dirs:
         if not d.is_dir():
@@ -146,7 +136,7 @@ def scan(dirs: list[Path],
                 continue
             if key in seen:
                 continue
-            meta = parse_raw(text, fallback_title=titles.get(key, ""))
+            meta = parse_raw(text)
             seen[key] = {
                 "case_key": key,
                 "raw_text": text.strip(),
@@ -157,18 +147,6 @@ def scan(dirs: list[Path],
     return list(seen.values())
 
 
-def yaml_index(cases_dir: Path) -> dict[str, str]:
-    """编号 -> YAML 文件名。一个编号有多份时取文件名最短的（最像正主）。"""
-    out: dict[str, list[str]] = {}
-    if not cases_dir.is_dir():
-        return {}
-    for f in sorted(cases_dir.glob("*.yaml")):
-        if f.name.startswith("_"):
-            continue            # _test_invalid.yaml 这类是校验夹具，不是真用例
-        key = store.case_number(f.name)
-        if key:
-            out.setdefault(key, []).append(f.name)
-    return {k: sorted(v, key=len)[0] for k, v in out.items()}
 
 
 def import_all(*, db: str | Path | None = None,
@@ -193,11 +171,7 @@ def import_all(*, db: str | Path | None = None,
     dirs = dirs if dirs is not None else raw_case_dirs()
     cases_dir = cases_dir if cases_dir is not None else _cases_dir()
 
-    # ★ YAML 索引要先算：原文没题目时，YAML 里的题目是最优先的兜底
-    yidx = yaml_index(cases_dir)
-    titles = {k: yaml_title(v) for k, v in yidx.items()}
-
-    rows = scan(dirs, titles)
+    rows = scan(dirs)
     have = {c["case_key"] for c in store.list_cases(db=db)}
     created = updated = skipped = 0
     for r in rows:
@@ -214,19 +188,6 @@ def import_all(*, db: str | Path | None = None,
         else:
             skipped += 1
 
-    # ── 关联 YAML ──
-    linked = 0
-    for key, yname in yidx.items():
-        if store.set_case_yaml(key, yname, db=db):
-            linked += 1
-    # 反向：YAML 没了就解除关联（别留一个指向不存在文件的链接）
-    unlinked = 0
-    for c in store.list_cases(db=db):
-        yn = c.get("yaml_name")
-        if yn and not (cases_dir / yn).is_file():
-            store.set_case_yaml(c["case_key"], None, db=db)
-            unlinked += 1
-
     # 库里已有、但这次没扫到的用例（文件夹里删了 / 编号改了）——
     # **不自动删行**：原文已经在库里，可能是用户后来在网页上改过的唯一副本。
     # 只报出来，让人自己决定。
@@ -239,8 +200,6 @@ def import_all(*, db: str | Path | None = None,
         "cases_dir": str(cases_dir),
         "files": len(rows),
         "created": created, "updated": updated, "skipped": skipped,
-        "yaml_total": len(list(cases_dir.glob("*.yaml"))) if cases_dir.is_dir() else 0,
-        "linked": linked, "unlinked": unlinked,
         "not_in_folder": orphans,
         "total_in_db": len(store.list_cases(db=db)),
     }

@@ -54,9 +54,9 @@ echo '{"case_name":"168"}' | .venv/Scripts/python.exe run_case_json.py
 | 区块 | 内容 |
 |---|---|
 | 总览 | 三段式仪表盘：用例总数 + 通过率、用例结论环形图、最近三天成败柱；下面按用例列 |
-| 用例库 | `storage/cases/` 下的用例清单，点进去看 **YAML 原文**（只读） |
+| 用例库 | `storage/cases/` 下的用例清单，点进去看 **原始用例原文**（只读） |
 | 运行记录 | 历次运行列表（历史不再互相覆盖） |
-| 原始用例 | 详情页顶部：这次跑的是哪个 YAML、**跑的那一刻的内容快照** |
+| 跑的是哪份 | 详情页顶部：这次跑的用例名 + 报告 JSON 快照 |
 | 断言结果 | 每条断言 PASS/FAIL + 判定依据（代码判的还是模型判的） |
 | 自动化率 | 代码直点 vs 交给模型的比例，附降级原因 |
 | 动作时间轴 | 每次点击/输入/按键：目标、点前点后页面、耗时、是否触发变化、**截图** |
@@ -66,19 +66,13 @@ echo '{"case_name":"168"}' | .venv/Scripts/python.exe run_case_json.py
 每次运行都会落一条历史到 `assets/storage/runs.db`（本地数据，不入库），
 所以「同一用例上次过没过、这次为什么变了」查得到。
 
-### 为什么要存用例快照，而不只存路径
+### 每次跑完都留一份完整报告
 
-YAML 是会被改的。168 的 a3 判据就改过三次：
+用例是会被改的（判据松紧、落点、断言都在调）。如果旧记录只存用例名，
+点开历史看到的就是「新判据 + 旧结论」，说不清当初到底是照着什么判的。
 
-1. 钉死 `PhotoPickerGetContentActivity`
-2. 改成 `album_reached` 关键词匹配
-3. 最后**删掉判据，交模型判**
-
-如果旧记录只存路径，点开历史看到的就是「新判据 + 旧结论」——
-反过来说不清当初到底是照着什么判的。所以跑完那一刻把 YAML 内容
-一起存进 `runs.case_yaml`，详情页优先显示快照，并标明「跑的时候那份」。
-更早的记录没有快照，页面会显式提示「这次没存快照，下面是当前文件」，
-而不是拿新文件冒充旧文件。
+所以每次跑完，`report_json` 整个进 `runs.db`，详情页直接渲染那一份 ——
+历史记录永远是"当时那份"，不会被后来的改动污染。
 
 ### 仪表盘的口径
 
@@ -124,16 +118,17 @@ YAML 是会被改的。168 的 a3 判据就改过三次：
 
 ```
 主 Agent（拆用例、派任务）
-    │  用例结构 + 知识卡路径 + 已有 YAML 路径
+    │  用例结构 + 知识卡路径 + 已有 JSON 用例路径
     ▼
 子 Agent（run_case_json.py）
     │
     ├─ 前提（pm clear / 拉起 App）
-    ├─ 逐步骤执行 ──┐
+    ├─ 逐步骤执行，边走边验 ──┐
     │               ├─ 强证据直点（代码）
     │               ├─ 判不了 → 模型决策
-    │               └─ 视觉模型（颜色/布局）
-    └─ 断言判定（代码优先）
+    │               ├─ 视觉模型（颜色/布局/形状）
+    │               └─ XML 变了 = 证据（代码直接判）
+    └─ 最后按记录写 case_learned.json
 ```
 
 ### 目录
@@ -143,7 +138,7 @@ langgraph-poc/
 ├── run_case_json.py          ← 入口：stdin 收 {case_name}，stdout 出报告 JSON
 │
 ├── src/android_agent/
-│   ├── cases/                用例层：读 YAML、算路径
+│   ├── cases/                用例层：读 JSON 用例、算路径
 │   ├── device/               设备层：唯一允许碰 adb 的地方
 │   │   └── direct.py           进程内设备实现（含权限就地处置）
 │   ├── agent/                Agent 层：LangGraph 状态机
@@ -151,19 +146,18 @@ langgraph-poc/
 │   │   ├── graph.py            用例级图
 │   │   ├── runner.py           interrupt 循环驱动、死循环检测
 │   │   └── decide.py           决策通道（渲染 prompt、校验回复）
-│   └── report/               报告层
-│       ├── writeback.py        YAML 回写（只写代码直点的动作）
-│       └── generate.py         首次跑完后生成 YAML
+│   └── reporting/            落库层
+│       └── store.py            runs / cases / actions / findings（SQLite）
 │
 ├── assets/
 │   ├── tools/                  工具层：observe / act / perm / vision ...
 │   ├── knowledge/              知识卡（每个包一份，供子 Agent 查询）
-│   └── storage/cases/          用例 YAML
+│   └── storage/cases/          用例 JSON / 原始用例原文
 │
 ├── scripts/                  一次性工具脚本（审计、调试）
 ├── tests/                    测试
 ├── tmp/                      临时产物（不进版本控制）
-└── docs/执行机制.md            ★ 架构与规则的完整说明
+└── docs/执行链路-边走边验.md    ★ 当前执行链路与判定规则
 ```
 
 ---
@@ -214,13 +208,15 @@ langgraph-poc/
 
 ## 强证据直点
 
-YAML 里每一步写 `target`，表示**这一步要点哪个控件**：
+用例里每一步写 `target`，表示**这一步要点哪个控件**：
 
-```yaml
-- id: s1
-  target: rid=iv_more
-  landing: activity=.timetable.display.TimetableActivity
-  desc: 点首页右上角「更多」按钮，进入课程表页面
+```json
+{
+  "id": "s1",
+  "desc": "点首页右上角「更多」按钮，进入课程表页面",
+  "target": "rid=iv_more",
+  "landing": "activity=.timetable.display.TimetableActivity"
+}
 ```
 
 执行时按当前屏去找这个 target：
@@ -283,66 +279,61 @@ com.android.permissioncontroller   ← 系统权限框（跨设备通用）
 「点过允许按钮」≠「授权成功」。dumpsys 查不到就如实记「未能确认」，
 绝不默认成「已授予」。
 
-### 只记账，不进 YAML
+### 只记账，不进用例
 
-系统权限框是平台标准流程，每个 App 都一样 —— 写进用例 YAML 没有任何信息量，
+系统权限框是平台标准流程，每个 App 都一样 —— 写进用例没有任何信息量，
 只会让文件变脏、把平台通用行为冒充成这个 App 的经验。
 
-**但点过什么必须留下** —— 授权是不可逆的现场变更，审计要查。所以分两个出口：
+**但点过什么必须留下** —— 授权是不可逆的现场变更，审计要查。所以：
 
 ```
 点过的权限   → report.runtime_permissions / runtime_permission_prompts
-权限框动作   → 永不进入 YAML（writeback / generate 两道都过滤）
+权限框动作   → 永不写进用例（只出现在 report 和动作账本里）
 ```
-
 ---
 
-## 用例 YAML
+## 用例格式（JSON）
 
-YAML 是**一级参考，不是执行脚本**。它记录「这一步想做什么、做到什么算完」，
-不记录怎么点。
+用例是**一级参考，不是执行脚本**。它记录「这一步想做什么、做到什么算完」，
+不记录怎么点。只支持 JSON —— YAML 那套（含回写、首次生成、字段白名单校验）
+已整体删除，见 `docs/重写-结果.md`。
 
-```yaml
-meta:
-  case_id: "168"
-  title: 联想日历_168_图库导入入口
-  package: com.zui.calendar
-  knowledge_files:
-    - knowledge/com.zui.calendar.md
-
-per_step_pitfalls: true      # 坑按步给，不汇总（防稀释）
-
-preconditions:
-  - kind: data
-    do: pm clear com.zui.calendar
-    skip_if: {activity: .AllInOneActivity}
-  - kind: nav
-    target: activity=.AllInOneActivity
-    assert_start: activity=.AllInOneActivity
-
-steps:
-  - id: s0
-    desc: 依次点掉 pm clear 后弹出的两个框，落回日历首页
-    target: rid=button1
-    landing: activity=.AllInOneActivity
-    pitfalls:
-      - "顺序不能反：先 button1「同意」，再 timetable_guide_button「我知道了」"
-      - "权限说明框是日历自己的（包名仍是 com.zui.calendar），不是系统权限框"
-  - id: s1
-    desc: 点右上角「更多」（iv_more），在菜单里选「课程表」，进入课程表页
-    target: rid=iv_more
-    landing: activity=.timetable.display.TimetableActivity
-    know:
-      where: 首页 → 课程表
-      why_this: 课程表入口不在首页直接露出来，藏在「更多」菜单里
-    pitfalls:
-      - "iv_more 没有 text/desc —— 用文案找「更多」会找不到，必须按 rid 定位"
-
-asserts:
-  - id: a1
-    desc: 可打开课程表页面
-    check:
-      activity: .timetable.display.TimetableActivity
+```json
+{
+  "case_id": "168",
+  "title": "联想日历_168_图库导入入口",
+  "package": "com.zui.calendar",
+  "preconditions": [
+    {"kind": "data", "do": ["pm clear com.zui.calendar"],
+     "skip_if": {"activity": ".AllInOneActivity"}},
+    {"kind": "nav", "desc": "走到首页",
+     "target": "activity=.AllInOneActivity",
+     "assert_start": "activity=.AllInOneActivity"}
+  ],
+  "steps": [
+    {
+      "id": "s0",
+      "desc": "依次点掉 pm clear 后弹出的两个框，落回日历首页",
+      "target": "rid=button1",
+      "landing": "activity=.AllInOneActivity",
+      "pitfalls": [
+        "顺序不能反：先 button1「同意」，再 timetable_guide_button「我知道了」",
+        "权限说明框是日历自己的（包名仍是 com.zui.calendar），不是系统权限框"
+      ]
+    },
+    {
+      "id": "s1",
+      "desc": "点右上角「更多」（iv_more），在菜单里选「课程表」",
+      "target": "rid=iv_more",
+      "landing": "activity=.timetable.display.TimetableActivity",
+      "pitfalls": ["iv_more 没有 text/desc —— 用文案找「更多」会找不到，必须按 rid 定位"]
+    }
+  ],
+  "asserts": [
+    {"id": "a1", "step": "s1", "desc": "可打开课程表页面",
+     "check": {"activity": ".timetable.display.TimetableActivity"}}
+  ]
+}
 ```
 
 **写什么**
@@ -351,9 +342,8 @@ asserts:
 - `landing` — 做到什么算完成，必须是**稳定的终态**
 - `desc` — 这一步的意图，要具体（「点右上角更多打开菜单」，不是「点更多」）
 - `pitfalls` — 这一步会踩什么坑，**跟着步走，不汇总**
-- `know` — 这一步为什么这么点（`where` / `why_this` / `locate`）
 - `preconditions` — `kind: data`（清数据）/ `kind: nav`（走到起点）
-- `confidence` — 这条链路验证到什么程度、还差什么
+- `asserts[].step` — **必填**。断言绑不到步骤，判定时就取不到该步的证据快照
 
 **不写什么**
 
@@ -361,7 +351,28 @@ asserts:
 - ❌ `locate_seq` 坐标序列 —— 同上，且隐藏了真实意图
 - ❌ 权限框动作 —— 标准流程，各 App 一样
 
-不认识的字段会**报 warning**（不静默忽略），避免写了没生效。
+字段不认识就报 warning（`cases/loader.py`），不静默忽略。
+
+### 执行是「边走边验」，不是「走完再回头验」
+
+早期的做法是：先把所有步骤走完，再统一判所有断言。这有个硬伤 ——
+判的时候屏幕上早就不是那一步的界面了，只能拿最后一屏硬判。
+
+168 实跑就撞上：a1 判据是 `activity=.timetable.display.TimetableActivity`，
+但流程走完时屏幕上已是系统图库选择器，于是被判 FAIL ——
+可日志显示第 5-8 轮确实停在过课程表页。
+
+现在的链路是一步一验：
+
+```
+点击 → 观察变化 →
+  ├─ Activity 变了     → 这就是证据，落点达成 ✅
+  ├─ 出现新控件        → 控件就是证据 ✅
+  └─ XML 没变化        → 交给 AI 现场判断 ❓
+```
+
+判定顺序固定为：**先验这一步的断言，再走下一步**。证据跟着步骤走，
+每一步的记录都落在 `clicks.jsonl`（原始动作）和 `case_learned.json`（结论）。
 
 ### 落点判据必须是稳定终态
 
@@ -375,8 +386,8 @@ asserts:
 
 168 的 a3 原来写死：
 
-```yaml
-activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
+```json
+"check": {"activity": "com.android.providers.media.photopicker.PhotoPickerGetContentActivity"}
 ```
 
 同一个用例在真机上，系统这次给 `PhotoPickerGetContentActivity`，
@@ -388,19 +399,13 @@ activity: com.android.providers.media.photopicker.PhotoPickerGetContentActivity
 > 打开相册。我不管打开的是哪个相册。打开就行了。
 
 Activity 类名是实现细节，换 Android 版本、换 ROM 就变。钉死它等于自找误报。
-所以用判"界面用途"的判据：
+所以用判"界面用途"的判据 —— `album=any`（任一类选图界面都算）：
 
-```yaml
-# 断言
-check:
-  album_reached: true        # 任一类选图界面都算
-  # album_reached: {kinds: [photopicker]}   也可以收窄范围
-
-# 落点
-landing: album=any
+```json
+"landing": "album=any"
 ```
 
-判的是什么：前台 activity 属于系统图片选择器 / 文档选择器 / 相册类 App
+判的是前台 activity 属于系统图片选择器 / 文档选择器 / 相册类 App
 （`photopicker` `mediapicker` `documentsui` `gallery` `photos` `album`），
 并且**排除**权限框、桌面这些会混淆的界面。
 
@@ -410,16 +415,17 @@ landing: album=any
 > 判宽的界在这里：`_ALBUM_EXCLUDES` 里那几类是**必须判假**的。
 > 把权限框当成"已打开相册"就是漏测 —— `tests/test_album_reached.py` 盯着这一点。
 
-### 只有代码直点的动作会回写进 YAML
+### XML 判不了的交视觉模型
 
-模型点的动作是**猜测**，不是经验。把猜测写进用例，下次就照着错误的路子走。
+颜色、形状、布局这类东西 XML 里根本没有描述（比如课程表配色面板：
+XML 里只有「取消」和「完成」两个按钮，**一个「颜色」字样都没有**，
+10 个色块只能靠看图数）。
 
-所以动作记录带 `by` 字段（`code` / `model`），回写只认 `by == "code"`。
-实测踩到：回写把 s1 的 `iv_more` 改成了 `rid=button1`（那是 s0 的「同意」按钮）。
+所以规则是：**代码只判结构化事实（activity / rid / xpath / 控件集合），
+其余一律交视觉模型**。这条是通用做法，不是某一处特例。
 
-### 第一次跑完会生成 YAML
+---
 
-未知用例第一次跑，跑完自动落一份 YAML 作为下次的一级参考。
 
 ---
 
@@ -532,7 +538,7 @@ cd tests && for f in test_*.mjs; do node "$f"; done
 | `test_subagent_chain.py` | 子 Agent 执行链完整：插件 → 执行器 → 设备层，导入不断、stdout 干净 |
 | `test_subagent_contract.py` | 三层闸门都在：主 Agent 被拒、工具面收窄、报告字段齐 |
 | `test_skill_card_consistency.py` | 技能卡和 preset 不许提代码里不存在的参数/字段 |
-| `test_perm_autogrant.py` | 权限自动处置 + 只记账不进 YAML |
+| `test_perm_autogrant.py` | 权限自动处置 + 只记账不写进用例 |
 
 ---
 
@@ -562,6 +568,6 @@ cd tests && for f in test_*.mjs; do node "$f"; done
 
 ## 文档
 
-- **`docs/执行机制.md`** —— 架构与规则的完整说明，改判定逻辑前必读
+- **`docs/执行链路-边走边验.md`** —— 当前执行链路与判定规则，改判定逻辑前必读
 - `docs/开发记录-踩坑.md` —— 反复踩过的坑（尤其「不要重复造工具层的轮子」）
-- `assets/storage/cases/SPEC.md` —— 用例 YAML 的字段规范
+- `docs/重写-结果.md` / `docs/重写-保护清单.md` —— 这一轮重写的记录与保护项

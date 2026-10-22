@@ -113,8 +113,7 @@ def main():
     wd = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_permrec"
     report = sa.run_case(spec, answer=answer, serial=None, diag=True,
                          max_loops=12, workdir=wd,
-                         # ★ 生成物留在临时目录，别写进用例库（污染过 permrec_授权留痕）
-                         yaml_out_dir=wd, device=dev)
+                         device=dev)
 
     print("\n=== 1. 权限框被记录 ===")
     pg = report.permissions_granted

@@ -12,7 +12,7 @@
 ### ① 删用例不能连坐删历史
 
 旧 skill 是连坐的（删用例顺手删掉它全部记录）。这里刻意不学：
-记录里存着**跑的时候那份 YAML 快照**，是用例文件删掉之后唯一的判据副本。
+用例删掉之后历史记录仍然可复核（证据在 tmp/ 下，跟用例无关）。
 连坐 = 证据跟着一起销毁。
 
 ### ② 删文件必须圈在证据根内
@@ -71,7 +71,7 @@ def _mkrun(name, shots=(), log=None):
 
 
 print("=" * 70)
-print("1) 用例：原文和 YAML 绑在一行里")
+print("1) 用例：原文存取")
 print("=" * 70)
 
 ck("没有时返回 None（不拿空串冒充有）", st.get_case("999", db=db) is None)
@@ -92,17 +92,6 @@ ck("★ 空文本不覆盖（手滑清空不该丢数据）",
    st.save_case("999", raw_text="   ", db=db) == "skipped"
    and "新内容" in (st.get_case("999", db=db) or {}).get("raw_text", ""))
 
-# ★ 关联 YAML
-ck("★ 关联 YAML 返回 1",
-   st.set_case_yaml("999", "联想日历_999_某某.yaml", db=db) == 1)
-ck("★★ 关联后能读出来",
-   (st.get_case("999", db=db) or {}).get("yaml_name") == "联想日历_999_某某.yaml")
-ck("★ 改原文不会把关联冲掉（两件事分开写）",
-   st.save_case_raw("999", "又改了", db=db) is True
-   and (st.get_case("999", db=db) or {}).get("yaml_name") == "联想日历_999_某某.yaml")
-ck("解除关联", st.set_case_yaml("999", None, db=db) == 1
-   and not (st.get_case("999", db=db) or {}).get("yaml_name"))
-
 ck("空文本改原文返回 False", st.save_case_raw("999", "  ", db=db) is False)
 ck("删除返回 1", st.delete_case("999", db=db) == 1)
 ck("删完读不到", st.get_case("999", db=db) is None)
@@ -115,11 +104,11 @@ print("=" * 70)
 ck("★★ '13_日历_167.txt' 取 167 而不是 13（排序前缀不能当编号）",
    st.case_number("13_日历_167.txt") == "167", st.case_number("13_日历_167.txt"))
 ck("'03_日历_03.txt' -> 03", st.case_number("03_日历_03.txt") == "03")
-ck("YAML 名取编号",
-   st.case_number("联想日历_167_首次进入课程表引导与空态.yaml") == "167",
-   st.case_number("联想日历_167_首次进入课程表引导与空态.yaml"))
+ck("用例文件名取编号",
+   st.case_number("联想日历_167_首次进入课程表引导与空态") == "167",
+   st.case_number("联想日历_167_首次进入课程表引导与空态"))
 ck("纯数字名也能解析", st.case_number("167") == "167")
-ck("没有数字返回空串（不瞎猜）", st.case_number("nope.yaml") == "")
+ck("没有数字返回空串（不瞎猜）", st.case_number("nope") == "")
 
 print()
 print("=" * 70)
@@ -468,17 +457,14 @@ app = (ROOT / "webui" / "app.js").read_text(encoding="utf-8")
 
 ck("后端有 do_DELETE", "def do_DELETE" in src)
 ck("★ 删记录接口", 'path.startswith("/api/run/")' in src)
-ck("★★ 删用例接口（原文 + YAML 一起，用户要的那种简单）",
+ck("★★ 删用例接口",
    'path.startswith("/api/cases/")' in src and "st.delete_case(key)" in src)
-ck("★ 删 YAML 失败时不删库里的行（免得留孤儿文件）",
-   "为免留下孤儿文件" in src)
 ck("改原文接口", 'path.endswith("/raw")' in src and "save_case_raw" in src)
-ck("用例列表带关联 YAML 状态", '"yaml_exists"' in src)
 ck("用例列表带跑过几次", '"last_status"' in src)
-# ⚠️ runs.case_name 存的是编号，不是 YAML 名。拿 stem 去对必然空，且不报错。
+# ⚠️ runs.case_name 存的是编号，不是文件名。拿文件名去对必然空，且不报错。
 ck("★★ 统计按编号对（runs.case_name 存的是编号）",
    '_run_stats_by_case' in src and 'by_case.get(str(c["case_key"])' in src,
-   "拿 YAML stem 去对会整列显示未跑过")
+   "拿文件名去对会整列显示未跑过")
 
 ck("前端有删记录确认框", "function confirmDeleteRun" in app)
 ck("前端有删用例确认框", "async function confirmDeleteCase" in app)
@@ -488,8 +474,6 @@ ck("★ 用例库行上有删除按钮", "data-delcase=" in app)
 ck("★ 记录列表行上有删除按钮", "data-delrun=" in app)
 ck("详情页也有删除按钮", 'id="run-del"' in app)
 ck("用例详情页展示原始 case", "d.raw_text" in app)
-ck("★ 用例详情页同时展示关联的 YAML", "d.yaml" in app and "y.content" in app)
-ck("没 YAML 时明确说还没拆解", "还没拆解成 YAML" in app)
 
 print()
 print("=" * 70)

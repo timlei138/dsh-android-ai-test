@@ -9,13 +9,12 @@
 
 记录本身是**自足**的，不依赖用例还活着：
 
-    · 判据   —— 跑的那一刻已经把 YAML 全文快照进 runs.case_yaml
     · 证据   —— log / clicks.jsonl / 截图 / dump.xml 的路径存在
                 runs/actions 里，文件在 tmp/ 下，跟用例没关系
     · 断言   —— findings 表
     · 账本   —— actions 表
 
-所以删用例只该动两样：cases 那一行、磁盘上那个 YAML 文件。
+所以删用例只该动 cases 那一行。
 
 ## 这个测试在防什么
 
@@ -66,16 +65,9 @@ def counts(db):
 db = str(Path(tempfile.mkdtemp()) / "t.db")
 tmp = Path(tempfile.mkdtemp())
 
-# ── 造一条用例 + 一个 YAML + 两条记录 + 真实证据文件 ──
-CDIR = tmp / "cases"
-CDIR.mkdir()
-YAML_TEXT = ("case_id: '888'\ntitle: 删用例安全测试\n"
-             "steps:\n- id: s0\n  desc: 点一下\n  landing: activity=.A\n")
-(CDIR / "联想日历_888_删用例安全测试.yaml").write_text(YAML_TEXT, encoding="utf-8")
-
+# ── 造一条用例 + 两条记录 + 真实证据文件 ──
 st.save_case("888", title="删用例安全测试", raw_text="1. 打开日历\n预期：看到首页",
              db=db)
-st.set_case_yaml("888", "联想日历_888_删用例安全测试.yaml", db=db)
 
 # 两个真实的证据文件（截图 + dump）
 EV = tmp / "shots" / "run_A" / "step01"
@@ -95,39 +87,31 @@ r1 = st.save_run(
     report={"case_id": "888", "status": "PASS", "summary": "第一次跑",
             "steps_done": 1, "elapsed_s": 12.0,
             "progress": [{"t": time.time()}],
-            "findings": [], "strong_stats": {"auto_rate": 1.0},
-            "case_yaml": YAML_TEXT},
+            "findings": [], "strong_stats": {"auto_rate": 1.0}},
     ledger_rows=[{"seq": 1, "step": "s0", "action": "click", "x": 10, "y": 20,
                   "before_act": "A", "after_act": "B", "changed": 1, "ms": 5,
                   "shot_before": str(shot), "xml_before": str(xmlf)}],
     paths={"log": str(LOG), "ledger": str(LEDGER)},
-    case_yaml=YAML_TEXT,
-    case_yaml_path=str(CDIR / "联想日历_888_删用例安全测试.yaml"),
     db=db)
 r2 = st.save_run(
     case_name="888",
     report={"case_id": "888", "status": "FAIL", "summary": "第二次跑",
             "steps_done": 0, "elapsed_s": 8.0,
             "progress": [{"t": time.time()}],
-            "findings": [], "strong_stats": {"auto_rate": 0.5},
-            "case_yaml": YAML_TEXT},
+            "findings": [], "strong_stats": {"auto_rate": 0.5}},
     ledger_rows=[{"seq": 1, "step": "s0", "action": "click", "x": 11, "y": 21,
                   "before_act": "A", "after_act": "C", "changed": 1, "ms": 9,
                   "shot_before": str(shot), "xml_before": str(xmlf)}],
     paths={"log": str(LOG), "ledger": str(LEDGER)},
-    case_yaml=YAML_TEXT,
-    case_yaml_path=str(CDIR / "联想日历_888_删用例安全测试.yaml"),
     db=db)
 
 print("=" * 70)
-print("1) 删之前：记录是自足的（判据快照在库里，不靠 YAML 文件）")
+print("1) 删之前：记录是自足的")
 print("=" * 70)
 d1 = st.get_run(r1, db=db)
 d2 = st.get_run(r2, db=db)
 ck("两条记录都在", d1 is not None and d2 is not None)
-ck("★★ 判据快照在库里（删了文件也还在）",
-   len(d1.get("case_yaml") or "") == len(YAML_TEXT),
-   f"{len(d1.get('case_yaml') or '')} vs {len(YAML_TEXT)}")
+ck("★★ report_json 在库里（记录自足）", bool(d1.get("report_json")))
 ck("★ 证据路径存在库里", bool(d1["actions"][0].get("shot_before")))
 ck("证据文件此刻真实存在", shot.is_file() and xmlf.is_file())
 
@@ -158,7 +142,7 @@ d1b = st.get_run(r1, db=db)
 d2b = st.get_run(r2, db=db)
 ck("★★ 两条记录都还读得到", d1b is not None and d2b is not None)
 ck("★★ 状态没变", d1b["status"] == "PASS" and d2b["status"] == "FAIL")
-ck("★★★ 判据快照逐字没变", d1b.get("case_yaml") == d1.get("case_yaml"))
+ck("★★★ report_json 逐字没变", d1b.get("report_json") == d1.get("report_json"))
 ck("★★ 动作账本没少", len(d1b["actions"]) == len(d1["actions"]))
 ck("账本内容没变",
    [(a["x"], a["y"]) for a in d1b["actions"]]
@@ -174,9 +158,9 @@ ck("★★ 截图内容没变", shot.read_bytes().startswith(b"\x89PNG"))
 ck("★★ dump.xml 还在", xmlf.is_file())
 ck("★★ 运行日志还在", LOG.is_file() and "第二行" in LOG.read_text(encoding="utf-8"))
 ck("★★ 点击账本还在", LEDGER.is_file())
-# ⚠️ 只查**会执行的代码**，不查注释 —— delete_case 的 docstring 里正好写着
-#    "不碰磁盘上的 YAML …… 得由调用方显式做"，连文档一起搜会把自己的
-#    说明误判成违规（第一次写就踩了）。
+# ⚠️ 只查**会执行的代码**，不查注释/文档 —— delete_case 的 docstring 里
+#    会提到不碰磁盘上的文件，连文档一起搜会把自己的说明误判成违规
+#    （第一次写就踩了）。
 _src_store = (ROOT / "src" / "android_agent" / "reporting" /
               "store.py").read_text(encoding="utf-8")
 _body = _src_store.split("def delete_case")[1].split("\ndef ")[0]
@@ -207,7 +191,7 @@ app = (ROOT / "webui" / "app.js").read_text(encoding="utf-8")
 #    用这一段独有的注释当边界。
 start = src.index("# --- 删一条用例")
 tail = src[start:]
-end = tail.index("# --- 只删 YAML")
+end = tail.index('return self._err("没有这个接口", 404)')
 block = tail[:end]
 
 ck("★★★ 删用例那一段**没有** delete_run（否则级联删记录了）",
@@ -217,7 +201,7 @@ ck("★★★ 删用例那一段**没有** _purge_evidence（否则连截图一�
 ck("★★★ 删用例那一段**没有** rmtree（否则可能删掉整个证据目录）",
    "rmtree" not in block)
 ck("★ 只调了 delete_case", "st.delete_case(key)" in block)
-ck("★ 只 unlink 那一个 YAML 文件", "fp.unlink()" in block)
+ck("★ 删用例那段不碰任何磁盘文件", ".unlink(" not in block)
 
 ck("★★ 删之前先记下记录 id，删完再核对（不是事后编数字）",
    "runs_before = st.list_runs" in block and "ids_before" in block)

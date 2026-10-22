@@ -52,9 +52,13 @@ from android_agent.agent.nodes import (  # noqa: E402
 
 # 这些字段**能单独构成一次动作**：模型只给这一个字段，图就应该去执行它。
 # 新增字段时如果属于这一类，必须同时加进这里并改 route_after_decide。
+# ⚠️ need_knowledge / vision_question 以前是独立节点（knowledge / vision），
+#    15 个节点里有 3 个只是 decide 的分支产物。现在收进 decide 内部就地处理
+#    （查完/看完立刻再问一次模型），所以路由这里回 **check** ——
+#    它们仍然属于"这一轮没动作"，必须显式有分支，否则会掉进 else 被当成"有坐标"。
 ACTION_FIELDS = {
-    "need_knowledge": "knowledge",
-    "vision_question": "vision",
+    "need_knowledge": "check",
+    "vision_question": "check",
     "step_done": "check",
     "key": "act",
     "input_rid": "act",
@@ -91,10 +95,16 @@ for field, want in ACTION_FIELDS.items():
 
 print()
 print("3) 图的边必须连上这些节点")
-for node in ("knowledge", "vision", "act", "check"):
+# 新图只有 8 个节点：prep / plan / decide / act / check / verify / learn / finish。
+# knowledge、vision 已merged 进 decide，不再是图上的节点。
+for node in ("act", "check", "plan", "verify", "learn", "finish"):
     ck(f'decide 有通往 {node} 的边',
        f'"{node}": "{node}"' in _src,
        "add_conditional_edges 的映射表里缺这一项")
+for gone in ("knowledge", "vision"):
+    ck(f'{gone} 不再是图上的节点（已并入 decide）',
+       f'"{gone}": "{gone}"' not in _src,
+       "如果这里红了，说明又把它拆回去了 —— 确认是不是有意的")
 
 print()
 print('4) StepAction 里所有「动作型」字段都在测试清单里')

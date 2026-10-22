@@ -355,20 +355,6 @@ const apply = (ctx) => {
           description:
             "运行时权限策略；留空=默认同意（工具层自动点，抢 6 秒窗口）。只有测「拒绝分支」才填 deny。",
         },
-        writeback: {
-          type: "boolean",
-          description: [
-            "跑完是否把**实际走过的路径**回写进用例 YAML（默认 true）。",
-            "只在 case_name/有 YAML 文件时生效 —— 现场拆的用例没有文件可写。",
-            "改动会出现在报告 yaml_writeback.changed 里，并逐条列出",
-            "「YAML 原写 X / 实际走 Y」。",
-            "",
-            "⚠️ 只改 do:（怎么走），**绝不改 expect:/assertions:**（验收标准）——",
-            "标准是人写的需求，路径是工具的记录，两者不能混。",
-            "结论为 BLOCKED 时不回写（路径没走完，写进去会固化半截经验）。",
-            "想先看效果不改文件，传 false。",
-          ].join("\n"),
-        },
         answer: {
           type: "string",
           enum: ["model", "autopilot"],
@@ -532,8 +518,6 @@ const apply = (ctx) => {
           answer: args.answer ?? "model",
           skill_root: SKILL_ROOT,
           diag: true,
-          // 有 YAML 就回写，没有就"首次生成"——两种都由后端按有没有文件分流。
-          writeback: args.writeback ?? true,
         };
 
         // ★★ 一条用例只允许一个子 Agent 在跑。

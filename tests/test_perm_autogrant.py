@@ -141,44 +141,8 @@ ck("★ 权限框已在前台时沿用上一次的申请方（多权限链）",
    "self._last_perm_owner" in src and "is_system_perm_package(pkg)" in src)
 ck("★ permission 不再硬编码 None", "permission=perm_result" in src)
 
-print()
-print("=" * 68)
-print("7) ★★ 权限动作只记账，**不写进 YAML**")
-print("=" * 68)
-# 用户原话：「这种权限的我们只点击记录点击了哪些个权限。
-#            操作步骤不记录到 yaml 里面。因为都是按照标准走。」
-from android_agent.report.writeback import _actual_locate  # noqa: E402
-from android_agent.report.generate import _spec_to_actions  # noqa: E402
 
-# 系统权限框按钮：rid 特征
-perm_items = [
-    {"rid": "com.android.permissioncontroller:id/permission_allow_button_two",
-     "text": "允许"},
-    {"rid": "com.android.permissioncontroller:id/permission_allow_all_button",
-     "text": "全部允许"},
-    {"rid": "com.android.permissioncontroller:id/permission_deny_button",
-     "text": "拒绝"},
-]
-for it in perm_items:
-    ck(f"writeback 不写权限按钮 {it['rid'].split('/')[-1]}",
-       _actual_locate(it) is None, str(_actual_locate(it)))
-    ck(f"generate 不写权限按钮 {it['rid'].split('/')[-1]}",
-       _spec_to_actions(it) is None, str(_spec_to_actions(it)))
-
-# 只有文案（没有 rid）也要拦住
-ck("writeback 按文案拦住「允许」",
-   _actual_locate({"text": "允许"}) is None)
-ck("generate 按文案拦住「允许」",
-   _spec_to_actions({"text": "允许"}) is None)
-
-# ★ 业务按钮不能被误伤 —— 这是最容易写过头的地方
-for it in [{"rid": "com.zui.calendar:id/iv_more", "text": "更多"},
-           {"rid": "btnImportFromGallery", "text": "从图库导入课程表"},
-           {"key": "back"},
-           {"text": "课程表"}]:
-    ck(f"业务动作照常表达 {it.get('rid') or it.get('key') or it.get('text')}",
-       _actual_locate(it) is not None, str(_actual_locate(it)))
-
+# 原第 7 段（权限动作不写进回写/YAML）随 YAML 回写模块整体删除。
 print()
 print("=" * 68)
 print(f"  {FAIL} 失败 / {PASS + FAIL} 项")

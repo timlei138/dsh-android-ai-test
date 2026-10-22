@@ -8,6 +8,8 @@
 那条预期从来没验过，而且没人知道（warning 只打 stdout）。
 
 按用户原则「能完全确定的让代码判断」，包名**是唯一确定的**，必须交给代码。
+
+注：原第 4/5 段（加载器转 package= / yaml_unused_fields 进报告）随 YAML 整体删除。
 """
 import sys
 from pathlib import Path
@@ -34,7 +36,6 @@ def ck(name, cond, extra=""):
         print(f"  [FAIL] {name}" + (f" -> {extra}" if extra else ""))
 
 
-import android_agent.cases.loader as case_yaml  # noqa: E402
 import android_agent.agent.nodes as ca
 
 print("=" * 74)
@@ -79,58 +80,6 @@ hit, _ = ca.match_landing("package=com.zui.camera,activity=.CaptureActivity",
                           activity="com.zui.camera/.CaptureActivity")
 ck("AND 其一不满足 -> 不命中", not hit)
 
-print()
-print("=" * 74)
-print("4) ★ 加载器把 expect.package 转成 package= （不再丢弃）")
-print("=" * 74)
-from pathlib import Path
-import tempfile
-
-import android_agent.cases.loader
-
-d = Path(tempfile.mkdtemp())
-p = d / "c.yaml"
-p.write_text("""\
-meta:
-  case_id: 1
-  title: t
-  package: com.a
-steps:
-  - id: s1
-    desc: 到相机
-    expect:
-      package: com.zui.camera
-""", encoding="utf-8")
-spec, warns = case_yaml.load_case(p)
-landing = spec.steps[0].landing
-ck("landing 里有 package=", "package=com.zui.camera" in (landing or ""),
-   str(landing))
-ck("★ 不再报『无法表达』",
-   not any("package" in w and "无法" in w for w in warns), str(warns))
-
-print()
-print("=" * 74)
-print("5) ★ 报告要带『判据未生效』清单")
-print("=" * 74)
-from android_agent.agent.nodes import SubagentReport
-
-ck("报告有 yaml_unused_fields 字段",
-   "yaml_unused_fields" in SubagentReport.model_fields)
-r = SubagentReport(case_id="1", status="PASS", summary="x")
-ck("默认是空列表", r.yaml_unused_fields == [])
-
-import inspect
-
-import android_agent.agent.runner as sa
-
-src = inspect.getsource(sa.run_case)
-ck("run_case 接受 yaml_warnings", "yaml_warnings" in src)
-ck("把未生效判据塞进 issues", "判据未生效" in src)
-
-import run_case_json as rcj
-
-rsrc = inspect.getsource(rcj)
-ck("run_case_json 传了 warns", "yaml_warnings=list(warns)" in rsrc)
 
 print()
 print("=" * 74)

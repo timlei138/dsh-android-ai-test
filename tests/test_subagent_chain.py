@@ -121,7 +121,7 @@ print("4) 导入链完整（子 Agent 进程里不会半路 ImportError）")
 print("=" * 70)
 for mod in ("android_agent.agent.runner", "android_agent.agent.nodes",
             "android_agent.device.direct", "android_agent.cases.loader",
-            "android_agent.report.writeback", "android_agent.agent.vision",
+            "android_agent.reporting.store", "android_agent.agent.vision",
             "android_agent.agent.child_runner"):
     try:
         __import__(mod)

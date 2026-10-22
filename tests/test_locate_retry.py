@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from android_agent.agent.nodes import step_check_node, target_present  # noqa: E402
+from android_agent.agent.nodes import check_node, target_present  # noqa: E402
 
 ok = fail = 0
 
@@ -70,7 +70,7 @@ check("不可点的文案也能找到（靠 nodes_text 兜底）",
       target_present("text=课程表", clickable=[], nodes_text="课程表") is True)
 
 print("\n=== 2) 目标不在 -> 记一次，继续找 ===")
-out = step_check_node(state())
+out = check_node(state())
 check("记了 1 次尝试", out.get("locate_attempts") == 1,
       str(out.get("locate_attempts")))
 check("没直接判死（还在重试）", out.get("status") is None,
@@ -86,7 +86,7 @@ check("issues 里明确提示了",
       str(out.get("issues")))
 
 print("\n=== 3) 累计到上限 -> 停这一步（不无限找）===")
-out = step_check_node(state(locate_attempts=3))
+out = check_node(state(locate_attempts=3))
 check("第 4 次触发停止", out.get("status") == "BLOCKED",
       str(out.get("status")))
 check("说清是查找次数用尽",
@@ -96,11 +96,16 @@ check("推进到下一步（不卡死整条用例）",
 check("findings 标了 locate_exhausted",
       (out.get("findings") or [{}])[0].get("status") == "locate_exhausted",
       str(out.get("findings")))
-check("summary 提到 on_fail 策略",
-      "on_fail" in str(out.get("summary")), str(out.get("summary")))
+# 早先断言 summary 里有 "on_fail" —— 那是 YAML 时代的前提字段策略名，
+# YAML 已经整体删除，这个词不再存在。真正要保证的是：
+# **这一次查找失败只停这一步，不终止整条用例**（保护 30）。
+check("summary 说清了为什么停", "找不到" in str(out.get("summary")),
+      str(out.get("summary")))
+check("没有设 abort（不炸整条用例）", not out.get("abort"),
+      str(out.get("abort")))
 
 print("\n=== 4) 目标在 -> 根本不该消耗额度 ===")
-out = step_check_node(state(
+out = check_node(state(
     obs_clickable=[{"r": "iv_more", "c": [100, 200]}]))
 check("没有记尝试", out.get("locate_attempts") is None,
       str(out.get("locate_attempts")))
@@ -111,12 +116,12 @@ s2 = state()
 s2["task"] = {"steps": [{"id": "s1", "desc": "x",
                          "landing": "activity=Foo"}],
               "package": "com.zui.calendar"}
-out = step_check_node(s2)
+out = check_node(s2)
 check("不记尝试", out.get("locate_attempts") is None)
 check("不报错、正常重试", out.get("status") is None)
 
 print("\n=== 6) 换目标找的理由被记下来（区分 UI 变了 vs 模型乱试）===")
-out = step_check_node(state(action={"step_done": False,
+out = check_node(state(action={"step_done": False,
                                     "why": "想改用文本定位试试"}))
 tri = (out.get("locate_tried") or [{}])[0]
 check("why 被留痕", tri.get("why") == "想改用文本定位试试", str(tri))

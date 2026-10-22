@@ -15,7 +15,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from android_agent.agent import nodes as N          # noqa: E402
 from android_agent.agent.nodes import (             # noqa: E402
-    ChildState, LANDING_MAX_TRIES, route_after_plan, route_after_strong)
+    ChildState, LANDING_MAX_TRIES, route_after_plan, route_after_decide)
 
 OK = 0
 BAD = 0
@@ -38,13 +38,14 @@ ck("LANDING_MAX_TRIES == 3", LANDING_MAX_TRIES == 3, LANDING_MAX_TRIES)
 
 print()
 print("=" * 70)
-print("2) ★ 状态为 BLOCKED 时，route_after_plan 立刻去 finish")
+print("2) ★ 已 abort 时，route_after_plan 立刻去 finish")
 print("=" * 70)
 task = {"case_id": "t", "title": "t", "package": "p",
         "steps": [{"id": "s1"}, {"id": "s2"}, {"id": "s3"}], "asserts": []}
 
-st = ChildState(task=task, status="BLOCKED", step_index=1)
-ck("BLOCKED + 还有步骤 -> finish（不是继续跑）",
+# 新图里 BLOCKED 由 verify/check 置 abort，路由统一看 abort。
+st = ChildState(task=task, abort=True, step_index=1)
+ck("abort + 还有步骤 -> finish（不是继续跑）",
    route_after_plan(st) == "finish", route_after_plan(st))
 
 st_ok = ChildState(task=task, step_index=1)
@@ -53,16 +54,16 @@ ck("正常状态 -> 不会误判成 finish", r != "finish", r)
 
 print()
 print("=" * 70)
-print("3) ★ 状态为 BLOCKED 时，route_after_strong 不派发动作")
+print("3) ★ 已 abort 时，route_after_decide 不派发动作")
 print("=" * 70)
-st2 = ChildState(task=task, status="BLOCKED",
+st2 = ChildState(task=task, abort=True,
                  action={"next_x": 100, "next_y": 200})
-ck("BLOCKED 时即便有坐标也不去 act",
-   route_after_strong(st2) == "finish", route_after_strong(st2))
+ck("abort 时即便有坐标也不去 act",
+   route_after_decide(st2) == "finish", route_after_decide(st2))
 
 st3 = ChildState(task=task, action={"next_x": 100, "next_y": 200})
-ck("正常状态仍会去 act", route_after_strong(st3) == "act",
-   route_after_strong(st3))
+ck("正常状态仍会去 act", route_after_decide(st3) == "act",
+   route_after_decide(st3))
 
 print()
 print("=" * 70)

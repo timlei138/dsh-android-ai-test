@@ -35,15 +35,16 @@ print("=== 1) 资产目录必须在仓库内，不依赖外部目录 ===")
 check("assets/ 就是工作区内的目录",
       assets_dir() == HERE / "assets", str(assets_dir()))
 # ⚠️ 这条原来断言"用例目录非空"。写死路径会读成空目录，用它当哨兵是对的 ——
-# 但用例会被**主动清理**（含旧坐标/locate_seq 的旧 YAML 会被删掉重生成，
-# 见 docs/执行机制.md 3.2），清空是合法状态，不是故障。
-# 所以哨兵改成"目录存在且可读"，再单独确认 SPEC.md 这类资产还在 ——
-# 那才是"路径写死-> 读到别的空目录"真正会暴露的症状。
+# 但用例会被**主动清理**，清空是合法状态，不是故障。
+# 所以哨兵改成"目录存在且可读"，再单独确认一份**一定该在**的资产还在 ——
+# 那才是"路径写死 -> 读到别的空目录"真正会暴露的症状。
+# 原来拿 SPEC.md 当哨兵，那份 YAML 规范已随 YAML 一起删除；
+# 现在改用知识卡目录的模板，它同在 assets/ 下且长期存在。
 check("用例目录存在且可读",
       cases_dir().is_dir(), str(cases_dir()))
-check("用例目录的资产文件在（SPEC.md）",
-      (cases_dir() / "SPEC.md").exists(),
-      f"{len(list(cases_dir().glob('*.yaml')))} 个 yaml")
+_tpl = assets_dir() / "knowledge" / "_template.md"
+check("资产目录的常驻文件在（knowledge/_template.md）",
+      _tpl.is_file(), str(_tpl))
 
 print("\n=== 2) ★ 只有一个运行环境（仓库根 .venv）===")
 # 历史：这里曾经要求 assets/.venv 存在，因为 OCR 库 rapidocr-onnxruntime

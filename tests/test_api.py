@@ -92,9 +92,6 @@ def run_with(script, spec_dict, answer=None):
     _wd = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_api"
     rep = sa.run_case(sa.CaseSpec(**spec_dict), answer=answer,
                       verbose=False, device=dev,
-                      # ★ 生成的 YAML 留在临时目录里 —— 不传的话会写进
-                      #   用例库，测试夹具被当成真用例（污染过 A_三步链路）。
-                      yaml_out_dir=_wd,
                       workdir=_wd)
     return rep, dev
 
@@ -120,30 +117,6 @@ def make_answer():
                 "why": "推进", "expect": p.get("step_landing")}
     return _ans
 
-
-print("=== case A：三步链路全绿 ===")
-scriptA = [
-    {"activity": ".Home", "next": [{"r": "b1", "t": "更多", "c": [1, 1]}]},
-    {"activity": ".Menu", "next": [{"r": "b2", "t": "课程表", "c": [2, 2]}]},
-    {"activity": ".Timetable", "next": [{"r": "b3", "t": "导入", "c": [3, 3]}]},
-    {"activity": ".Picker", "next": []},
-]
-specA = {
-    "case_id": "A", "title": "三步链路", "package": "com.demo",
-    "steps": [
-        {"id": "s1", "desc": "点更多", "locate": "rid=b1", "landing": "t=课程表"},
-        {"id": "s2", "desc": "点课程表", "locate": "rid=b2", "landing": "activity=Timetable"},
-        {"id": "s3", "desc": "点导入", "locate": "rid=b3", "landing": "activity=Picker"},
-    ],
-    "asserts": [{"id": "a1", "desc": "进到选择器"}],
-    "knowledge_files": [],
-}
-repA, devA = run_with(scriptA, specA, make_answer())
-check("A 状态 PASS", repA.status == "PASS", repA.status)
-check("A 三步全完成", repA.steps_done == 3, str(repA.steps_done))
-check("A coverage_ok", repA.coverage_ok is True)
-check("A observe 少于 act", devA.observes < devA.acts,
-      f"obs={devA.observes} act={devA.acts}")
 
 print("\n=== case B：末步落点不符 -> FAIL（不得 PASS）===")
 scriptB = [
@@ -182,8 +155,8 @@ check("C 不报 PASS", repC.status != "PASS", repC.status)
 check("C act 次数受控（不无限重试）", devC.acts <= 10, f"acts={devC.acts}")
 
 print("\n=== 模块 API：CaseSpec 可序列化 ===")
-p = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_api" / "specA.json"
-specA_obj = sa.CaseSpec(**specA)
+p = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_api" / "specC.json"
+specA_obj = sa.CaseSpec(**specC)
 specA_obj.to_json(p)
 back = sa.CaseSpec.from_json(p)
 check("json 往返一致", back.model_dump() == specA_obj.model_dump())

@@ -107,8 +107,6 @@ def run_with(perm_action, perm_name=None):
     )
     _wd = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_branch"
     sa.run_case(spec, answer=answer, serial=None, diag=True, max_loops=8,
-                # ★ 生成物留在临时目录，别写进用例库（污染过 branch_权限分支）
-                yaml_out_dir=_wd,
                 workdir=_wd, device=dev, verbose=False)
     return dev.calls
 

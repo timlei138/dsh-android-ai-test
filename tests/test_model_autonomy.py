@@ -63,16 +63,15 @@ ck("step_done 仍去 check", r4 == "check", r4)
 r5 = ca.route_after_decide({"action": {"step_done": False}})
 ck("无动作仍去 check", r5 == "check", r5)
 
-rr = ca.route_after_strong({"action": {"_key": "back", "next_x": None}})
-ck("强证据路径的 key 动作 -> act", rr == "act", rr)
-
 print()
 print("=" * 70)
 print("3) payload 要告诉模型：能用 back、自己是不是跑到别的 App 了")
 print("=" * 70)
 import inspect
 
-src = inspect.getsource(ca.decide_node)
+# payload 的构建在 _base_decide_node 里（decide_node 只做知识/看图的
+# 现场处理，主体仍走旧实现）。
+src = inspect.getsource(ca._base_decide_node)
 ck("payload 带 system_actions", "system_actions" in src)
 ck("payload 带 app_package", "app_package" in src)
 ck("payload 带 off_app 判定", "off_app" in src)

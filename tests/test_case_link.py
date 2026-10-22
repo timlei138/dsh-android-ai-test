@@ -79,16 +79,6 @@ ck("★ 没题目时用第一条步骤兜底",
    "进入已保存的课程表" in m3["title"], m3["title"])
 ck("兜底不会跨到预期结果里去", "可以" != m3["title"], m3["title"])
 
-# 给了 YAML 题目就用它（比步骤兜底准）
-m4 = importer.parse_raw(t3, fallback_title="图库导入入口")
-ck("★ 有 YAML 题目时优先用它", m4["title"] == "图库导入入口", m4["title"])
-
-ck("空原文不炸", importer.parse_raw("")["title"] == "")
-ck("YAML 题目剥离正确",
-   importer.yaml_title("联想日历_167_首次进入课程表引导与空态.yaml")
-   == "首次进入课程表引导与空态")
-ck("文件名不合约定时不猜题目",
-   importer.yaml_title("奇怪的名字.yaml") == "")
 
 print()
 print("=" * 70)
@@ -119,10 +109,10 @@ else:
 
 print()
 print("=" * 70)
-print("4) 关联 YAML：按编号对上")
+print("4) 导入：原文进库，题目取法正确")
 print("=" * 70)
 
-# 造一个假目录结构验关联，不碰真库真文件
+# 造一个假目录结构，不碰真库真文件
 tmp = Path(tempfile.mkdtemp())
 rawdir = tmp / "raw"
 cdir = tmp / "cases"
@@ -132,19 +122,11 @@ cdir.mkdir()
     "测试用例 日历_101 某某功能（P1）\n操作步骤：\n1. 点什么", encoding="utf-8")
 (rawdir / "02_日历_102.txt").write_text(
     "测试用例 联想日历_102 \n前提：无\n操作步骤 \n1. 看某个页面", encoding="utf-8")
-(cdir / "联想日历_101_某某功能.yaml").write_text("steps: []\n", encoding="utf-8")
-(cdir / "_test_invalid.yaml").write_text("bad: [\n", encoding="utf-8")
 
 res = importer.import_all(db=db, dirs=[rawdir], cases_dir=cdir)
 ck("导入 2 条", res["files"] == 2, str(res["files"]))
-ck("★ 关联上 1 个 YAML", res["linked"] == 1, str(res["linked"]))
-ck("★ 夹具 _test_invalid 不参与关联", res["linked"] == 1, str(res))
 
-c101 = st.get_case("101", db=db) or {}
 c102 = st.get_case("102", db=db) or {}
-ck("★★ 101 关联到它自己的 YAML",
-   c101.get("yaml_name") == "联想日历_101_某某功能.yaml", str(c101.get("yaml_name")))
-ck("★ 102 没有 YAML 时留空（不瞎挂）", not c102.get("yaml_name"))
 ck("102 没题目时用第一条步骤兜底",
    "看某个页面" in (c102.get("title") or ""), str(c102.get("title")))
 
@@ -169,23 +151,8 @@ ck("覆盖时报告 updated", res3["updated"] == 2, str(res3["updated"]))
 
 print()
 print("=" * 70)
-print("6) 反向：YAML 没了，关联要跟着断")
+print("7) 删用例：历史记录不动")
 print("=" * 70)
-(cdir / "联想日历_101_某某功能.yaml").unlink()
-res4 = importer.import_all(db=db, dirs=[rawdir], cases_dir=cdir)
-ck("★★ 文件删掉后关联被解除（不留悬空链接）",
-   not (st.get_case("101", db=db) or {}).get("yaml_name"),
-   str((st.get_case("101", db=db) or {}).get("yaml_name")))
-ck("报告里记了 unlinked", res4["unlinked"] == 1, str(res4["unlinked"]))
-
-print()
-print("=" * 70)
-print("7) 删用例：原文和 YAML 一起走，历史不动")
-print("=" * 70)
-(cdir / "联想日历_101_某某功能.yaml").write_text("steps: []\n", encoding="utf-8")
-importer.import_all(db=db, dirs=[rawdir], cases_dir=cdir)
-ck("101 又关联上了", bool((st.get_case("101", db=db) or {}).get("yaml_name")))
-
 rid = st.save_run(
     case_name="101",
     report={"case_id": "101", "status": "PASS", "summary": "s", "steps_done": 1,
@@ -197,9 +164,6 @@ ck("先有一条运行记录", st.get_run(rid, db=db) is not None)
 n = st.delete_case("101", db=db)
 ck("★ 用例删掉了", n == 1 and st.get_case("101", db=db) is None)
 ck("★★ 运行记录还在（删用例不连坐）", st.get_run(rid, db=db) is not None)
-ck("★★ YAML 文件不受 store 影响（删文件是 webui 的事）",
-   (cdir / "联想日历_101_某某功能.yaml").is_file(),
-   "store.delete_case 只删库里的行，文件由调用方显式删")
 st.delete_run(rid, db=db)
 
 print()

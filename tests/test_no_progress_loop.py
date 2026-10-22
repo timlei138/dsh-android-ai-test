@@ -71,7 +71,7 @@ limit = 8
 max_iter = 60
 concluded = None
 for i in range(max_iter):
-    out = nd.step_check_node(state)
+    out = nd.check_node(state)
     if out.get("status") == "BLOCKED" or out.get("step_index") is not None:
         concluded = (i + 1, out)
         break
@@ -110,7 +110,7 @@ state2["findings"] = []
 concluded2 = None
 for i in range(max_iter):
     state2["round_in_step"] = i          # act 每轮都动过手
-    out = nd.step_check_node(state2)
+    out = nd.check_node(state2)
     if out.get("status") == "BLOCKED" or out.get("step_index") is not None:
         concluded2 = (i + 1, out)
         break
@@ -131,7 +131,7 @@ ok["findings"] = []
 ok["last_activity"] = "com.zui.calendar.timetable.widget.TimetableGuideActivity"
 ok["obs_clickable"] = [{"rid": "timetable_guide_button", "text": "我知道了",
                         "cls": "android.widget.Button"}]
-out_ok = nd.step_check_node(ok)
+out_ok = nd.check_node(ok)
 ck("★★ 落点命中时正常推进到下一步（修复不能把正常路堵死）",
    out_ok.get("step_index") == 1 and not out_ok.get("status"),
    f"step_index={out_ok.get('step_index')} status={out_ok.get('status')}")
@@ -140,6 +140,27 @@ print()
 print("=" * 70)
 print("4) 换步时 check_rounds 归零（否则跨步累积会误杀）")
 print("=" * 70)
+
+
+class _FakeDev:
+    """plan_node 现在会真去 observe，所以必须给它一个设备。
+
+    这里只关心 check_rounds 的计数维护，不关心画面 ——
+    返回一份固定的、落点命中的观察即可。
+    """
+
+    def observe_raw(self):
+        return {"activity": "com.zui.calendar.timetable.widget.TimetableGuideActivity",
+                "package": "com.zui.calendar",
+                "next": [{"r": "timetable_guide_button", "t": "我知道了",
+                          "c": [10, 10]}],
+                "event_ids": ["e1"]}
+
+
+nd.set_context(nd.ChildContext(device=_FakeDev(), skill_root=str(ROOT / "assets"),
+                               python="py",
+                               report_path=str(ROOT / "tmp" / "_npl.json")))
+
 nxt = dict(ok)
 nxt["check_rounds"] = 5
 nxt["step_index"] = 1
