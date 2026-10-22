@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import operator
+import os
 import re
 import sys
 import time
@@ -66,6 +67,33 @@ STRONG_MAX_SAME_TARGET = 2
 # 同一个问题失败两次就不是偶发了，再问也不会有新答案。
 VISION_MAX_FAILURES = 2
 
+
+# ★ 代码判定判"不成立"时，交 AI 复核的最大轮次（用户要求："AI 判断 3 次上限"）。
+#
+# 为什么"不成立"需要复核，而"成立"不需要：
+#   · 成立  = 代码在留痕里**搜到了**证据，是硬事实，复核只会浪费一轮 LLM；
+#   · 不成立= 代码**没搜到**证据。没搜到的原因有一半不是产品的错：
+#            文案被拆进多个节点、控件没进可点列表、seen_screens 截断、
+#            YAML 里的 rid 改了名。拿"没搜到"直接判 FAIL，等于让一个
+#            过期的判据变成对产品的指控（实测 177 a4 / 186 a2、a4）。
+#
+# 为什么是 3：和 LANDING_MAX_TRIES 同一个理由 —— 用户定的。
+# 复核用尽仍判不了，就**维持代码结论**并注明"AI 复核过 N 次"，
+# 绝不因为"没复核成"就把 FAIL 洗成 PASS。
+ASSERT_AI_RECHECK_MAX = 3
+
+# ★ 一条断言"证据不够 -> 退回补动作"最多几次（用户定的：3）。
+#
+# 和 ASSERT_AI_RECHECK_MAX 的区别：
+#   · 复核：模型再看一遍**同样的 XML**，靠想；
+#   · 补动作：执行器**真的去点一下**（展开面板、翻页、滚动），界面变了，看得见的更多。
+# 后者才解决 a13 那种"面板根本没展开"的问题 —— 想多少遍都看不到色块。
+#
+# 用尽仍看不到 -> 判 **FAIL**（用户定的：「那就如果报 FAIL。验证不报 BLOCK」）。
+# 但这只针对"补过、界面也动过、还是没有"—— 那说明产品确实没做到。
+# 若补的过程中**执行本身失败**（点不到控件、设备出错），仍走 BLOCKED（没验成）。
+ASSERT_FIX_MAX = 3
+
 # --------------------------------------------------------------------------
 # 主 Agent -> 子 Agent 的任务包
 # --------------------------------------------------------------------------
@@ -110,6 +138,27 @@ class AssertSpec(BaseModel):
     desc: str = Field(description="预期的文字描述")
     check: str | dict[str, Any] | None = Field(
         default=None, description="机器可判的判据（字符串或结构化字典）")
+    # ★ 注解：这条判据为什么这么写 / 证据从哪来。
+    #   原实现在 YAML 里写了 note 但这里没声明 —— pydantic 静默丢掉，
+    #   写的人以为留下了依据，其实一个字都没存下来。
+    #   （和上面"字段必须在 schema 里声明"是同一个坑，第二次踩。）
+    note: str = Field(
+        default="", description="判据的来由/证据出处，不参与判定")
+    # 用例原文里的预期写法，纯文本、不参与判定。
+    result: str = Field(
+        default="", description="原始用例里的预期原文，供人工对照")
+    # ★★ 这条预期属于哪一步（如 "s3"）。
+    #
+    # 为什么必须有：断言是在**整个流程末尾统一判**的，而每步的界面证据
+    # 各不相同。没有这个绑定，"判 a6 时该看哪一屏"就无从得知，
+    # 只能拿最后一屏硬判 —— 实测（run 68/69）a6 验的是「新建课程表」的
+    # 完成按钮，却拿到「编辑课程」页，模型只能答"看不到完成按钮"，
+    # 记成 BLOCKED。看起来像模型不行，其实是给错了那一屏。
+    #
+    # `None` / "" 表示未绑定：判的时候退回"整轮最后一屏"，并在提示词里
+    # 明确告知模型"这条没绑定步骤，别拿这一屏硬判"。
+    step: str = Field(
+        default="", description="所属步骤 id（如 s3）；空=未绑定")
 
 
 class Precondition(BaseModel):
@@ -207,6 +256,16 @@ class SubagentReport(BaseModel):
     status: str                       # PASS / FAIL / BLOCKED（只有这三档）
     summary: str
     session_id: int | None = None
+    # ★ 本次运行的产物目录（tmp/runs/<uuid>_<时间戳>_<case>/）。
+    #   截图、XML、日志、账本、报告都在里面 —— 落库时用它反查"这一次"的现场。
+    run_dir: str = ""
+    # 崩溃日志片段（只有真崩了才有内容）。崩了却没 log 等于没法定位。
+    crash_log: str = ""
+    # ★ 模型对话原文（每轮提示词 + 模型回复）。
+    #   用户报过「LLM的记录没有」—— 原因是 decide.py 的 _llm_trace
+    #   只在设置了 LLM_TRACE_FILE 时才写文件，而没人设过。
+    #   现在执行器自己指定位置并把它带进报告，WebUI 才能点开看。
+    llm_path: str = ""
     findings: list[dict[str, Any]] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)      # 过程中遇到的问题
     steps_done: int = 0
@@ -322,6 +381,54 @@ class ChildState(TypedDict, total=False):
     # 于是那个收口条件永远不成立（167 实测空转到 80 轮上限）。
     check_rounds: NotRequired[int]
 
+    # ★ 断言"代码判不成立 -> 交 AI 复核"的轮次（见 ASSERT_AI_RECHECK_MAX）。
+    #
+    # assert_ai_rounds  当前这条断言已经被复核了几次
+    # assert_ai_last    上一次复核时模型给的意见（用尽轮次时写进 actual，
+    #                   让人看得出"AI 看过，但它也判不了/它说的不一样"）
+    #
+    # ⚠️ 必须在这里声明，不能只靠节点返回值"兜着"：
+    #    LangGraph 的状态字段是声明的那些，未声明的键在下一次节点派发时
+    #    可能被丢掉 —— 表现就是计数永远是 0、复核无限循环。
+    assert_ai_rounds: NotRequired[int]
+    assert_ai_last: NotRequired[str]
+    # ★ 当前这条断言正在等哪一轮复核回来（复核对的是哪个 assert_id）。
+    #   没有它，interrupt 恢复后分不清"这是复核的回复"还是"普通断言的回复"。
+    assert_pending_for: NotRequired[str]
+
+    # ★★★ 断言"证据不够 -> 退回补一步"的轮次（用户要求）★★★
+    #
+    # 用户原话：
+    #   「检查 10 个色块。条件不满足了。那就退回执行增加个步骤呗」
+    #   「最多 3 次，但要防止一直点相同的」
+    #   「那就如果报 FAIL。验证不报 BLOCK」
+    #
+    # assert_fix_rounds   这条断言已经补过几次（上限 ASSERT_FIX_MAX）
+    # assert_fix_for      正在为哪条断言补（补完回来重新判它）
+    # assert_fix_tried    这次已经试过的动作签名（防重复点同一个东西）
+    # assert_fix_note     执行器对这次补证据的自然语言说明（写进 actual）
+    assert_fix_rounds: NotRequired[int]
+    assert_fix_for: NotRequired[str]
+    assert_fix_tried: NotRequired[list[str]]
+    assert_fix_note: NotRequired[str]
+    # 交给执行器的"补证据任务卡"（要验什么/为什么不够/相关元素）
+    assert_fix_task: NotRequired[dict[str, Any]]
+    # ★ 当前正在判哪一步的断言（用户要求的"一个点一个点验证"）。
+    #
+    # 「判断应该是一个昨晚然后判断下一个。这是正常人类的思维。」
+    # 做完一步就把这一步的断言判掉、判完再走下一步 ——
+    # 判的时候界面还停在那一屏，证据是拿得到的。
+    assert_step: NotRequired[str]
+    # ★ 补证据点开之后，看完要点的那个"关闭/取消"按钮的文字。
+    #
+    # 用户的原话：「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。
+    #              不然继续不下去了。我说了要像个人类测试员一样」
+    #
+    # 由模型在 need_action.close_with 里给（它知道点开的是个面板、怎么关），
+    # 执行器在**重判落定之后**点它一下，把界面退回原来的样子，
+    # 后面的断言才不会拿到错屏。空字符串 = 不用关。
+    assert_fix_close: NotRequired[str]
+
     # ★ 目标查找的有界重试（用户要求）。
     #
     # 「目标 rid 找不到 → 立即停」这条太严：它假设目标一定有 rid，
@@ -341,6 +448,32 @@ class ChildState(TypedDict, total=False):
     # 工作集：观测与动作分开存，避免互相覆盖（曾经因此静默丢动作）
     last_activity: str
     last_shot: str
+    # ★★ 按用例步骤存的证据快照（step_evidence[step_id] = {...}）。
+    #
+    # 为什么必须有它（2026-10-21，run 68 实测）：
+    #   last_shot / obs_nodes / obs_clickable 这些**全是单值**，每次 observe 都
+    #   整份覆盖。而断言是在**整个流程末尾统一判**的，于是 8 条断言拿到的
+    #   都是"最后那一刻"的同一张图 —— 实测 8 条提示词里的图片 base64
+    #   **md5 完全一致**（f292dc2c），而它们要验的根本不是同一屏：
+    #     · a6 验「新建课程表」的完成按钮
+    #     · a11/a12/a13 验「编辑课程」弹窗里的时间/周数/配色
+    #     · a14 验「弹框已关闭」
+    #   拿最后一屏去判 a6，模型只能答"看不到完成按钮" —— 看起来像模型不行，
+    #   其实是喂给它的东西不对。
+    #
+    # 结构（每步**追加一条**记录，同一 step_id 可能有多条，取最后一条）：
+    #   [{"step": "s3", "step_index": 3, "activity", "package",
+    #     "shot", "dump", "nodes", "nodes_text", "clickable"}]
+    #
+    # ⚠️⚠️ 必须是 `Annotated[list, operator.add]`（累加），不能是普通 dict！
+    #
+    #   第一版写成 `dict[str, Any]`、节点返回 `{sid: {...}}`，看起来像"按
+    #   步骤存"，实际 LangGraph 对未声明累加器的字段是**整体替换** ——
+    #   于是每一轮都把上一步的记录冲掉，最后 state 里只剩 s5 一条。
+    #   实测表现：a14（绑 s5）拿到的是"步骤 s5 的快照"，其余 7 条全部退回
+    #   "整轮最后一屏" —— 图、绑定、提示词全对，只有存储方式错了。
+    #   上面 seen_rids / seen_texts 用 operator.add 也是同一个原因。
+    step_evidence: Annotated[list[dict[str, Any]], operator.add]
     # 视觉通道连续失败次数。达到 VISION_MAX_FAILURES 后禁止再问（见 vision_node）。
     # 没有这个计数，模型会一直以为"还没看到"而无脑重问 —— 167 空转 16 轮。
     vision_failures: int
@@ -1379,10 +1512,182 @@ def observe_node(state: ChildState) -> dict[str, Any]:
         "obs_nodes_text": _screen_text(out),
         "obs_nodes": _brief_nodes(out.get("nodes")),
         "obs_xml_path": _screen_xml_path(out),
-        "seen_rids": _seen_rids(out.get("next")),
-        "seen_texts": _seen_texts(out.get("next")),
+        # ★ 按步骤留一份证据（见 _step_evidence_of 的说明）
+        "step_evidence": _step_evidence_of(state, out),
+        "seen_rids": _seen_rids(out.get("next"), out.get("nodes")),
+        "seen_texts": _seen_texts(out.get("next"), out.get("nodes")),
         "seen_screens": [_screen_text(out)],
     }
+
+
+def _step_evidence_of(state: ChildState, out: dict[str, Any]) -> list[dict[str, Any]]:
+    """把这次观测打包成"属于当前用例步骤"的证据快照（**列表，供 operator.add 追加**）。
+
+    同一 step_id 会累积多条，取用时取最后一条 —— 也就是"这一步最后一次观测"，
+    因为断言问的是"这一步做完之后屏幕上该有什么"。
+    """
+    idx = int(state.get("step_index") or 0)
+    steps = (state.get("task") or {}).get("steps") or []
+    sid = str(steps[idx].get("id") or "") if idx < len(steps) else ""
+    if not sid:
+        return []
+    # 截图：observe 会给 evidence.png；act 只给 xml_path，
+    # 而落盘时 dump.xml 与 shot.png 同目录 —— 按同目录推。
+    shot = (out.get("evidence") or {}).get("png") or ""
+    if not shot:
+        dump_p = str(out.get("xml_path") or "")
+        if dump_p:
+            cand = os.path.join(os.path.dirname(dump_p), "shot.png")
+            if os.path.exists(cand):
+                shot = cand
+    return [{
+        "step": sid,
+        "step_index": idx,
+        "activity": out.get("activity") or "",
+        "package": out.get("package") or "",
+        "shot": shot,
+        "dump": _screen_xml_path(out),
+        "nodes": _brief_nodes(out.get("nodes")),
+        "nodes_text": _screen_text(out),
+        "clickable": out.get("next") or [],
+    }]
+
+
+def _evidence_for_assert(state: ChildState, a: dict[str, Any]) -> dict[str, Any]:
+    """取这条断言**该看的那一步**的证据快照。
+
+    断言自己声明了 `step`（如 "s3"）就用它；没声明就用整轮最后一屏兜底
+    —— 并且**把这个事实显式告诉调用方**，不允许静默地拿最后一屏冒充。
+
+    ⚠️ 当前 176 的 14 条断言全是 step=-（未绑定），所以走得最多的还是
+    兜底分支。这跟"每步证据存好了但没有对应关系"是一回事：**存**是
+    第 1 件事，**绑**是另一件事，不能混为一谈。
+    """
+    ev = state.get("step_evidence") or []
+    want = str(a.get("step") or "").strip()
+    # 同一 step_id 会累积多条（每次 observe/act 一条），取**最后一条**
+    # —— 那才是"这一步做完之后"的屏幕。
+    mine = [e for e in ev if str(e.get("step") or "") == want] if want and want != "-" else []
+    if mine:
+        return {"source": f"步骤 {want} 的快照", "data": mine[-1], "bound": True}
+    # 兜底：整轮最后一屏（并如实标注）
+    if ev:
+        return {"source": "整轮最后一屏（该断言未绑定步骤）",
+                "data": ev[-1], "bound": False}
+    return {"source": "无快照", "data": {}, "bound": False}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 视觉通道：颜色 / 形状 / XML 判不了的一律交给视觉模型
+# ══════════════════════════════════════════════════════════════════════
+#
+# 用户定的通用规则（原话）：
+#   「颜色，形状，还有 xml 判断不了的都要交给视觉模型。这个通用做法。」
+#
+# 所以要有一个统一的判断：**这条预期光看 XML 能不能定论**。不能的话，
+# 判定前先用那一步的截图问一次视觉模型，把答案拼进判定提示词。
+#
+# 为什么不是"所有断言都上图"：实测（run 68）每条断言 51.7 万字符、
+# 图占 99.3%，8 条断言共用同一张最后截图 —— 既烧钱又给错屏。
+# 所以只在**确实需要**时问一次，并且问的是**该步骤那一张**。
+#
+# 为什么是关键词而不是"让模型自己说要图"：
+# 那样每条断言都要多一次模型调用。关键词漏掉的，还有下面第 3 条兜底
+# ——判定时明确告诉模型"数不全就判 null"，不会硬错。
+
+# 颜色：色值、色块、背景色、主题色……
+_VISION_COLOR_WORDS = (
+    "颜色", "色块", "色值", "色彩", "配色", "背景色", "主题色",
+    "变色", "红", "绿", "蓝", "黄", "紫", "橙", "灰",
+)
+
+# 形状 / 图形 / 视觉态：XML 只能给 rid，给不了"长什么样"
+_VISION_SHAPE_WORDS = (
+    "形状", "图标", "图形", "圆角", "圆形", "方形", "样式", "外观",
+    "高亮", "置灰", "选中", "打勾", "对勾", "加号", "减号", "箭头",
+    "阴影", "加粗", "斜体", "字号", "排版", "居中", "左对齐", "右对齐",
+)
+
+# 数量：XML 里同名节点会重复/嵌套，数不准（知识库实测 25≠10）
+_VISION_COUNT_WORDS = ("共", "一共", "总数", "个数", "数量", "几种", "几条", "几项")
+
+
+def _needs_vision(a: dict[str, Any]) -> tuple[bool, str]:
+    """判断这条断言是否**必须看图**才能定论。
+
+    返回 (要不要看图, 原因)。原因会写进判定提示词，让模型知道
+    这张图是**为哪句话**问的，不是随手给一张。
+    """
+    text = str(a.get("desc") or "") + " " + str(a.get("check") or "")
+    for w in _VISION_COLOR_WORDS:
+        if w in text:
+            return True, f"涉及颜色（命中「{w}」），XML 没有颜色信息"
+    for w in _VISION_SHAPE_WORDS:
+        if w in text:
+            return True, f"涉及形状/视觉态（命中「{w}」），XML 只有 rid 描述不了外观"
+    for w in _VISION_COUNT_WORDS:
+        if w in text:
+            return True, f"涉及数量（命中「{w}」），XML 同名节点会重复嵌套、数不准"
+    return False, ""
+
+
+def _vision_for_assert(state: ChildState, a: dict[str, Any],
+                       evd: dict[str, Any]) -> dict[str, Any]:
+    """需要看图时，用**该步骤那一张**截图问一次视觉模型。
+
+    提示词写死 JSON 输出（用户要求：视觉检查提示词要准确、格式写死），
+    并且**明确允许它答不上来** —— 答不上来比编一个答案有用得多，
+    因为判定模型会因此判 null，而不是拿到一个假结论当证据。
+    """
+    need, why = _needs_vision(a)
+    if not need:
+        return {}
+    shot = str((evd or {}).get("shot") or "").strip()
+    if not shot or not os.path.exists(shot):
+        return {"tried": True, "why": why, "ok": False,
+                "error": f"该步骤没有可用截图（{shot or '路径为空'}）"}
+    desc = str(a.get("desc") or "").strip()
+    prompt = (
+        f"你是手机界面视觉核验员。现在要核验一条测试预期是否成立。\n"
+        f"预期原文：{desc}\n"
+        f"需要你确认的：{why}\n\n"
+        f"请**只看这张截图**回答，不要推测截图之外的任何东西。\n"
+        f"如果截图里看不到能回答该预期的内容（例如相关弹窗没展开、"
+        f"界面不对、被遮挡），can_answer 必须是 false —— "
+        f"**不要**为了给答案而猜测或编造。\n\n"
+        f"只输出一个 JSON 对象，不要 markdown 围栏，不要任何前后缀：\n"
+        f'{{"can_answer": true, "answer": "一句话：预期成立不成立", '
+        f'"detail": "你具体看到的内容，含数量/颜色/位置等可核对的事实"}}'
+    )
+    try:
+        raw = ask_image(_ctx().python, _ctx().skill_root, shot, prompt)
+    except VisionError as exc:
+        return {"tried": True, "why": why, "ok": False, "error": str(exc)}
+    # 视觉回复要求是 JSON；解析失败时**原样保留文本**给判定模型看，
+    # 而不是丢掉 —— 至少那句话是视觉真看到的，扔了等于白问一次。
+    got: Any = {}
+    try:
+        got = _extract_json_loose(raw)
+    except Exception:
+        got = {}
+    if not isinstance(got, dict) or "can_answer" not in got:
+        return {"tried": True, "why": why, "ok": True,
+                "can_answer": None, "detail": str(raw)[:1500]}
+    return {"tried": True, "why": why, "ok": True,
+            "can_answer": bool(got.get("can_answer")),
+            "answer": str(got.get("answer") or ""),
+            "detail": str(got.get("detail") or "")[:1500]}
+
+
+def _extract_json_loose(text: str) -> Any:
+    """从视觉/模型回复里抠出第一个 JSON 对象（容忍围栏和前后缀）。"""
+    s = str(text or "")
+    if "```" in s:
+        s = "\n".join(l for l in s.splitlines() if not l.strip().startswith("```"))
+    i, j = s.find("{"), s.rfind("}")
+    if i < 0 or j <= i:
+        raise ValueError("回复里没有 JSON 对象")
+    return json.loads(s[i:j + 1])
 
 
 def _trace_by_step(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1584,7 +1889,8 @@ def _screen_text(out: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _seen_texts(items: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+def _seen_texts(items: list[dict[str, Any]] | None,
+                nodes: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
     """把当前屏带 rid 的控件的**文案**攒下来（供 seen_texts 累加）。
 
     和 `_seen_rids` 是一对：那个记"见过哪些 rid"，这个记"那时它写着什么"。
@@ -1602,20 +1908,50 @@ def _seen_texts(items: list[dict[str, Any]] | None) -> list[dict[str, str]]:
             continue
         txt = str(n.get("t") or n.get("text") or n.get("d") or "")
         out.append({"rid": rid, "text": txt})
+    # ★ 值节点（clickable=false）不在可点列表里，但它们的文案恰恰是
+    #   node_text 判据最常要读的东西（178 的「50分钟」「10分钟」）。
+    #   不补这一路，那条判据就永远读不到值。
+    for n in (nodes or []):
+        if not isinstance(n, dict):
+            continue
+        rid = str(n.get("r") or n.get("rid") or "")
+        if not rid:
+            continue
+        txt = str(n.get("t") or n.get("text") or "")
+        if not txt:
+            continue          # 没文字的值节点记了也没用
+        out.append({"rid": rid, "text": txt})
     return out
 
 
-def _seen_rids(items: list[dict[str, Any]] | None) -> list[str]:
-    """把当前可点项里的 rid 提取出来（供 seen_rids 累加）。
+def _seen_rids(items: list[dict[str, Any]] | None,
+               nodes: list[dict[str, Any]] | None = None) -> list[str]:
+    """把当前屏出现过的 rid 提取出来（供 seen_rids 累加）。
 
     断言的 node_present=rid=X 是"过程中出现过"的语义，
     而断言在流程末尾才判，那时 X 可能早已翻页消失。
     所以要一路把见过的 rid 攒下来（168 的 a2 就因此被误判成 FAIL）。
+
+    ★★ `nodes` 这一路是必须的（178 实测）。
+    「可点项」里只有**可点的**控件，而很多被断言的控件恰恰不可点：
+    178 的 a2/a3/a4 要判 tv_lesson_duration / tv_break_duration /
+    tv_morning_slot_count —— 它们是值节点（clickable=false），
+    只收可点项就永远攒不到它们，于是三条全报 `rid ✘`。
+    那不是产品没这个值，是**我们没记**，纯假失败。
+
+    工具层的 `nodes` 是 summarize_xml 压过的语义节点（含不可点文字），
+    里面带 rid —— 和 `_screen_text` 用的是同一批数据。
     """
     out: list[str] = []
     for it in items or []:
         rid = it.get("r") or it.get("rid")
-        if rid and rid not in out:
+        if rid and str(rid) not in out:
+            out.append(str(rid))
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        rid = n.get("r") or n.get("rid")
+        if rid and str(rid) not in out:
             out.append(str(rid))
     return out
 
@@ -2090,6 +2426,16 @@ class StepAction(BaseModel):
                      "遇到必填输入框就**先把内容填上再继续**，"
                      "不要反复点提交按钮硬试 —— 点了也不会通过校验。"),
     )
+    # ★ 语义点击目标（新契约）。模型只说点哪个控件，坐标由 act 解析。
+    #
+    # 必须在这里声明：没声明的键会被 pydantic **静默丢掉** ——
+    # StepAction 是 interrupt 的 response_schema，模型给的字段
+    # 不在 schema 里就等于没给（`unknown`/`error` 就是被这样丢过一次）。
+    tap_target: str | None = Field(
+        default=None,
+        description=("要点的控件名（rid 或文字，取自当前可点项）。"
+                     "同名多个时用「名字#序号」。不要给坐标。"),
+    )
     why: str = ""
     expect: str | None = Field(default=None, description="落点判据")
     need_knowledge: str | None = Field(default=None, description="想检索的关键词，没有就留空")
@@ -2182,6 +2528,26 @@ def act_node(state: ChildState) -> dict[str, Any]:
     dev = _ctx().device
     action = state.get("action") or {}
 
+    # ★★ 语义目标 -> 坐标（新契约 kind=tap 走这里）★★
+    #
+    # 模型的契约是「点哪个控件」，不是「点哪个像素」。它给 tap_target
+    #（可点项的名字/rid），坐标由**观察层的解析结果**决定：
+    #   · 唯一命中 -> 拿到 (x,y)
+    #   · 不唯一    -> 不猜第一个，报错让模型用 `名字#序号` 指明
+    #   · 找不到    -> 报错让模型换目标
+    #
+    # 这和 strong_target 用的是**同一个解析器**（_resolve_strong_target），
+    # 所以"代码直点"和"模型指定"两条路的行为完全一致 ——
+    # 不会出现"代码说唯一、模型点了别的"这种两套逻辑打架。
+    if action.get("tap_target") and action.get("next_x") is None:
+        _tt = str(action.get("tap_target") or "").strip()
+        _tx, _ty, _thow = _resolve_strong_target(_tt, state)
+        if _tx is None:
+            return {"issues": [f"点不了「{_tt}」：{_thow}"],
+                    "action": {**action, "acted": False, "error": _thow}}
+        action = {**action, "next_x": _tx, "next_y": _ty,
+                  "why": (str(action.get("why") or "") or "")}
+
     # ★ 输入文字动作：填必填输入框。
     #
     # 顺序上放在最高优先级 —— 模型说"先填名称"时，这一轮就只做填，不要又去点。
@@ -2189,6 +2555,27 @@ def act_node(state: ChildState) -> dict[str, Any]:
     _irid = str(action.get("input_rid") or "").strip()
     _itext = action.get("input_text")
     if _irid and _itext is not None and not action.get("step_done"):
+        # ★★ 已经有这个值了就别再填 ★★
+        #
+        # 176 实测（run 65）：模型对 et_schedule_name 连填 19 次，
+        # 其中 18 次 chg=0 —— 第一次就填进去了，它看不见，以为没填上。
+        # 这不是模型蠢：**输入动作在界面上不留可见反馈**（值填进去了，
+        # 但对 XML 的可点项清单几乎无影响），它只能靠"上次 why"猜。
+        #
+        # 所以由代码判死：值已经一样，这个动作就是无效的，直接拒掉。
+        # 拒掉要**明确告诉它"已经填好了，去点保存"** ——
+        # 只说"无效"，它会换个写法再填一遍。
+        if not action.get("_retry_after_guard"):
+            _cur = _current_input_value(state, f"rid={_irid}")
+            if _cur is not None and str(_cur).strip() == str(_itext).strip():
+                # 用 _ask_model 而不是自定义字段：它会把话拼进下一轮的
+                # 提示词里交给模型。自己加个没人读的键等于没说话。
+                return _ask_model(
+                    state,
+                    f"输入框 {_irid} 里**已经有** {_cur!r} 了，内容和你这次要填的"
+                    f"一模一样，**不需要再输入**。"
+                    f"请直接去做这一步剩下的事（通常是点「完成」/「保存」提交，"
+                    f"或者判定已经完成）。")
         try:
             # step/why 传下去是为了**账本里能查到这一步**：
             # 只记 rid 和时间不记步骤号，页面上一堆动作就分不清属于哪一步。
@@ -2299,12 +2686,38 @@ def act_node(state: ChildState) -> dict[str, Any]:
         #       只会出现在整屏文字里，收 obs_clickable 是收不到的。
         #
         #   这几个字段都是 operator.add 累加，返回两个列表就是拼接，不会覆盖。
-        "seen_rids": (_seen_rids(state.get("obs_clickable"))
-                      + _seen_rids(res.next)),
-        "seen_texts": (_seen_texts(state.get("obs_clickable"))
-                       + _seen_texts(res.next)),
+        #
+        #   ★ 必须把 nodes 也喂进去：很多被断言的控件是不可点的值节点
+        #     （178 的 tv_lesson_duration 等），只收可点项就永远攒不到，
+        #     三条断言全报 `rid ✘` —— 那是假失败（见 _seen_rids 说明）。
+        #
+        #   ⚠️ ActResult 上没有 `nodes` 字段（只有 next / xml_path），
+        #     所以 `res.nodes` 会 AttributeError（实测崩过一次）。
+        #     用 getattr 取，取不到就是空 —— 后面的 rounds 里
+        #     `obs_nodes` 会从 act_node 自己的 out（含 nodes）补上。
+        "seen_rids": (_seen_rids(state.get("obs_clickable"),
+                                 state.get("obs_nodes"))
+                      + _seen_rids(res.next, getattr(res, "nodes", None))),
+        "seen_texts": (_seen_texts(state.get("obs_clickable"),
+                                   state.get("obs_nodes"))
+                       + _seen_texts(res.next, getattr(res, "nodes", None))),
         "seen_screens": [s for s in (state.get("obs_nodes_text"),
                                      _screen_text({"next": res.next})) if s],
+        # ★ 动作之后的那一屏也按步留档（覆盖本步上一条）。
+        #
+        # 断言的语义是"这一步**做完之后**屏幕上该有什么"，所以动作之后的
+        # 画面才是它该看的。只存 observe 那一份的话，一步里最后一个动作
+        # 造成的界面变化就进不了快照 —— 那正是断言最该看的那一屏。
+        #
+        # 注意 ActResult 没有 nodes / shot（只有 next / xml_path）：
+        # 截图路径由 xml_path 同目录推出（落盘时 dump.xml 与 shot.png 同放一处）。
+        "step_evidence": _step_evidence_of(state, {
+            "activity": res.activity,
+            "package": getattr(res, "package", "") or "",
+            "xml_path": getattr(res, "xml_path", "") or "",
+            "next": res.next,
+            "nodes": getattr(res, "nodes", None),
+        }),
         "round_in_step": state.get("round_in_step", 0) + 1,
         "visited": [f"{state.get('last_activity')} -> {res.activity}"],
         # 轨迹：记下这一步实际点了哪个控件 —— 回写 YAML 用。
@@ -3204,6 +3617,30 @@ def step_check_node(state: ChildState) -> dict[str, Any]:
 
 
 def assert_node(state: ChildState) -> dict[str, Any]:
+    """断言节点（外层壳）：负责清理"补证据"标记，然后转调真正的实现。
+
+    ## 为什么要有这层壳
+    `_assert_node_inner` 里有 6 个 return 分支，每个都要带上"清掉
+    assert_fix_task"这件事。写在里面就得改 6 处，以后加分支还会漏。
+    包一层是唯一能保证**任何出口都清干净**的写法。
+
+    ## 为什么必须清
+    assert_fix_task 是"请执行器去点一下"的标记：
+      · 不清 -> route_after_observe 一直送回 assert（标记还在 → 死循环）
+      · 不清 -> route_after_verdict 一直送回 act（点个没完）
+    执行器点完、observe 完，回到这里就是"补完了"，标记必须在进来时失效。
+
+    ## 为什么清理放在最外面
+    assert_node 是 interrupt 节点，恢复时**整个节点从头重跑**。
+    写在 interrupt 之后的清理，恢复那一轮可能根本不执行 —— 那就白写了。
+    """
+    out = _assert_node_inner(state)
+    if state.get("assert_fix_task"):
+        out = {**out, "assert_fix_task": {}}
+    return out
+
+
+def _assert_node_inner(state: ChildState) -> dict[str, Any]:
     """逐条收预期（一次一条）。"""
     from langgraph.types import interrupt
     task = state["task"]
@@ -3215,7 +3652,119 @@ def assert_node(state: ChildState) -> dict[str, Any]:
     if done_assers >= len(asserts):
         return {"pending": {"kind": "finish"}}
 
-    a = asserts[done_assers]
+    # ★★ 挑哪一条断言：**先判当前这一步的**（用户的要求）★★
+    #
+    # 「一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
+    #
+    # 早先是死按 asserts 的书写顺序取（asserts[done_assers]），
+    # 而进入 assert 的时机又是"所有步骤都走完" —— 于是判 a13 时
+    # 编辑弹窗早就关了，色块一个都看不到。
+    #
+    # 现在：如果 state 里有"刚做完的这一步"，先把它名下没判的断言收掉。
+    # 没有标记（比如起头就没步骤了）就退回原来的顺序取法。
+    a = None
+    _cur = str(state.get("assert_step") or state.get("last_step_id") or "")
+    if _cur:
+        _mine = _pending_asserts_for_step(state, _cur)
+        if _mine:
+            a = _mine[0]
+    if a is None:
+        a = asserts[done_assers]
+
+    # ★★ 复核循环的"再问一次"出口。
+    #
+    # 上一轮 assert_node 交出去问模型时留了一个标记 `assert_pending_for`
+    # （= 这是哪条断言的复核）。现在带着模型的回复回来了：
+    #   · AI 说成立      -> 交 verdict 落 PASS（verdict 里有 ai_recheck 例外）
+    #   · AI 说不成立/看不清，且复核次数没用完 -> **再问一次**
+    #     （模型上一轮可能是看漏了，也可能这次给的上下文更全 ——
+    #       把上一轮的意见塞进 payload，让它知道"你上次是这么说的"）
+    #   · 次数用完       -> 交 verdict，以代码结论收口
+    #
+    # ⚠️ 为什么"再问一次"一定要在这里做、不能交给路由：
+    #    interrupt() 恢复时整个节点会**从头再跑一遍**，所以"问了没"这件事
+    #    必须由 state 里的标记判，不能靠"代码走到哪一行"来判。
+    pend = state.get("pending") or {}
+    if pend.get("ai_recheck") and pend.get("assert_id") == a["id"]:
+        n = int(state.get("assert_ai_rounds") or 0)
+        if pend.get("passed") is not True and n < ASSERT_AI_RECHECK_MAX:
+            print(f"  [assert] {a['id']} AI 复核第 {n} 次未采信，"
+                  f"再问一次（{n + 1}/{ASSERT_AI_RECHECK_MAX}）",
+                  file=sys.stderr)
+            seen_acts2: set[str] = set()
+            for v in (state.get("visited") or []):
+                s = str(v)
+                if "->" in s:
+                    left, right = s.split("->", 1)
+                    seen_acts2.add(left.strip())
+                    seen_acts2.add(right.strip())
+                else:
+                    seen_acts2.add(s.strip())
+            if state.get("last_activity"):
+                seen_acts2.add(str(state["last_activity"]))
+            last = str(pend.get("actual") or "")
+            steps0 = task.get("steps", [])
+            idx_step0 = min(state.get("step_index", 0), max(len(steps0) - 1, 0))
+            step_ctx0 = steps0[idx_step0] if steps0 else {}
+            # 复核轮也取"这条断言该看的那一步"的证据（与首次判定同一份）
+            _ev2 = _evidence_for_assert(state, a)
+            _evd2 = _ev2["data"]
+            # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
+            _vis2 = _vision_for_assert(state, a, _evd2)
+            recheck_payload = {
+                "kind": "assert",
+                "index": done_assers + 1, "total": len(asserts),
+                "assert_id": a["id"], "desc": a["desc"],
+                "check": a.get("check"), "assert_expect": a.get("check"),
+                "case_title": task.get("title"),
+                "step_desc": step_ctx0.get("desc"),
+                "step_landing": step_ctx0.get("landing"),
+                "steps_done": _steps_done(state),
+                "step_total": len(steps0),
+                "activity": state.get("last_activity"),
+                "activity_reached": _activity_reached(
+                    state, str(a.get("check") or "")),
+                "code_verdict": False,
+                "code_why": str(pend.get("code_why") or ""),
+                "prev_opinion": last,
+                # ★ 复核轮同样**不给图**（与首次判定保持一致）。
+                #   复核的意义是"请再核对一遍 XML 证据"，不是"换张图看"。
+                #   真要图，得走 vision 通道 —— 见下面 evidence 那几项。
+                "evidence_source": _ev2["source"],
+                "evidence_bound": _ev2["bound"],
+                "screen_activity": _evd2.get("activity") or "",
+                "screen_nodes_text": _evd2.get("nodes_text") or "",
+                "screen_nodes": _evd2.get("nodes") or [],
+                "screen_clickable": _evd2.get("clickable") or [],
+                "vision_result": _vis2,
+                "image": "",
+                "question": (
+                    f"这是第 {n + 1}/{ASSERT_AI_RECHECK_MAX} 次复核。"
+                    f"上一轮你的判断是「{last or '（未给出）'}」。"
+                    "如果上一轮是你没看仔细，这次请重新核对界面内容和控件清单；"
+                    "如果上一轮的判断是对的，直接维持 passed=false 并在 actual 里"
+                    "写清实际是什么样。仍然看不清就 passed=null。"),
+                "activity_seen": sorted(seen_acts2),
+                "evidence_event_ids": state.get("last_event_ids", []),
+                "visited": state.get("visited", [])[-8:],
+                "clickable": state.get("obs_clickable", []),
+                "seen_rids": sorted(set(state.get("seen_rids") or [])),
+                "knowledge": (state.get("action") or {}).get("knowledge") or "",
+                "knowledge_files": task.get("knowledge_files", []),
+            }
+            answer = interrupt(recheck_payload, response_schema=AssertVerdict)
+            if isinstance(answer, AssertVerdict):
+                answer = answer.model_dump()
+            answer["ai_recheck"] = True
+            # ★ code_why 必须一路带下去。
+            #   复核轮再问一次时，payload 里要写的"代码原话"就是它 ——
+            #   丢了的话第 2、3 次复核拿不到"代码为什么说不成立"，
+            #   模型只能瞎猜，等于复核质量一轮比一轮差。
+            answer["code_why"] = str(pend.get("code_why") or "")
+            # 记下这一轮的判断，下一轮复核当"你上次是这么说的"用。
+            return {"pending": answer, "assert_ai_rounds": n + 1,
+                    "assert_ai_last": str(answer.get("actual") or "")}
+
     # 带上步骤上下文：断言要对照"哪一步、期望什么"才判得准。
     # 第一次真跑时只给了断言描述，模型看到系统图库就判 FAIL
     # ——它不知道 a1 其实在 s1 之后就该成立，而当时早已走过 s3。
@@ -3242,26 +3791,139 @@ def assert_node(state: ChildState) -> dict[str, Any]:
     # None = 代码判不了（要看图），交回模型；True/False = 硬事实。
     code_verdict, code_why = evaluate_check(a.get("check"), state=state)
 
-    # ★ 强证据直通：代码已经能百分百确定的，**不问模型**。
+    # ★ 代码判定成立 -> 强证据直通，**不问模型**。
     #
-    # 为什么可以跳过：activity= / node_present= / package= 这类判据是
+    # 为什么成立时可以跳过：activity= / node_present= / package= 这类判据是
     # 硬事实 —— 设备报上来的 activity 名、dump 里有没有这个 rid，
     # 没有解释空间。让模型"确认"一遍只会多烧一轮 LLM 和几十秒，
     # 而它除了照抄代码的结论也做不了别的（原实现就是把结论塞进 prompt
     # 再让它复述一遍）。
     #
-    # 判不了的（要看图/看颜色的）才走 interrupt —— 那才是模型的活。
-    if code_verdict is not None:
-        print(f"  [assert] {a['id']} 代码强判定："
-              f"{'成立' if code_verdict else '不成立'}（{code_why}），不问模型",
+    # ★★ 但**代码判定不成立时，必须让 AI 介入复核**（用户要求）。
+    #
+    # 为什么"不成立"和"成立"不能对称处理：
+    #   "成立"只要证据出现在留痕里就是硬事实；
+    #   "不成立"却是**代码搜不到** —— 它可能是真没有，也可能是
+    #   `seen_screens` 截断 / 文案被拆分到多个节点 / rid 改了名 /
+    #   控件没进可点列表。拿"我没搜到"直接当"功能坏了"，就是让
+    #   YAML 里的一个过期 rid 变成对产品的指控。
+    #
+    #   实测（177 a4）：`text ✘ 周末是否有课` 判 FAIL，但那个文案到底
+    #   在不在页面上，代码其实说不清 —— 报出来的只是"我没在留痕里搜到"。
+    #
+    # 所以 FAIL 方向交回模型看图判，最多 ASSERT_AI_RECHECK_MAX 次
+    # （用户定的"AI 判断 3 次上限"）。模型也判不了时**维持代码结论**，
+    # 不因为"没复核成"就改判 PASS。
+    if code_verdict is True:
+        print(f"  [assert] {a['id']} 代码强判定：成立（{code_why}），不问模型",
               file=sys.stderr)
         return {"pending": {
             "kind": "verdict", "assert_id": a["id"],
-            "passed": code_verdict,
+            "passed": True,
             "actual": f"[代码判定] {code_why}",
             "event_id": (state.get("last_event_ids") or [""])[0],
             "by_code": True,
         }}
+
+    if code_verdict is False:
+        n = int(state.get("assert_ai_rounds") or 0)
+        if n < ASSERT_AI_RECHECK_MAX:
+            # 这条断言该看的那一步的证据（与常规判定同一份）
+            _ev1 = _evidence_for_assert(state, a)
+            _evd1 = _ev1["data"]
+            # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
+            _vis1 = _vision_for_assert(state, a, _evd1)
+            print(f"  [assert] {a['id']} 代码判定不成立（{code_why}），"
+                  f"交 AI 复核 第 {n + 1}/{ASSERT_AI_RECHECK_MAX} 次",
+                  file=sys.stderr)
+            # ★★★ 这里必须**真的 interrupt 去问模型** ★★★
+            #
+            # 之前这里 `return {"pending": {"kind":"assert", ...}}` ——
+            # 只是把"我要问模型"这个**请求**当 state 返回，**没有任何地方
+            # 把它交给模型**：图按 route_after_assert 把它送进 verdict 节点，
+            # 而 verdict 节点的 `v = state["pending"]` 是**模型回复**的位置，
+            # 读出来自然没有 passed / actual。
+            #
+            # 结果就是报告里那句假话：「模型回复无法解析，本条未做判定（）」
+            # —— 模型连问题都没看到，却被记成"它答得乱七八糟"。
+            # 176 的 a4/a5 两条就是这么变的 BLOCKED，查了半天才发现
+            # 日志里 a4/a5 **一条提示词都没有**（对比 a6 有完整问答）。
+            #
+            # 教训：`pending` 有两个语义完全不同的用途 ——
+            #   · "要问模型的东西" → 必须 interrupt()
+            #   · "模型已经答的"    → 可以直接 return
+            # 混用就会出现这种"请求被当成答案"的静默错误。
+            _recheck_payload = {
+                "kind": "assert",
+                "index": done_assers + 1, "total": len(asserts),
+                "assert_id": a["id"], "desc": a["desc"],
+                "check": a.get("check"), "assert_expect": a.get("check"),
+                "case_title": task.get("title"),
+                "step_desc": step_ctx.get("desc"),
+                "step_landing": step_ctx.get("landing"),
+                "steps_done": _steps_done(state),
+                "step_total": len(steps),
+                "activity": state.get("last_activity"),
+                "activity_reached": activity_reached,
+                "code_verdict": code_verdict,
+                "code_why": code_why,
+                # ★ 明确告诉模型：代码说"不成立"，但那是**代码没搜到**，
+                #   不是判决。请你看图/看控件上下文自己判。
+                "question": (
+                    f"代码按判据 {a.get('check')!r} 没搜到证据"
+                    f"（{code_why}），但**这只说明代码没找到，不代表功能不对**："
+                    "可能是文案被拆分到多个控件、控件没进可点列表、"
+                    "或 YAML 里的 rid 已经改名。"
+                    f"证据来自{_ev1['source']}，只有 XML 文字（**没有图片**）。"
+                    "请对照下面的控件清单自行判断这条预期是否达成。"
+                    "真的没达成 -> passed=false；看得出达成了 -> passed=true；"
+                    "看不清 -> passed=null 并在 actual 说明看不清什么。"),
+                # ★ 与首次判定一致：**不给图**，按步取 XML 证据
+                "evidence_source": _ev1["source"],
+                "evidence_bound": _ev1["bound"],
+                "screen_activity": _evd1.get("activity") or "",
+                "screen_nodes_text": _evd1.get("nodes_text") or "",
+                "screen_nodes": _evd1.get("nodes") or [],
+                "screen_clickable": _evd1.get("clickable") or [],
+                "vision_result": _vis1,
+                "image": "",
+                "activity_seen": sorted(seen_acts),
+                "evidence_event_ids": state.get("last_event_ids", []),
+                "visited": state.get("visited", [])[-8:],
+                "seen_rids": sorted(set(state.get("seen_rids") or [])),
+                "knowledge": (state.get("action") or {}).get("knowledge") or "",
+                "knowledge_files": task.get("knowledge_files", []),
+            }
+            _ans = interrupt(_recheck_payload, response_schema=AssertVerdict)
+            if isinstance(_ans, AssertVerdict):
+                _ans = _ans.model_dump()
+            # 打上"这是复核轮"的标记：verdict 节点靠它豁免 activity 改判。
+            return {"pending": {**_ans, "ai_recheck": True},
+                    "assert_ai_rounds": n + 1,
+                    "assert_ai_last": str(_ans.get("actual") or ""),
+                    "assert_pending_for": a["id"]}
+
+        # 复核次数用尽：以代码结论收口，并**如实记一条**
+        print(f"  [assert] {a['id']} 代码判定不成立，"
+              f"AI 复核 {ASSERT_AI_RECHECK_MAX} 次未能改判，维持代码结论",
+              file=sys.stderr)
+        # 读 AI 最后一次意见：它会由 assert_verdict_node 写进 assert_ai_last。
+        # 读不到就只报代码结论，不编。
+        _last = str(state.get("assert_ai_last") or "").strip()
+        return {"pending": {
+            "kind": "verdict", "assert_id": a["id"],
+            "passed": False,
+            "actual": (f"[代码判定·AI已复核{ASSERT_AI_RECHECK_MAX}次] {code_why}"
+                       + (f"｜AI 意见：{_last}" if _last else "")),
+            "event_id": (state.get("last_event_ids") or [""])[0],
+            "by_code": True,
+        }, "assert_ai_rounds": 0}
+
+    # 取这条断言该看的那一步的证据（见 _evidence_for_assert）
+    _ev = _evidence_for_assert(state, a)
+    _evd = _ev["data"]
+    # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
+    _vis = _vision_for_assert(state, a, _evd)
 
     payload = {
         "kind": "assert",
@@ -3273,18 +3935,41 @@ def assert_node(state: ChildState) -> dict[str, Any]:
         "step_landing": step_ctx.get("landing"),
         "steps_done": _steps_done(state),
         "step_total": len(steps),
-        "activity": state.get("last_activity"),
+        # ★★★ 这里**不给图**，只给 XML 证据 ★★★
+        #
+        # 用户定的优先级：XML 能判就用 XML；文字要靠 OCR 才认得出就走 OCR；
+        # 两个都不行才请视觉模型。**图片只走 vision 那条独立通道**，
+        # 不随断言一股脑塞给判定模型。
+        #
+        # 为什么必须撤掉（run 68 实测，8 条断言）：
+        #   · 每条提示词 51.7 万字符，其中图片 51.4 万 —— 占 99.3%，
+        #     文字证据只有 3.4 千；
+        #   · 8 条断言的图片 base64 **md5 完全一致**（都是最后那张 step16），
+        #     而它们要验的是不同时刻的不同界面；
+        #   · 提示词里**没有一句话**说明这张图是哪一步的。
+        #   结果是 a6 拿着「编辑课程」那张图去找「新建课程表」的完成按钮，
+        #   只能答"看不到" —— 看起来像模型不行，其实是证据给错了。
+        #
+        # 现在给的是**这条断言所属那一步**的快照（见 _evidence_for_assert），
+        # 并且明确写上"证据来自哪一步"，让模型知道自己在看哪一屏。
+        "evidence_source": _ev["source"],
+        "evidence_bound": _ev["bound"],
+        "screen_activity": _evd.get("activity") or "",
+        "screen_nodes_text": _evd.get("nodes_text") or "",
+        "screen_nodes": _evd.get("nodes") or [],
+        "screen_clickable": _evd.get("clickable") or [],
+        "screen_dump": _evd.get("dump") or "",
+        "vision_result": _vis,
+        "image": "",          # ★ 判定不给图，看图请走 vision 通道
+        "activity": _evd.get("activity") or state.get("last_activity"),
         # 代码算好的硬事实：None=不适用，True/False=到达过没有
         "activity_reached": activity_reached,
-        # 结构化判据的代码结论：None=判不了（请你看图判）
         "code_verdict": code_verdict,
         "code_why": code_why,
         "activity_seen": sorted(seen_acts),
         "evidence_event_ids": state.get("last_event_ids", []),
         "visited": state.get("visited", [])[-8:],
-        "clickable": state.get("obs_clickable", []),
         # 整个执行过程中见过的控件 —— 供 node_present=rid=X 这类判据使用。
-        # 断言是流程末尾统一判的，那时目标控件可能早就翻页翻走了。
         "seen_rids": sorted(set(state.get("seen_rids") or [])),
         "knowledge": (state.get("action") or {}).get("knowledge") or "",
         "knowledge_files": task.get("knowledge_files", []),
@@ -3293,8 +3978,11 @@ def assert_node(state: ChildState) -> dict[str, Any]:
             f"代码已判定该判据**{'成立' if code_verdict else '不成立'}**"
             f"（{code_why}），请按此结论作答。"
             if code_verdict is not None else
+            f"证据来自{_ev['source']}，只有 XML 文字（**没有图片**）。"
             "这条预期达成了吗？actual 写具体现象；"
-            "event_id 必须取自 evidence_event_ids。"),
+            "event_id 必须取自 evidence_event_ids。"
+            "XML 里确实找不到依据、且你认为必须看图才能判 -> passed=null，"
+            "并在 actual 里写清要看的到底是什么。"),
     }
     answer = interrupt(payload, response_schema=AssertVerdict)
     if isinstance(answer, AssertVerdict):
@@ -3317,6 +4005,59 @@ class AssertVerdict(BaseModel):
         description="true=通过，false=不通过，null=看不清/无法判断（不要猜）")
     actual: str = Field(description="实际现象，必须具体")
     event_id: str = Field(default="", description="证据事件 ID")
+    # ★★ 这两个字段必须声明，否则会被 pydantic **静默丢掉**。
+    #
+    # 178 实测踩到，这是"报错信息是空的"的真正原因：
+    #   runner._answer 在模型回复解析失败时返回
+    #       {"passed": None, "actual": "...", "unknown": True, "error": "..."}
+    #   但 interrupt 带了 response_schema=AssertVerdict，
+    #   LangGraph 会按这个 schema **校验并转换**，没声明的键直接丢弃。
+    #   于是 assert_verdict_node 里 `v.get("unknown")` 永远是 None、
+    #   `v.get("error")` 永远是 None —— 结果就是：
+    #     · 判不出来这件事**根本传递不上来**（unknown 丢了）
+    #     · issues 里印出空括号「判定缺失：模型回复无法解析（）」
+    #   排查时看到空括号完全无从下手，就是这个原因。
+    #
+    # 教训：凡是 runner 要往回带的状态，**必须在 schema 里声明**。
+    # 声明了才留得住，不声明就等于没传。
+    unknown: bool = Field(
+        default=False, description="模型回复解析失败/无法判定（不是 PASS 也不是 FAIL）")
+    error: str = Field(default="", description="解析失败的具体原因，用于排查")
+    # 复核轮标记（见 assert_node / runner）：代码说不成立、这轮是让 AI 复核
+    ai_recheck: bool = Field(
+        default=False, description="本轮是否属于「代码判定失败 -> 交 AI 复核」")
+    code_why: str = Field(default="", description="代码判定不成立的原话")
+    # 计算成本相关的注解，模型可以不填
+    evidence: str = Field(default="", description="判断依据")
+    confidence: str = Field(default="", description="high/medium/low")
+    note: str = Field(default="", description="补充说明")
+    event_id_corrected: str = Field(default="", description="evidence id 纠正记录")
+    # ★★★ 证据不足时，请执行器补一步（用户要求）★★★
+    #
+    # 场景（a13 实测）：预期「能调背景色，共 10 种」，但色块面板没展开，
+    # 只看到一行「课程背景色」。判定只能给 null —— 而 null 只会变成
+    # BLOCKED，报告里就是"这条没验"。用户的原话：
+    #   「检查 10 个色块。条件不满足了。那就退回执行增加个步骤呗」
+    #
+    # 所以判定可以**回话**：告诉执行器我还要看什么、为什么现在看不到、
+    # 屏幕上哪些元素可能相关。执行器补一步动作，回来重判。
+    #
+    # 形状（结构化而不是一句话，让执行器能直接用）：
+    #   {"verify_target": "要核验什么",
+    #    "why_insufficient": "为什么现在判不了",
+    #    "related_elements": [{"rid": "llCourseColor", "text": "课程背景色"}],
+    #    "close_with": "取消"}
+    #
+    # `close_with` 是"点开看完怎么关回去"（用户的要求）：
+    #   「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。
+    #     不然继续不下去了。我说了要像个人类测试员一样」
+    #   人类点开色板看完会点「取消」退回编辑弹窗再继续。不关的话，
+    #   下一条断言拿到的是色板 —— 验的根本不是一回事。
+    #
+    # 空 dict / 没有该键 = 不需要补证据（正常路径）。
+    need_action: dict[str, Any] = Field(
+        default_factory=dict,
+        description="证据不足时请求补动作：要验什么/为什么不够/相关元素")
 
 
 def _steps_done(state: ChildState) -> int:
@@ -3696,6 +4437,14 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
                                 got = str(n.get("t") or n.get("text") or "")
                                 break
                     if not got:
+                        # ★ 值节点（clickable=false）不在可点列表里，但在语义节点里。
+                        #   178 的 tv_lesson_duration「50分钟」就是这种 ——
+                        #   只查可点列表永远读不到它的文案，于是 a2/a3 判不出。
+                        for n in (state.get("obs_nodes") or []):
+                            if str(n.get("r") or n.get("rid") or "") == rid:
+                                got = str(n.get("t") or n.get("text") or "")
+                                break
+                    if not got:
                         # 控件压根没带文案（或没进可点列表）：只能靠整屏文案兜底。
                         # ★ 这里必须把"兜底命中"和"真没出现"分开写。
                         #   原来两种情况都记「没见过该控件」，于是会出现
@@ -3788,15 +4537,144 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
     # ★ 代码判定的结论不需要模型给证据 ID —— 它的证据是设备状态本身
     #   （activity 名、dump 里的 rid），比模型随手贴的 event_id 更硬。
     #   不加这个例外的话，直通结论会被误记成"缺证据"。
+    #
+    # ⚠️ 必须在"补证据"那段之前取 —— 那段要用 by_code 判"这是不是代码定论"。
+    #    放到后面会 UnboundLocalError（实测踩过）。
     by_code = bool(v.get("by_code"))
+    # ★★★ 证据不够 → 请执行器补一步动作，**这一条先不落 finding** ★★★
+    #
+    # 用户的需求（原话）：
+    #   「检查 10 个色块。条件不满足了。那就退回执行增加个步骤呗」
+    #   「最多 3 次，但要防止一直点相同的」
+    #   「那就如果报 FAIL。验证不报 BLOCK」
+    #
+    # 触发条件三条同时成立：
+    #   ① 模型这轮判不了（passed=None）—— 判得了就不该再折腾
+    #   ② 它给了 need_action（带 related_elements）—— 知道该点哪
+    #   ③ 这条断言补证据次数还没到上限
+    #
+    # 拦截点必须在落 finding **之前**：一旦写了 finding，这条断言就算"已收"，
+    # 后面 route_after_verdict 会拿 done_assers 推进到下一条，再也回不来了。
+    _na = v.get("need_action") or {}
+    _na_ok = isinstance(_na, dict) and (
+        _na.get("verify_target") or _na.get("related_elements"))
+    _fix_rounds = int(state.get("assert_fix_rounds") or 0)
+    _fix_for = str(state.get("assert_fix_for") or "")
+    # 换了一条断言就重置计数（和 assert_ai_rounds 同一个道理）
+    if _fix_for and _fix_for != a["id"]:
+        _fix_rounds = 0
+    # ⚠️⚠️ 判据必须用 `_p`（模型原始回复），**不能用 `passed`**。
+    #
+    #   上面那行 `if _p is None: passed = False` 是给"落 finding"用的：
+    #   null 最终要落成 BLOCKED，所以内部先记 False 再由 unreviewed 兜住。
+    #   但补证据这段判的是"模型这轮判没判得了" —— 那是 `_p is None`。
+    #   用 `passed is None` 恒为假，整个补动作机制**一次都不会触发**。
+    #   （实测：a13 模型明明给了完整 need_action，日志里却一个"补动作"都没有。）
+    if _p is None and _na_ok and not by_code and _fix_rounds < ASSERT_FIX_MAX:
+        _tried = list(state.get("assert_fix_tried") or []) if _fix_for == a["id"] else []
+        # ★ 把任务卡翻成一个**能直接执行的动作**（act_node 认 tap_target）。
+        #
+        # 从 related_elements 里挑第一个**可点且没试过**的：
+        #   · 用户要求「防止一直点相同的」—— 试过的签名记在 assert_fix_tried，
+        #     这里跳过，避免 3 次都点在同一个元素上原地打转。
+        #   · rid 优先（唯一性好），没 rid 才退回 text。
+        _pick: dict[str, Any] = {}
+        for _e in (_na.get("related_elements") or []):
+            if not isinstance(_e, dict):
+                continue
+            _rid = str(_e.get("rid") or "").strip()
+            _txt = str(_e.get("text") or "").strip()
+            _sig = f"rid={_rid}" if _rid else (f"text={_txt}" if _txt else "")
+            if not _sig or _sig in _tried:
+                continue
+            _pick = {"sig": _sig, "tap_target": _sig}
+            break
+        _act = {}
+        if _pick:
+            _act = {"tap_target": _pick["tap_target"],
+                    "why": f"补证据：{_na.get('verify_target') or a['desc']}"}
+            _tried = _tried + [_pick["sig"]]
+            print(f"  [assert] {a['id']} 判定为「看不清」，补动作 "
+                  f"{_fix_rounds + 1}/{ASSERT_FIX_MAX}：点 {_pick['sig']}",
+                  file=sys.stderr)
+        else:
+            # 没有可点的新元素 —— 说明该点的都点过了，这一轮补不出新东西。
+            # 直接把轮次推到上限，下一轮就按「补满仍看不清 → FAIL」收口，
+            # 免得空转三次。
+            print(f"  [assert] {a['id']} 没有新的可点元素，直接收口",
+                  file=sys.stderr)
+            return {
+                "assert_fix_rounds": ASSERT_FIX_MAX,
+                "assert_fix_for": a["id"],
+                "assert_fix_tried": _tried,
+                "assert_fix_task": {},
+                "pending": None,
+                "issues": [f"{a['id']} 可点的相关元素都已试过，"
+                           f"无法再补证据"],
+            }
+        return {
+            "assert_fix_rounds": _fix_rounds + 1,
+            "assert_fix_for": a["id"],
+            "assert_fix_tried": _tried,
+            "assert_fix_note": str(_na.get("why_insufficient") or ""),
+            # 模型说点开之后怎么关回去（下一轮重判落定后点它）
+            "assert_fix_close": str(_na.get("close_with") or "").strip(),
+            # ★ 交给执行器的"任务卡"：要验什么、缺什么、该找什么元素
+            "assert_fix_task": {
+                "assert_id": a["id"],
+                "verify_target": str(_na.get("verify_target") or a["desc"]),
+                "why_insufficient": str(_na.get("why_insufficient") or ""),
+                "related_elements": [
+                    e for e in (_na.get("related_elements") or [])
+                    if isinstance(e, dict)][:12],
+                "tried": _tried,
+                "round": _fix_rounds + 1,
+                "max": ASSERT_FIX_MAX,
+            },
+            "action": _act,
+            # 不落 finding，pending 清掉，路由会把我们送去 act
+            "pending": None,
+            "issues": [f"{a['id']} 证据不足，回执行补动作"
+                       f"（第 {_fix_rounds + 1}/{ASSERT_FIX_MAX} 次）："
+                       f"{_na.get('why_insufficient') or '未说明'}"],
+        }
+    if _p is None and _na_ok and not by_code and _fix_rounds >= ASSERT_FIX_MAX:
+        # 补满了还是看不清 —— 用户定的：**判 FAIL，不报 BLOCKED**。
+        #
+        # 但要把"补过几次、试过什么、为什么还是看不到"写进 actual，
+        # 否则报告里就一句 FAIL，看不出是我们没找到还是产品没做到。
+        _tried_txt = "、".join(state.get("assert_fix_tried") or []) or "（无）"
+        passed = False
+        unreviewed = False
+        actual = (f"{actual}".rstrip()
+                  + f"\n[补证据 {ASSERT_FIX_MAX} 次仍看不到，判 FAIL]"
+                  + f" 试过的动作：{_tried_txt}")
+        issues.append(f"{a['id']} 补动作 {ASSERT_FIX_MAX} 次仍无法核验，"
+                      f"按约定判 FAIL（不是 BLOCKED）")
+
+    # ★ 代码判定的结论不需要模型给证据 ID —— 它的证据是设备状态本身
+    #   （activity 名、dump 里的 rid），比模型随手贴的 event_id 更硬。
+    #   不加这个例外的话，直通结论会被误记成"缺证据"。
+    #   （by_code 已在上面「补证据」段之前取好，这里不再重复定义。）
     if unreviewed:
         issues.append(
             f"{a['id']} 判定缺失：模型回复无法解析，本条未做判定"
             f"（{str(v.get('error') or '')[:160]}）")
     if not by_code:
         if not got:
-            issues.append(f"{a['id']} 缺证据 ID")
-        elif valid and got not in valid:
+            # ★ 断言阶段「没有 event_id」通常**不是模型的问题**。
+            #
+            # 断言是在整个流程走完之后统一判的。那时最后一步的点击早已过去，
+            # `last_event_ids` 是空的（见 176 实测：a7/a8/a9 全被判 PASS，
+            # 却每条都挂一条「缺证据 ID」，看起来像证据缺失，实际什么都缺）。
+            #
+            # 所以只在**真的没有可信证据**时才报：本会话没走过任何步骤，
+            # 或者 valid 为空（说明连一次 act 的证据都没攒下）。
+            # 走过步骤且 valid 非空时，证据在 actions 表和截图里，
+            # 只是"当前这一瞬"的 last_event_ids 过期了 —— 不该诬告模型。
+            if not valid:
+                issues.append(f"{a['id']} 缺证据 ID（本次没有任何可绑定的动作证据）")
+        elif got not in valid:
             issues.append(f"{a['id']} 证据 ID {got} 不属于本会话")
     if not actual.strip():
         issues.append(f"{a['id']} actual 为空")
@@ -3811,37 +4689,64 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
     # activity= 判据是纯字符串比对，代码说了到达过就是到达过，
     # 不存在"模型看得更准"的空间 —— 它只是容易把"当前"当成"到达过"。
     # 这里直接纠正，并如实记一条问题，不偷偷改判。
+    #
+    # ⚠️ 复核轮的 PASS 要豁免下面那条"改判 FAIL"：
+    #   代码说"这个 activity 没出现过"，AI 复核说"我看到了" ——
+    #   如果这里无条件翻回 FAIL，assert_node 的复核又白做了。
+    #   注意"到达过"是纯字符串比对，理论上不该出现"代码没搜到但真有"，
+    #   所以豁免的同时要把 code_why 记进 issues，让改判留痕可查。
+    _ai_pass_now = bool(v.get("ai_recheck") and passed)
     reached = _activity_reached(state, a.get("check"))
     if reached is True and not passed:
         issues.append(
             f"{a['id']} 判定纠正：模型判 FAIL，但代码核对该 activity "
             f"本次确实到达过（{a.get('check')}）→ 改判 PASS")
         passed = True
-    elif reached is False and passed:
+    elif reached is False and passed and not _ai_pass_now:
         issues.append(
             f"{a['id']} 判定纠正：模型判 PASS，但代码核对该 activity "
             f"本次从未出现（{a.get('check')}）→ 改判 FAIL")
         passed = False
+    elif reached is False and passed and _ai_pass_now:
+        issues.append(
+            f"{a['id']} 代码说该 activity 本次未出现，但 AI 复核判成立"
+            f"（{a.get('check')}）→ 以 AI 复核为准记 PASS，疑似"
+            f"activity 名/短名写法与实际不符，建议核对")
 
-    # ★ 结构化判据：代码判得了的一律以代码为准。
+    # ★ 结构化判据：代码判得了的一律以代码为准 —— **除了"代码说不成立、
+    #   AI 复核后判成立"这一种**。
     #
-    # 和 activity_reached 同一个道理，但覆盖面更广 ——
-    # 用例 YAML 的 check 是结构化的（node_present / node_text / package / …），
-    # 这些都是纯字符串比对，代码判得比模型准（模型会看错、会看当前不看历史）。
-    # None = 判不了（要看图），那种才留给模型。
-    code_verdict, code_why = evaluate_check(a.get("check"), state=state)
-    if code_verdict is True and not passed:
+    # 为什么留这个例外（用户要求"代码判定失败就让 AI 介入"）：
+    #   代码判"不成立"的含义只是"我没在留痕里搜到"，它可能是真没有，
+    #   也可能是文案被拆进多个节点 / 控件没进可点列表 / rid 改名。
+    #   而 AI 是对着截图和控件上下文判的，它能看见"字在，只是结构变了"。
+    #   如果这里无条件把 AI 的 PASS 再翻回 FAIL，那 assert_node 里加的
+    #   复核就白做了 —— 模型说"我看到了"和这一行冲突时，错的多半是代码。
+    #
+    #   反过来的方向（代码说成立、模型说不成立 / 代码说成立、模型说看不清）
+    #   仍然以代码为准：搜到证据是硬事实，不需要谁再确认一遍。
+    ai_rechecked_pass = (v.get("ai_recheck") and passed)
+    if ai_rechecked_pass:
         issues.append(
-            f"{a['id']} 判定纠正：模型判 FAIL，但代码核对判据成立"
-            f"（{code_why}）→ 改判 PASS")
+            f"{a['id']} 代码判据未命中，但 AI 复核判成立"
+            f"（代码结论：{v.get('code_why') or ''}）→ 以 AI 复核为准记 PASS")
         passed = True
-        unreviewed = False          # 代码已经给出确定结论，不再是"判不了"
-    elif code_verdict is False and passed:
-        issues.append(
-            f"{a['id']} 判定纠正：模型判 PASS，但代码核对判据不成立"
-            f"（{code_why}）→ 改判 FAIL")
-        passed = False
         unreviewed = False
+
+    code_verdict, code_why = evaluate_check(a.get("check"), state=state)
+    if not ai_rechecked_pass:
+        if code_verdict is True and not passed:
+            issues.append(
+                f"{a['id']} 判定纠正：模型判 FAIL，但代码核对判据成立"
+                f"（{code_why}）→ 改判 PASS")
+            passed = True
+            unreviewed = False          # 代码已经给出确定结论，不再是"判不了"
+        elif code_verdict is False and passed:
+            issues.append(
+                f"{a['id']} 判定纠正：模型判 PASS，但代码核对判据不成立"
+                f"（{code_why}）→ 改判 FAIL")
+            passed = False
+            unreviewed = False
 
     # ★ 模型回复解析不了、代码判据也判不了 → 这条是 UNKNOWN，不是 FAIL。
     #
@@ -3852,6 +4757,33 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
     #   报告里的 issues 会写明"模型回复无法解析"，主 Agent 能一眼看出
     #   这是执行问题还是产品问题 —— 这个区分正是用户反复强调的。
     tool_failed = False
+    # ★★ 补证据看完，把界面关回去 ★★
+    #
+    # 「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。不然继续不下去了。
+    #   我说了要像个人类测试员一样」
+    #
+    # 人类点开色板看完会点「取消」退回编辑弹窗，再继续下一步。
+    # 这里就点模型在 need_action.close_with 里说的那个按钮。
+    # 判断条件只有"模型给过 close_with 且这次确实补过证据"——
+    # 不比较指纹、不搞返回栈，复杂度就这么多。
+    _close = str(state.get("assert_fix_close") or "").strip()
+    if _close and _fix_rounds > 0:
+        # 按**文字**点那个关闭按钮。用 xpath 精确匹配，命中多个就退回用返回键 ——
+        # 和 click_xpath 的既有约定一致（宁可退回，也不赌点哪个）。
+        _esc = _close.replace('"', '\\"')
+        _expr = f'//*[@text="{_esc}"]'
+        try:
+            _r = dev.click_xpath(_expr)
+            if _r is None:
+                dev.key("back", why=f"补完证据，用返回键退回（{a['id']}）",
+                        step=_step_id(state))
+                print(f"  [assert] {a['id']} 没找到「{_close}」唯一命中，改用返回键",
+                      file=sys.stderr)
+            else:
+                print(f"  [assert] {a['id']} 补完证据，已点「{_close}」退回",
+                      file=sys.stderr)
+        except ToolError as exc:
+            issues.append(f"{a['id']} 补证据后点「{_close}」失败：{exc}")
     if unreviewed:
         status = "BLOCKED"
         if not actual.strip():
@@ -3880,6 +4812,12 @@ def assert_verdict_node(state: ChildState) -> dict[str, Any]:
                       "event_id": got, "issues": issues}],
         "issues": issues,
         "pending": None,
+        # ★ 换断言时把复核计数归零 —— 计数是"这一条断言"的，不是整轮的。
+        #   不归零的话：a1 用完 3 次，a2 一进来就没有复核机会了。
+        "assert_ai_rounds": 0,
+        "assert_pending_for": "",
+        # 留给下一条断言用的"AI 最后意见"，换条时清掉。
+        "assert_ai_last": actual if v.get("ai_recheck") else "",
     }
 
 
@@ -3932,14 +4870,38 @@ def finish_child_node(state: ChildState) -> dict[str, Any]:
     elif len(got) < len(asserts):
         status = "BLOCKED"
         issues.append(f"预期 {len(asserts)} 条，只验到 {len(got)} 条")
+    elif any(f["status"] == "BLOCKED" for f in got):
+        # ★★ 有断言记成 BLOCKED（"判定缺失"）时，整条用例**不是 PASS**。
+        #
+        # 178 实测踩到的：a2/a3/a4 三条因为视觉模型返回空文本 -> 判定缺失，
+        # 状态记 BLOCKED，可**上面这两条判断都拦不住**：
+        #   · len(got) == len(asserts)  —— 三条都"写进去了"
+        #   · any(status == "FAIL")     —— 它们是 BLOCKED，不是 FAIL
+        # 于是走到 else 分支，总结论写成 **PASS**，
+        # summary 还写着「预期 6/6 已验证」——
+        # 实际是 3 条代码判过、3 条压根没判。
+        #
+        # 这比直接报 FAIL 更危险：**它让没验的东西看起来验过了**。
+        # 用户问"这个 case 到底过没过"，得到的是假的"过"。
+        #
+        # 归 BLOCKED 而不是 FAIL，理由和单条断言一致：
+        # 我们没验，所以既不能替产品说"坏"，也不能说"好"。
+        _n_blocked = len([f for f in got if f["status"] == "BLOCKED"])
+        status = "BLOCKED"
+        issues.append(
+            f"{_n_blocked} 条预期未做出判定（判定缺失，不是功能问题）——"
+            f"这些预期**没有验过**，不能算通过")
     elif any(f["status"] == "FAIL" for f in got):
         status = "FAIL"
     else:
         status = "PASS"
 
+    _verified = len([f for f in got if f["status"] in ("PASS", "FAIL")])
+    _blocked_n = len([f for f in got if f["status"] == "BLOCKED"])
     summary = state.get("summary") or (
         f"{task['title']}：步骤 {steps_done}/{len(steps)}，"
-        f"预期 {len(got)}/{len(asserts)} 已验证")
+        f"预期 {_verified}/{len(asserts)} 已判定"
+        + (f"（{_blocked_n} 条未判定）" if _blocked_n else ""))
 
     # ⚠️ env 类前提的恢复：**无论成败都要跑**，否则污染下一条用例。
     # 这一步放在 finish 里而不是正常流程里，就是为了保证异常路径也能执行到。
@@ -3998,14 +4960,20 @@ def finish_child_node(state: ChildState) -> dict[str, Any]:
 # 路由
 # --------------------------------------------------------------------------
 
-def route_after_observe(state: ChildState) -> Literal["strong_target", "decide", "finish"]:
+def route_after_observe(state: ChildState) -> Literal["strong_target", "decide",
+                                                      "assert", "finish"]:
     """崩溃/硬终止 -> 直接收尾，不再问 AI、不再动作。
 
     观察完先给代码一次机会：这一步的 target 在当前屏上能唯一确定就直点，
     定不下来才叫模型（`fallback_reason` 非空表示本步已经交给模型了，别再问一遍）。
+
+    ★ 若当前是在为断言补证据（assert_fix_task 非空），**拿到新画面就直接回去重判**
+      —— 补证据不是执行用例的某一步，不该再走 strong_target/decide 去推进步骤。
     """
     if state.get("status") == "BLOCKED":
         return "finish"
+    if state.get("assert_fix_task"):
+        return "assert"
     if not state.get("fallback_reason"):
         return "strong_target"
     return "decide"
@@ -4135,6 +5103,12 @@ def route_after_decide(
     #       动作有字段、路由不认，等于这个能力不存在。
     if str(a.get("input_rid") or "").strip():
         return "act"
+    # ★ tap 的语义目标同理（2026-10-21 又踩一次）。
+    #   新契约下模型只给 tap_target，不给坐标；路由只判 next_x 的话，
+    #   每一轮都被吞成"无动作"，176 直接 0 动作跑空。
+    #   注释里那条"每加一种新的动作类型，必须同时加路由判据"是真话。
+    if str(a.get("tap_target") or "").strip():
+        return "act"
     if a.get("next_x") is None:
         return "check"
     return "act"
@@ -4151,7 +5125,7 @@ def route_after_knowledge(state: ChildState) -> Literal["decide", "vision", "act
 
 
 def route_after_act(state: ChildState) -> Literal["vision", "strong_target", "decide",
-                                                  "observe", "start_check"]:
+                                                  "observe", "start_check", "check"]:
     """动作后直接用 act 返回的画面进入判断 —— 不再 observe。
 
     ⚠️ SKILL 的节奏：act → 读 next → act。
@@ -4166,14 +5140,52 @@ def route_after_act(state: ChildState) -> Literal["vision", "strong_target", "de
       代码能据此判断下一步：target 唯一命中就继续直点，
       定不下来（或本步已交给模型）才去 decide。
       ⚠️ 少了这条，每做完一个动作仍会白叫一次模型（实测 6 次）。
+
+    ★★ 本步轮次超限 -> 去 check 收口（不能只靠模型自觉）。
+    ---------------------------------------------------------------
+    176 实测（2026-10-21）空转了 **65 轮、11 分钟**，在
+    「填名称 -> 点完成 -> 回到列表页 -> 再进编辑页」里循环，
+    建出 6 张同名课程表。事后查下来是 YAML 落点写错了一屏。
+
+    但真正该拦住它的是**代码**，不是运气：
+      · check_node 里有 `round_in_step >= limit -> BLOCKED` 的收口，
+        而且 `round_in_step` 在 act 里每轮都正常 +1；
+      · 可 check_node **只有**在模型主动说 step_done 时才被路由到
+        （见 route_after_decide）。模型不说 done、一直在"努力"试，
+        就永远进不了 check —— 那道轮次上限**一次都没机会执行**。
+
+    教训：上限写在某个节点里，就必须保证那条路由**真的会到达**它。
+    否则等于没写。
+
+    这里在动作之后补一个判断：本步已经动了 limit 次还没结论，
+    直接送 check 让它收口。用的是**同一份** limit 语义
+    （state.max_rounds_per_step），不另起阈值。
     """
     a = state.get("action") or {}
+    # ★★ 补证据的那一次动作：做完就回 observe，然后重判原断言 ★★
+    #
+    # 必须放在所有既有判断之前 —— 这类 act 不属于任何一步的正常执行
+    # （round_in_step / fallback / strong_target 那一套都不适用），
+    # 走进去只会把它当成"这一步没走完"，然后又是一整轮 plan/decide。
+    #
+    # 失败也回 observe：observe 一定会刷新画面，随后 route_after_observe
+    # 会看到 assert_fix_task 把我们送回 assert 重判。不在这里搞两套去向。
+    if state.get("assert_fix_task"):
+        return "observe"
     if a.get("vision_question"):
         return "vision"
     if state.get("start_mismatch"):
         return "start_check"
     if not state.get("obs_fresh"):
         return "observe"
+    # ★ 本步动作次数到顶 -> 交 check 收口（它会判 BLOCKED 并停）。
+    #   放在 strong_target 之前：都到上限了就别再直点了。
+    try:
+        _limit = int(state.get("max_rounds_per_step") or 8)
+    except (TypeError, ValueError):
+        _limit = 8
+    if int(state.get("round_in_step") or 0) >= _limit:
+        return "check"
     if not state.get("fallback_reason"):
         return "strong_target"
     return "decide"
@@ -4185,20 +5197,93 @@ def route_after_vision(state: ChildState) -> Literal["observe", "start_check", "
     return "start_check" if state.get("start_mismatch") else "observe"
 
 
+def _pending_asserts_for_step(state: ChildState, step_id: str) -> list[dict[str, Any]]:
+    """这一步**还没判**的断言。
+
+    用户的原话（这是整个改动的出发点）：
+      「判断应该是一个昨晚然后判断下一个。这是正常人类的思维。
+        我看完了是否又 10 个色块。当前这个弹窗挡住了。那我就回退到上一步继续判断。」
+      「正常的逻辑也是。一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
+
+    也就是说：**做完一步就把这一步的断言判掉**，趁界面还停在那一屏。
+    早先是全部步骤走完再统一判，那时弹窗早关了 ——
+    a13 要数的 10 个色块在编辑弹窗里，判的时候弹窗已经不在，
+    补动作也点不到（实测靠返回键硬退，最后把 App 退到桌面）。
+    """
+    if not step_id:
+        return []
+    done_ids = {str(f.get("id")) for f in (state.get("findings") or [])
+                if f.get("kind") == "assert"}
+    return [a for a in (state["task"].get("asserts") or [])
+            if str(a.get("step") or "") == step_id
+            and str(a.get("id") or "") not in done_ids]
+
+
 def route_after_check(state: ChildState) -> Literal["plan", "assert"]:
+    """一步做完之后：**先判这一步的断言**，再走下一步。
+
+    ★ 为什么不是直接 plan（早先的写法）：
+      断言全都攒到所有步骤走完才判，那时界面早就退回去了。
+      a13 要数色块，而色块在编辑弹窗里 —— 判的时候弹窗已经关了，
+      模型只能回 null，补动作也够不着那个控件。
+      人类测试员是"看完这一步就验，验完再走下一步"，代码照做就行。
+    """
     if state.get("status") == "BLOCKED":
         return "assert"      # 仍收已验的预期，最终 finish 会判 BLOCKED
+    if _pending_asserts_for_step(state, str(state.get("last_step_id") or "")):
+        return "assert"
     return "plan"
 
 
 def route_after_assert(state: ChildState) -> Literal["verdict", "finish"]:
+    """assert 节点出来的三种 pending：
+
+      kind=finish   -> 收尾
+      kind=verdict  -> 代码已定论，直接落 finding
+      kind=assert   -> 问了模型，拿回来的还可以再回 assert 复核
+                       （assert_node 里 code_verdict=False 那条路）
+
+    ⚠️ 后两种都进 verdict 节点没错 —— verdict 节点既负责"落代码定论"，
+       也负责"接住模型回复"。区分靠 pending 里有没有 passed/by_code。
+    """
     return "finish" if (state.get("pending") or {}).get("kind") == "finish" else "verdict"
 
 
-def route_after_verdict(state: ChildState) -> Literal["assert", "finish"]:
+def route_after_verdict(state: ChildState) -> Literal["assert", "act", "plan", "finish"]:
+    """verdict 之后去哪。
+
+    三条路：
+      · act    —— 模型说"看不清、要补一步"（assert_fix_task 被填了）
+                  → 直接去 act 把那个元素点开，再回来重判
+      · assert —— 还有断言没收完，收下一条
+      · finish —— 全收完了
+
+    ⚠️ act 必须排在最前面：assert_fix_task 存在意味着**这条断言还没落 finding**，
+       此时 done 计数没变，若先判 assert 就会原地把同一条再问一遍，死循环。
+
+    ★ 为什么绕过 plan/decide：
+      补证据要点的元素，模型已经在 need_action.related_elements 里指明了，
+      再走一遍 plan→decide 只会让模型重新挑一次、还可能挑错。
+      这里是**一次确定的动作**，不是重新规划。
+    """
+    if state.get("assert_fix_task"):
+        return "act"
     task = state["task"]
     done = len([f for f in state.get("findings", []) if f.get("kind") == "assert"])
-    return "assert" if done < len(task["asserts"]) else "finish"
+    if done >= len(task["asserts"]):
+        return "finish"
+    # ★ 当前这一步的断言已经判完了 -> 回 plan 走下一步（用户要求的节奏）。
+    #
+    # 「一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
+    #
+    # 不这么写的话，assert 会顺着 asserts 顺序把**后面步骤**的断言也判掉 ——
+    # 而那些步骤还没执行，判它们等于拿错屏硬判。
+    _cur = str(state.get("assert_step") or state.get("last_step_id") or "")
+    if _cur and not _pending_asserts_for_step(state, _cur):
+        # 还有步骤没走 -> 回去继续执行；都走完了 -> 继续收剩下的断言
+        if int(state.get("step_index") or 0) < len(task.get("steps") or []):
+            return "plan"
+    return "assert"
 
 
 def _foreground_owner(state: ChildState) -> tuple[str, str]:
@@ -4383,6 +5468,21 @@ def strong_target_node(state: ChildState) -> dict[str, Any]:
     _tries = _strong_tries(state, sid, target)
     if _tries >= STRONG_MAX_SAME_TARGET:
         _now = state.get("last_activity") or "(未知)"
+        # ★ 输入框要单独说清楚（176 实测踩到）。
+        #
+        # 给模型的话原来是「点了 N 次毫无变化，缺前置条件」——
+        # 模型看到"缺前置条件"，于是**又去输入一次**，形成死循环：
+        # 名字其实第一次就填进去了（账本 chg=1），后面 N 次 chg=0，
+        # 它却以为"没填上"，不停重填，永远轮不到点「完成」。
+        _val = _current_input_value(state, target)
+        if _val is not None:
+            return _ask_model(
+                state,
+                f"{sid} 的输入框 {target} **已经有值了**：{_val!r}。"
+                f"代码已经把同一个值又写了 {_tries + 1} 次，界面毫无变化 ——"
+                f"说明内容是对的、不需要再输入。"
+                f"**下一步不要再输入**，去做这一步真正剩下的事"
+                f"（例如点「完成」/「保存」，或本来就该判定完成了）。")
         return _ask_model(
             state,
             f"{sid} 代码已经把这个目标点了 {_tries + 1} 次，"
@@ -4460,6 +5560,24 @@ def _resolve_strong_target(target: str, state: ChildState) -> tuple[int | None, 
         # rid 常写成全名 com.xxx:id/iv_more，可点清单里只留末段
         want_tail = want.split("/")[-1]
         hits = [n for n in clickable if str(n.get("r") or "") == want_tail]
+    if not hits and label == "rid" and "#" in want:
+        # ★ 支持 rid=xxx#2 取同名的第 2 个（从 1 开始）。
+        #
+        # 为什么需要：空课程表有 25 个格子，rid 全都叫 cv_empty_content
+        # （它们自己的 rid 是空的，按子节点借用来的名字），
+        # 「点第一个小节」用 rid= 表达不出来。没有序号时命中 25 个 ->
+        # 判定"不唯一" -> 交模型 -> 模型继续瞎点 -> 176 的 s4 空转。
+        #
+        # ⚠️ 只对 rid= 生效，且**必须带序号**才算数：
+        #    不带序号的 rid= 仍然要求唯一，绝不默认取第一个。
+        base, _, nth = want.partition("#")
+        base = base.split("/")[-1]
+        if nth.isdigit() and int(nth) >= 1:
+            same = [n for n in clickable if str(n.get("r") or "") == base]
+            k = int(nth) - 1
+            if 0 <= k < len(same):
+                hits = [same[k]]
+                label = f"rid={base}#{nth}"
     if not hits:
         return None, None, f"目标不在当前屏：{label}={want} 没找到"
     if len(hits) > 1:
@@ -4542,6 +5660,31 @@ def _screen_size_from_state(state: ChildState | Any) -> tuple[int, int]:
     if mx > 0 and my > 0:
         return mx, my
     return 0, 0
+
+
+def _current_input_value(state: ChildState, target: str) -> str | None:
+    """这个输入框**现在里面是什么**？不是输入框、或读不到就返回 None。
+
+    只读真的能读到的东西：可点清单里该 rid 的 text。
+    宁可不答（返回 None）也不要瞎猜 —— 猜错会把模型带偏。
+    """
+    want = target.partition("=")[2].strip().strip('"\'')
+    if not want:
+        return None
+    tail = want.split("/")[-1]
+    # 去掉 #n 序号（cv_empty_content#1 那种）
+    base = tail.split("#")[0]
+    for it in (state.get("obs_clickable") or []):
+        # 可点项有两种键名：解析层给 r/t，中间层规范化后是 rid/text。
+        # 只认一种就会漏读（176 里输入框的值就读不到，模型只能反复填）。
+        rid = str(it.get("rid") or it.get("r") or "")
+        if rid.split("#")[0] != base:
+            continue
+        txt = str(it.get("text") or it.get("t")
+                  or it.get("desc") or it.get("d") or "").strip()
+        if txt:
+            return txt
+    return None
 
 
 def _strong_tries(state: ChildState, sid: str, target: str) -> int:
@@ -4966,7 +6109,7 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
                              "check": "check"})
     b.add_conditional_edges("observe", route_after_observe,
                             {"strong_target": "strong_target", "decide": "decide",
-                             "finish": "finish"})
+                             "assert": "assert", "finish": "finish"})
     b.add_conditional_edges("decide", route_after_decide,
                             {"knowledge": "knowledge", "vision": "vision",
                              "act": "act", "check": "check"})
@@ -4976,6 +6119,10 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
     b.add_conditional_edges("act", route_after_act,
                             {"vision": "vision", "strong_target": "strong_target",
                              "decide": "decide", "observe": "observe",
+                             # ★ 本步轮次超限时回 check 收口（见 route_after_act 说明）。
+                             #   少这一项，route_after_act 返回 "check" 会直接抛
+                             #   "Invalid route to node"。
+                             "check": "check",
                              "start_check": "start_check"})
     b.add_conditional_edges("vision", route_after_vision,
                             {"observe": "observe", "start_check": "start_check",
@@ -4985,7 +6132,8 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
     b.add_conditional_edges("assert", route_after_assert,
                             {"verdict": "verdict", "finish": "finish"})
     b.add_conditional_edges("verdict", route_after_verdict,
-                            {"assert": "assert", "finish": "finish"})
+                            {"assert": "assert", "act": "act",
+                             "plan": "plan", "finish": "finish"})
     b.add_edge("finish", END)
 
     return b.compile(checkpointer=checkpointer)

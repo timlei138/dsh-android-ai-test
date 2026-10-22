@@ -43,7 +43,10 @@ print("=== 1) ★ 默认必须是 model（忘了传 → 真模型，不是假成
 DEFAULT_MODEL = 'args.answer ?? "model"'
 DEFAULT_AUTO = 'args.answer ?? "autopilot"'
 _n_model = js.count(DEFAULT_MODEL)
-check("JS 两个分支默认都是 model", _n_model == 2, f"{_n_model} 处")
+# 以前是 case_name / 现场拆 两个分支各写一次默认值，所以数 2。
+# 现在合并成一个 spec 构造（用户要求：没 YAML 也能跑），默认值只该有 1 处 ——
+# 两处反而说明又分叉了。
+check("JS 默认值是 model（合并成一处 spec 构造）", _n_model == 1, f"{_n_model} 处")
 check("JS 里不再有 autopilot 作默认", DEFAULT_AUTO not in js)
 check("Python 默认也是 model",
       'spec_in.get("answer") or "model"' in py)

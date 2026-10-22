@@ -59,6 +59,10 @@ ACTION_FIELDS = {
     "key": "act",
     "input_rid": "act",
     "next_x": "act",
+    # ★ 语义目标（新契约）：模型只给 tap_target，坐标由 act 解析。
+    #   2026-10-21 加了 kind 契约却忘了改路由，176 每轮都被吞成
+    #   "无动作"、0 个动作跑空 —— 就是这个清单没跟着更新的后果。
+    "tap_target": "act",
 }
 
 _src = io.open(str(ROOT / "src" / "android_agent" / "agent" / "nodes.py"),
@@ -80,7 +84,8 @@ for field, want in ACTION_FIELDS.items():
                  "q" if field == "vision_question" else
                  True if field == "step_done" else
                  "back" if field == "key" else
-                 "some_rid" if field == "input_rid" else 100)}
+                 "some_rid" if field == "input_rid" else
+                 "课程表" if field == "tap_target" else 100)}
     got = route_after_decide({"action": a})
     ck(f"只给 {field} → {got}（期望 {want}）", got == want, f"得到 {got}")
 

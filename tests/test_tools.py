@@ -65,10 +65,13 @@ ck("type_text 必填 rid/text/why",
    set(_tt["function"]["parameters"]["required"]) == {"rid", "text", "why"})
 
 _tap = next(t for t in T.decide_tools() if t["function"]["name"] == "tap")
-ck("tap 必填 x/y/why",
-   set(_tap["function"]["parameters"]["required"]) == {"x", "y", "why"})
-ck("tap 的 x/y 是 integer（省得后端拿到字符串坐标）",
-   _tap["function"]["parameters"]["properties"]["x"]["type"] == "integer")
+# ★ 契约变了：模型不再给坐标，只给语义目标 target。
+#   「执行器只决定下一步做什么，元素在哪由观察层用代码解析」。
+ck("tap 必填 target/why（不再要坐标）",
+   set(_tap["function"]["parameters"]["required"]) == {"target", "why"})
+ck("★ tap 的 schema 里没有 x/y（不给模型算坐标的机会）",
+   "x" not in _tap["function"]["parameters"]["properties"]
+   and "y" not in _tap["function"]["parameters"]["properties"])
 
 print()
 print("=" * 66)
@@ -87,15 +90,23 @@ a = T.tool_call_to_action("type_text", {"rid": "x", "text": ""})
 ck("空串 input_text 仍然透传（清空输入框是有效操作）",
    a.get("input_text") == "")
 
-a = T.tool_call_to_action("tap", {"x": 1520, "y": 375, "why": "点它"})
-ck("tap -> next_x/next_y", (a.get("next_x"), a.get("next_y")) == (1520, 375))
+a = T.tool_call_to_action("tap", {"target": "课程表", "why": "进课程表"})
+ck("★ tap -> tap_target（语义目标，不是坐标）",
+   a.get("tap_target") == "课程表" and "next_x" not in a, str(a))
 a = T.tool_call_to_action("tap",
-                          {"x": 1, "y": 2, "is_dialog": True,
+                          {"target": "允许", "is_dialog": True,
                            "grants_permission": True,
                            "permission_name": "存储"})
 ck("tap 的弹窗/权限申报透传",
    a.get("is_dialog") is True and a.get("grants_permission") is True
    and a.get("permission_name") == "存储")
+
+# ★ 没有 target 就是格式错误 —— 不退回坐标、不猜
+try:
+    T.tool_call_to_action("tap", {"x": 1, "y": 2, "why": "旧格式"})
+    ck("★ tap 缺 target -> 报错（不接受旧坐标格式）", False, "没有抛异常")
+except ValueError as exc:
+    ck("★ tap 缺 target -> 报错（不接受旧坐标格式）", "target" in str(exc), str(exc))
 
 a = T.tool_call_to_action("done", {"why": "到目标页了"})
 ck("done -> step_done=True", a.get("step_done") is True)
@@ -132,9 +143,10 @@ ck("没有 tool_calls 返回 None（调用方据此退回 JSON 解析）",
 
 # 有些网关会塞 ```json 围栏
 msg = {"tool_calls": [{"function": {
-    "name": "tap", "arguments": '```json\n{"x":1,"y":2}\n```'}}]}
+    "name": "tap", "arguments": '```json\n{"target":"课程表"}\n```'}}]}
 got = T.first_tool_call(msg)
-ck("能剥掉 ```json 围栏", got is not None and got[1].get("x") == 1)
+ck("能剥掉 ```json 围栏",
+   got is not None and got[1].get("target") == "课程表")
 
 try:
     T.first_tool_call({"tool_calls": [{"function": {

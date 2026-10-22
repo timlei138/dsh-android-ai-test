@@ -557,7 +557,33 @@ class Handler(BaseHTTPRequestHandler):
             #   记录本身完全自足 —— 判据在 case_yaml 快照里、证据在磁盘上，
             #   都不依赖用例还活着。但页面上那个"看当前版本"的链接会变成死链，
             #   所以先把"还在不在"告诉前端，让它决定是给链接还是给一句话。
-            run["case_exists"] = st.get_case(str(run.get("case_name") or "")) is not None
+            case = st.get_case(str(run.get("case_name") or ""))
+            run["case_exists"] = case is not None
+            # ★ 详情页第一屏要显示的是**用户写的步骤/预期**，不是 YAML。
+            #   原文住在 cases 表里（用例的属性），所以在这里补进来 ——
+            #   不补的话前端只能退而显示 case_yaml，那正是"显示是反的"的成因。
+            if case:
+                run["case_raw"] = case.get("raw_text") or ""
+                run["case_raw_source"] = case.get("source_path") or ""
+                run["case_raw_updated"] = case.get("updated_at") or ""
+                run["case_title"] = case.get("title") or ""
+                # ★ 把原文拆成「前提 / 步骤 / 预期」三块一起给出去。
+                #
+                # 用户的原话：「记录详情。显示原始的步骤和期待，不是 YAML。显示是反的。」
+                # 整段 txt 铺出来能读，但"第 3 步对应第 3 条预期"要靠人数。
+                # 拆成两列并排才对得上 —— 但这层解析放前端做不合适
+                # （前端没地方放正则，也测不了），所以在这里解析好再给。
+                try:
+                    from android_agent.cases.raw_parse import parse_raw_case
+                    run["case_raw_parsed"] = parse_raw_case(run["case_raw"])
+                except Exception:  # noqa: BLE001
+                    # 解析失败不能连累详情页 —— 前端会退化成显示原文。
+                    run["case_raw_parsed"] = None
+            else:
+                run["case_raw"] = ""
+                run["case_raw_source"] = ""
+                run["case_raw_updated"] = ""
+                run["case_raw_parsed"] = None
             return self._json(run)
 
         if path == "/api/compare":
@@ -778,7 +804,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "case_key": key,
                                "updated_at": rec.get("updated_at") or ""})
 
-        # 从文件夹重新同步原始 case（可指定 overwrite 覆盖已有原文）
+        # 从文件夹导入原始 case（可指定 overwrite 覆盖已有原文）
+        #
+        # ⚠️ 这只是**一次性的导入来源**，不是用例的正主。
+        #    用例原文归库管；文件夹没了、改名了，都不影响库里的用例。
+        #    新建用例请用下面那个 POST /api/cases。
         if path == "/api/cases/import":
             data = self._body() or {}
             ow = bool(data.get("overwrite"))
@@ -787,6 +817,34 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 return self._err(f"导入失败：{e}", 500)
             return self._json({"ok": True, **res})
+
+        # 新建一条用例（直接进库，不需要磁盘上有 txt 文件）
+        #
+        # ★ 用户要求的正是这条路：
+        #   「后面 plan 的过程中如果这是个新的 case 就要加入到数据库」
+        #   所以拆解时遇到库里没有的编号，就直接建一条，而不是先去
+        #   两个临时文件夹里放个文件再导入。
+        if path == "/api/cases":
+            data = self._body()
+            if data is None:
+                return self._err("请求体不是合法 JSON")
+            key = str(data.get("case_key") or "").strip()
+            raw = str(data.get("raw_text") or "").strip()
+            if not key:
+                return self._err("要给出用例编号 case_key")
+            if not raw:
+                return self._err("原始用例不能为空（那是需求原话，拆解要照它来）")
+            if st.get_case(key):
+                return self._err(f"编号 {key} 已经存在，请换一个或用编辑原文", 409)
+            try:
+                st.save_case(key,
+                             title=str(data.get("title") or ""),
+                             priority=str(data.get("priority") or ""),
+                             raw_text=raw,
+                             source_path=str(data.get("source_path") or "网页新建"))
+            except Exception as e:  # noqa: BLE001
+                return self._err(f"建不进去：{e}", 500)
+            return self._json({"ok": True, "case_key": key})
 
         return self._err("没有这个接口", 404)
 
@@ -955,14 +1013,23 @@ def _already_running(host: str, port: int) -> bool:
 def _evidence_roots() -> list[Path]:
     """截图可能落的地方。见 Handler._serve_shot 的说明。
 
-    三处都见过：
-      · tmp/shots            runner.py 显式传的 evidence_dir（当前主路径）
+    ★★ tmp/runs 必须在这里（用户报「记录里的图片都打不开」就是这个原因）★★
+
+    执行器现在把截图落在 `tmp/runs/<tag>_<time>_<case>/shots/stepNN/shot.png`，
+    但白名单里只有 tmp/shots、tmp/evidence、storage/evidence ——
+    结果每次取图都在 _serve_shot 里被判「截图不在证据目录内」-> 403，
+    页面上就是一张都显示不出来。
+
+    四处都见过：
+      · tmp/runs/**/shots    ★ 当前主路径（每次运行一个目录）
+      · tmp/shots            runner.py 显式传的 evidence_dir
       · tmp/evidence         DirectDevice 不传 evidence_dir 时的默认值
       · storage/evidence     旧 tools 链路
     """
     root = os.environ.get("ANDROID_SKILL_ROOT")
     base = Path(root) if root else (_HERE / "assets")
     return [
+        _HERE / "tmp" / "runs",
         _HERE / "tmp" / "shots",
         _HERE / "tmp" / "evidence",
         base / "storage" / "evidence",
@@ -1004,7 +1071,6 @@ def main() -> int:
     #
     # ★ 只在**空库**时导，不在每次启动时导：原文导入后归库管，
     #   每次启动都扫一遍会把人改过的内容冲掉。
-    #   要重新同步走页面上的「从文件夹同步」或 POST /api/cases/import。
     try:
         if not st.list_cases():
             _imp = importer.import_all()

@@ -404,8 +404,109 @@ _COORD_RE = re.compile(r"\[\s*-?\d+\s*,\s*-?\d+\s*\]")
 _KNOWN_STEP_KEYS = {
     "id", "desc", "target", "locate", "landing", "pitfalls",
     "do", "expect", "know", "on_fail", "verify", "pitfalls_from",
+    # 自动生成时，一步试过多种走法就写成 targets_tried（列表），
+    # 单个走法是 target。它是"上次这么走过"的参考，不含坐标。
+    "targets_tried",
     "locate_seq",   # 已废弃，但单独给一条更准确的警告，见下面
 }
+
+# ══════════════════════════════════════════════════════════════════════
+# 字段白名单（用户要求：「YAML 文件不能凭空添加字段」）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 规则来自用户原话：
+#   「YAML 文件不能凭空添加字段。所有强证据的值必须来自真实的记录。
+#     不能凭空捏造。」
+#
+# 为什么必须拦：**写了不生效 = 看起来验了，其实没验**。
+# 这是本项目里最坏的失败模式 —— 比报错还坏，因为报错能查，
+# 静默丢弃只会让人以为这条约束在管着。
+#
+# 已经吃过两次亏：
+#   · permission 判据键写了代码不认识 -> 整条断言从来没验过（169）
+#   · 断言上的 note: 只被 expect 层读，断言层直接丢（本次扫出来的）
+#
+# 所以每一层都要有白名单，且**默认拒收**（不在表里就报警）。
+
+# 文件顶层
+_KNOWN_TOP_KEYS = {
+    "meta", "steps", "assertions", "preconditions",
+    "per_step_pitfalls",   # 已废弃，但出现时给专门提示
+    "confidence",          # 用例可信度（level/reason/todo）
+    "playbook",            # 元规则，会被读成标题
+}
+
+# meta 段
+_KNOWN_META_KEYS = {
+    "case_id", "title", "package",
+    "knowledge_files",
+    "derived_from",        # 从哪个原始用例派生的
+    "source", "note",
+}
+
+# assertions 段的一条断言
+_KNOWN_ASSERT_KEYS = {
+    "id", "desc", "check",
+    # result: 用例原文里的预期写法，纯文本、不参与判定。
+    # 有了它，规则描述才和原文对得上。
+    "result",
+    "note",
+}
+
+# preconditions 段
+_KNOWN_PRE_KEYS = {
+    "kind", "desc", "do", "undo", "skip_if",
+    "assert_start", "target", "hint", "expect",
+}
+
+# 步骤里的 know 段
+_KNOWN_KNOW_KEYS = {
+    "where", "why_this", "locate", "source", "files",
+}
+
+
+def check_unknown_keys(raw: Any) -> list[str]:
+    """扫出**所有层**的未知字段。返回警告文本（空 = 全部合法）。
+
+    只报告、不改数据：未知字段本来就该被忽略，报出来是为了让人知道
+    "你写的这个东西没生效"，而不是让 loader 崩掉。
+    """
+    if not isinstance(raw, dict):
+        return []
+
+    out: list[str] = []
+
+    def scan(d: Any, allowed: set[str], where: str) -> None:
+        if not isinstance(d, dict):
+            return
+        unknown = [k for k in d if k not in allowed]
+        if unknown:
+            out.append(
+                f"{where}: 不认识的字段 {unknown} —— **未参与执行**。"
+                f"可用字段：{sorted(allowed)}")
+
+    scan(raw, _KNOWN_TOP_KEYS, "顶层")
+    scan(raw.get("meta"), _KNOWN_META_KEYS, "meta")
+
+    for i, a in enumerate(_as_list(raw.get("assertions"))):
+        if not isinstance(a, dict):
+            continue
+        scan(a, _KNOWN_ASSERT_KEYS, f"断言 {a.get('id') or i + 1}")
+
+    for i, pr in enumerate(_as_list(raw.get("preconditions"))):
+        if not isinstance(pr, dict):
+            continue
+        scan(pr, _KNOWN_PRE_KEYS, f"前提 {i + 1}")
+
+    for s in _as_list(raw.get("steps")):
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id") or "?"
+        scan(s, _KNOWN_STEP_KEYS, f"步骤 {sid}")
+        scan(s.get("know"), _KNOWN_KNOW_KEYS, f"步骤 {sid}.know")
+
+    return out
+
 
 
 def find_stale_patterns(node: Any, path: str = "") -> list[tuple[str, str]]:
@@ -525,6 +626,10 @@ def load_case(path: str | Path, *, keep_stale: bool = True) -> tuple[Any, list[s
                             + "；".join(stale))
 
     warns: list[str] = []
+    # ★ 先扫未知字段（全层）。这是"不能凭空添加字段"的总闸。
+    #   放在最前面：即使后面的解析分支有早退，这条路也一定被检查过。
+    warns += check_unknown_keys(raw)
+
     # 保留模式下把"这文件有旧机制"记进 warning，让调用方看得见但不拦。
     # locate_seq 现在**不参与执行**（没有回放了），留着只是噪音。
     if keep_stale:
@@ -654,7 +759,15 @@ def load_case(path: str | Path, *, keep_stale: bool = True) -> tuple[Any, list[s
             continue
         aids = str(a.get("id") or f"a{i+1}")
         asserts.append(AssertSpec(id=aids, desc=str(a.get("desc") or aids),
-                                  check=a.get("check")))
+                                  check=a.get("check"),
+                                  # ★ 这三个以前被静默丢弃（AssertSpec 没声明）。
+                                  #   现在声明了就必须真的读进来，否则等于没声明。
+                                  note=str(a.get("note") or ""),
+                                  result=str(a.get("result") or ""),
+                                  # ★ 断言绑定的步骤 id（如 "s3"）—— 判定时
+                                  #   据此取"那一步"的界面证据。不读进来的话，
+                                  #   所有断言都只能拿整轮最后一屏硬判。
+                                  step=str(a.get("step") or "")))
 
     # ── 文件级注解（不参与判定，但要**如实带出去**）──
     #

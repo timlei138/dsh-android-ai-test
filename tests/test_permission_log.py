@@ -112,7 +112,9 @@ def main():
     )
     wd = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_permrec"
     report = sa.run_case(spec, answer=answer, serial=None, diag=True,
-                         max_loops=12, workdir=wd, device=dev)
+                         max_loops=12, workdir=wd,
+                         # ★ 生成物留在临时目录，别写进用例库（污染过 permrec_授权留痕）
+                         yaml_out_dir=wd, device=dev)
 
     print("\n=== 1. 权限框被记录 ===")
     pg = report.permissions_granted
@@ -135,8 +137,13 @@ def main():
     check("普通点击不进弹窗表", len(dd) == 1, "仍是 1 条（未被污染）")
 
     print("\n=== 4. 落盘到报告文件 ===")
-    rp = wd / "report_permrec.json"
-    check("报告文件存在", rp.exists())
+    # ★ 报告不再直接落在 workdir 下 —— 每次运行一个 uuid 子目录
+    #   （workdir/runs/<tag>_<case>/report.json）。
+    #   这里按报告自己说的 run_dir 去找，而不是再猜一个固定文件名。
+    rp = Path(report.run_dir) / "report.json" if report.run_dir else wd / "report.json"
+    check("报告文件存在", rp.exists(), str(rp))
+    check("报告在独立目录里（不和别的运行混）",
+          "runs" in rp.parts, str(rp))
     if rp.exists():
         raw = json.loads(rp.read_text(encoding="utf-8"))
         check("文件里有 permissions_granted",

@@ -38,6 +38,27 @@ from typing import Any
 DEFAULT_MAX_TOKENS = 4000
 DEFAULT_TIMEOUT = 180
 
+# ★★ 断言专用额度（2026-XX-XX，178 真机实测）。
+#
+# 为什么断言不能沿用 DEFAULT_MAX_TOKENS=4000：
+#   178 那次 usage 报得很清楚 ——
+#       completion_tokens=6000, reasoning_tokens=6000
+#   一个 token 都没留给正文。注意它比 4000 还高：说明 `_chat` 内部
+#   遇到空正文会翻倍重试（4000 -> 8000，卡在 6000 是另一条路径），
+#   但**推理能把 6000 也吃满**。
+#
+#   这不是"偶发"，是任务性质决定的：
+#     · 选下一个控件   = 看一眼可点列表，挑一个      -> 4000 够
+#     · 判定一条断言   = 读值 + 对照预期 + 组织判词  -> 明显更长的推理链
+#   178 的 a2 要判「每节课上课时长默认 50 分钟」：得先在这屏找到那个控件、
+#   读出它的值、再和 "50分钟" 逐字比对 —— 推理量是"找控件"的两倍以上。
+#
+# 代价对比（这就是为什么值得给大）：
+#   给 4000 省下的那点 token，换来的是断言变成"判定缺失"（BLOCKED），
+#   而用户看到的是"这条没验" —— 一条用例白跑，重新跑一次的成本
+#   远高于多给几千 token。
+ASSERT_MAX_TOKENS = 12000
+
 
 class DecisionError(RuntimeError):
     """模型没给出可用决策。绝不吞掉——吞掉会变成"随便点一个"。"""
@@ -198,7 +219,17 @@ def _chat_req(cfg: dict[str, str], messages: list[dict[str, Any]],
         # 仍能跑，只是少了服务端保证），而不是发出去撞 400。
         _all_text = "\n".join(
             str(m.get("content") or "") for m in messages).lower()
-        if "json" in _all_text:
+        # ⚠️ 带图时不开 json_object（178 a4 实测踩到）。
+        #
+        #   多模态 + response_format=json_object 在部分 OpenAI 兼容网关上
+        #   是**不受支持**的组合：要么直接 400，要么返回空正文
+        #   （reasoning 吃满额度、正文一个字都没写）。表现就是
+        #   "模型回复无法解析（）"—— 看不出是格式问题还是模型没答。
+        #
+        #   断言本来就只输出一个简单 JSON，提示词里已经说清了形状，
+        #   靠服务端强约束并非必需。带图时让正文自由输出，
+        #   由 _extract_json 自己抠 —— 它对围栏/废话/裸引号都容忍。
+        if "json" in _all_text and not image:
             _payload["response_format"] = {"type": "json_object"}
 
     body = json.dumps(_payload).encode("utf-8")
@@ -352,6 +383,13 @@ def _escape_inner_quotes(s: str) -> str:
 def _extract_json(text: str) -> dict[str, Any]:
     """从回复里抠出 JSON 对象。容忍 ```json 围栏、前后废话、字符串内的裸引号。"""
     s = text.strip()
+    # ★ 空正文单独报，别和"格式不对"混成一句。
+    #   实测踩到（178 a4）：报告里只写"模型回复无法解析（）"，
+    #   看不出到底是模型没答、还是答了但格式坏 —— 这两种修法完全不同。
+    if not s:
+        raise DecisionError(
+            "模型返回了空正文（不是格式问题）—— 通常是 reasoning 把 "
+            "max_tokens 吃光了，或者返回的是 tool_calls 而正文为空。")
     if s.startswith("```"):
         # 去掉围栏
         s = s.split("\n", 1)[1] if "\n" in s else s
@@ -409,48 +447,266 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise DecisionError(f"模型没给出合法 JSON：{text[:300]}")
 
 
+# 7 类输出的名字。写死在这里，和 _SYSTEM 里的说明、tools 定义必须一致。
+_KINDS = ("tap", "input", "key", "done", "knowledge", "vision", "give_up")
+
+
+def action_from_kind(obj: dict[str, Any]) -> dict[str, Any]:
+    """把「带 kind 的分类 JSON」翻译成图里认识的 action dict。
+
+    这是模型**没走 function calling、改用 JSON 正文**时的那条路。
+    要求模型吐 `kind` + 语义目标，和 tools 那条路**落到同一个 action dict**，
+    下游完全不用改。
+
+    没有 kind = 格式错误，**不猜**。以前允许它直接吐 next_x/next_y，
+    等于让模型自己算坐标 —— 格式说不清、错了也不知道错在哪，现在不要了。
+    """
+    kind = str(obj.get("kind") or "").strip()
+    if not kind:
+        raise DecisionError(
+            f"回复里没有 kind 字段。必须输出 7 类之一"
+            f"（{'/'.join(_KINDS)}），原回复：{str(obj)[:200]}")
+    if kind not in _KINDS:
+        raise DecisionError(
+            f"不认识的 kind={kind!r}。合法的只有：{'/'.join(_KINDS)}")
+    why = str(obj.get("why") or "")
+    tgt = str(obj.get("target") or "").strip()
+
+    if kind == "done":
+        return {"step_done": True, "why": why or "模型判定本步完成",
+                "_by_kind": True}
+
+    if kind == "give_up":
+        return {"step_done": False, "give_up": True,
+                "give_up_reason": str(obj.get("reason") or why or "走不通"),
+                "_by_kind": True}
+
+    if kind == "key":
+        return {"step_done": False, "key": str(obj.get("key") or "back"),
+                "why": why, "_by_kind": True}
+
+    if kind == "knowledge":
+        return {"step_done": False,
+                "need_knowledge": str(obj.get("query") or why),
+                "why": why or "查知识卡", "_by_kind": True}
+
+    if kind == "vision":
+        return {"step_done": False,
+                "vision_question": str(obj.get("question") or why),
+                "why": why or "需要看图", "_by_kind": True}
+
+    if kind == "input":
+        if not tgt:
+            raise DecisionError("kind=input 必须给 target（输入框的 rid）")
+        return {"step_done": False, "input_rid": tgt,
+                "input_text": obj.get("text") if obj.get("text") is not None else "",
+                "why": why or f"往 {tgt} 填内容", "_by_kind": True}
+
+    # kind == "tap"：★ 只带语义目标，不带坐标。
+    # 坐标由 strong_target 那套（_resolve_strong_target）解析，
+    # 解析不到就是不唯一/不存在 —— 报错让模型换目标，而不是猜一个位置。
+    if not tgt:
+        raise DecisionError("kind=tap 必须给 target（可点项的名字或 rid）")
+    out = {"step_done": False, "why": why, "_by_kind": True,
+           # tap_target 是"要点的语义目标"，act 节点据此解析坐标
+           "tap_target": tgt}
+    for k in ("is_dialog", "dialog_text", "grants_permission",
+              "permission_name", "permission_decision"):
+        if k in obj and obj[k] not in (None, ""):
+            out[k] = obj[k]
+    return out
+
+
 # ── 提示词 ──────────────────────────────────────────────────────────────────
 
 _SYSTEM = """你是一个 Android 真机测试执行者，像人类测试员一样操作手机。
 
-铁律：
-1. **只能点给定的可点项**。坐标必须从"当前可点项"列表里选，绝不自己编造坐标。
-   列表每行长这样：`rid=iv_more c=[1920,1314]` 或 `text='课程表' c=[2300,900]`。
-   你要填的 next_x/next_y 就是 `c=[x,y]` 里的两个数。
-   有些项只有 text、没有 rid（菜单项常见），还有的只有坐标——都能点。
-2. 如果目标不在列表里，考虑：先滚动、先返回、先关掉挡路的弹窗。
-3. 遇到规则外的弹窗（权限说明、引导页、更新提示等）——**自动点掉它再继续**，
-   不要因为没见过的弹窗就停下。通常"同意/确定/继续"是正确选择。
-4. 路径不对时不要放弃，先想办法走回去（返回键、重新进入口、查知识卡）。
-5. **不要过度完成**。本步的目标就是"到达期望落点"。一旦到了（或做完了描述的事），
-   立刻置 step_done=true，不要在目标页上继续点下去。
-   如果本步的坑位写着"到此为止/不要继续"，那更是明确边界，必须停。
-6. **不要重复点同一个坐标**。如果上一次点的位置再点一次还是同样的界面，
-   说明这个动作没用，必须换目标（换控件、滚动、返回，或判定已完成）。
-7. 只在**确实无路可走**时才给 give_up=true。
+## 你的职责边界（先看这条）
 
-### 关于弹窗和权限（重要，会被记录进报告）
-8. 遇到挡路的弹窗（含 App 自己的提示框、系统权限框），**直接点掉，不要停下来问**。
-   同时**必须如实申报**（这些字段会原样进报告，供人审计授权行为）：
-   - 点的按钮是**同意/允许/授权**性质（文案含 同意/允许/始终允许/仅本次/授权，
-     或系统权限框的肯定按钮）→ `grants_permission=true`，
-     并填 `permission_name`（如 存储/相机/位置）和 `permission_decision`（allow/deny/仅本次）。
-     **注意**：App 自绘的"权限说明页"只要按钮是「同意」，同样要申报 ——
-     对审计者来说"点了同意"这个事实最重要，不要纠结它算不算"系统"框。
-   - 点的是**任何挡路弹窗**（含上面的情况）→ `is_dialog=true`，
-     并填 `dialog_text`（弹窗上的主要文字）。
-   - 「知道了」「确定」这类纯提示框：`is_dialog=true`，但 `grants_permission=false`。
+**你只决定"下一步做什么"，不负责"元素在哪"。**
+当前屏幕上有什么、每个可操作项叫什么、在哪个坐标 —— 观察层已经用代码
+解析好了，放在「当前可点项」里。你从里面**挑出要操作的那一个**，用它的名字，
+坐标由执行器自己解析。
 
-只输出一个 JSON 对象，不要任何其它文字。
+所以你**永远不要输出坐标**，也不要自己算位置。你只需要说清楚：
+对**哪一个**（名字/rid）做什么动作。
 
-### 输出格式（服务端已强制 JSON，这里说明怎么填对）
-- 以 `{` 开头、`}` 结尾，不要加 ```json 围栏，不要写任何前言/解释。
-- 所有键名用双引号；字符串值用双引号。
-- ⚠️ **字符串里如果要出现双引号，必须转义成 \\"**。
-  实测踩过：`"reason": "看到 "照片" 了"` 这种裸引号会让整个 JSON 失效。
-  想表达引用时更安全的做法是改用书名号「」，或直接避免内层引号。
-- 不要在 JSON 后面追加说明文字。
+## 全部合法输出（7 类，每类一个固定 JSON）
+
+每次回复**只能是下面 7 种之一**，必须是**单个 JSON 对象**，顶层必须有 `"kind"`。
+`"kind"` 之外**不要加任何别的键** —— 多出来的键会被丢弃，不会报错，但也没用。
+
+### 1. tap —— 点一个控件
+```json
+{"kind": "tap", "target": "完成的控件名或 rid", "why": "为什么点它"}
+```
+- `target` **必须**是「当前可点项」里某一项的名字（rid 或 text），原样抄。
+- 如果同一个名字出现多次，用 `名字#序号` 指明第几个（序号从 1 开始）。
+- 点弹窗/权限框时，额外交代这三项（会被记进报告供审计）：
+  ```json
+  {"kind": "tap", "target": "允许", "why": "放行通知权限",
+   "is_dialog": true, "grants_permission": true,
+   "permission_name": "通知", "permission_decision": "allow"}
+  ```
+  点的是 App 自绘的「权限说明页」但按钮写「同意」，同样算 `grants_permission=true`。
+
+### 2. input —— 往输入框填字
+```json
+{"kind": "input", "target": "输入框的 rid", "text": "要填的内容", "why": "为什么填"}
+```
+- 填**空字符串**是合法的（表示清空）。
+- 填完不要再重复填：下一轮会告诉你框里现在是什么。**只有值不对才重填。**
+
+### 3. key —— 按系统键
+```json
+{"kind": "key", "key": "back", "why": "退回上一页"}
+```
+`key` 只能是 `back` 或 `home`。
+
+### 4. done —— 本步做完了
+```json
+{"kind": "done", "why": "现在看到 xxx，符合本步目标"}
+```
+判据是**本步的落点/目标**。到了就立刻 done，**不要在目标页上继续点**。
+如果本步坑位写了"到此为止"，更是硬边界。
+
+### 5. knowledge —— 想查知识卡
+```json
+{"kind": "knowledge", "query": "课程表 入口", "why": "不确定路径"}
+```
+查到的内容下一轮给你。
+
+### 6. vision —— 想让视觉模型看图
+```json
+{"kind": "vision", "question": "屏幕顶部标题区写的是什么？有没有弹窗？"}
+```
+**只在 XML 真的看不出来时用**（图标含义不明、文字被截断、需要看颜色/位置）。
+问题要问得**具体到能用一个事实回答**，不要问"现在是什么界面"这种开放问题。
+
+### 7. give_up —— 真的走不通了
+```json
+{"kind": "give_up", "reason": "为什么走不通"}
+```
+**只有确实试过且无路可走才用**。放弃会进报告，影响最终判定。
+
+## 行为铁律
+
+1. 只从「当前可点项」里选目标，**不编造**名字。
+2. 目标不在列表里 → 先滚动、先返回、先关掉挡路的弹窗，别硬点。
+3. 遇到规则外的弹窗（权限说明、引导页、更新提示等）→ **直接点掉再继续**，
+   通常在「同意/确定/允许/继续」里选。同时按上面第 1 类如实申报。
+4. **不要重复做同一个无效动作**。如果提示某个动作做了 N 次界面毫无变化，
+   说明缺前置条件（必填没填、开关没开），换思路；再重复就是拿设备陪跑。
+5. 不确定时优先 `knowledge` 查知识卡，比瞎点划算。
+
+## 输出格式硬要求
+
+- 以 `{` 开头、`}` 结尾；**不要** ```json 围栏，不要任何前言、解释、后缀。
+- 键和字符串值都用双引号。
+- 字符串里要出现双引号必须转义成 \\"；更安全的做法是用「」代替。
+- 只输出一个 JSON 对象，**不要**输出数组，不要输出多行自然语言。
 """
+
+
+# 断言阶段是**另一套契约**：只判断，不动作，所以不认上面那 7 类。
+_SYSTEM_VERDICT = """你是一个 Android 真机测试的断言判定者。
+
+**你只判断事实，不操作手机。** 屏幕上有什么，观察层已经给你了；
+你要回答的是「这条预期成立不成立」，并说明依据。
+
+## 输出（只有一个 JSON 对象）
+
+```json
+{
+  "kind": "verdict",
+  "passed": true,
+  "actual": "实际看到了什么（必须具体，引用界面上的真实文字）",
+  "evidence": "你依据哪些界面内容判断的",
+  "event_id": "证据 ID，从上面给的 evidence_event_ids 里原样抄一个；没有就空字符串",
+  "confidence": "high",
+  "note": "补充说明"
+}
+```
+
+字段规则：
+- `passed`：**true / false / null**。用 `null` 表示"看不清、判不了" ——
+  **不要猜**。猜 PASS 是编造，猜 FAIL 是冤枉产品，两种都比 null 糟。
+- `actual`：必填，写屏幕上**真实看到的内容**，不要写"符合预期"这种空话。
+- `confidence`：只能是 `high` / `medium` / `low` 之一。
+- 其余字段没有就给空字符串，**不要省略键**。
+
+## 判不了时，可以要求"补一步动作"
+
+有些预期**光看这一屏根本判不了**，因为要看的界面还没打开。
+例如「能调背景色，共 10 种」—— 屏幕只显示一行「课程背景色」，
+色块面板没展开，数不出来。
+
+这时候**不要**判 false（产品可能没问题，是我们没打开），
+也**不要**只给个 null 就完事。请给 `need_action`，让执行器去补那一步：
+
+```json
+"need_action": {
+  "verify_target": "要核验什么（一句话）",
+  "why_insufficient": "为什么现在这一屏判不了（具体缺什么）",
+  "related_elements": [
+    {"rid": "llCourseColor", "text": "课程背景色"}
+  ],
+  "close_with": "取消"
+}
+```
+
+- `related_elements` —— **从上面给的界面元素里挑**，不要自己编。
+  这些是"执行器可能要去点的东西"。
+- `close_with` —— **点开之后，看完怎么关回去**。
+  像人类测试员那样：点开色板看完，点「取消」退回编辑弹窗，再继续下一步。
+  这里填那个"关闭/取消/返回"按钮的**文字**（如 `取消`）。
+  如果点开后是同一屏、不需要关，就填空字符串 `""`。
+- 同时 `passed` 仍填 `null`（表示这轮判不了），`actual` 写清缺什么。
+- 如果这一屏**已经足够判断**，或者再怎么点也看不到，就**不要**给
+  `need_action`（给空对象 `{}`），直接判 true/false。
+
+执行器补完动作会**拿新的界面回来再问你一次**（最多 3 次）。
+
+## 输出格式硬要求
+
+- 以 `{` 开头、`}` 结尾；不要 ```json 围栏，不要前言和后缀。
+- 只输出一个 JSON 对象。
+"""
+
+
+def _fmt_clickable_name(item: Any) -> str:
+    """把可点项排版成**只有语义名字**的一行 —— 不含坐标。
+
+    例：
+        `iv_more`
+        `课程表`（菜单项，只有文字没有 rid）
+        `cv_empty_content#1`（同名多个，带序号）
+
+    ## 为什么要带序号
+
+    176 的空课表网格有 25 个 FrameLayout 的 rid 全叫 cv_empty_content，
+    只写名字模型没法说清要点第几个。序号是**执行器解析时用的**，
+    和 `_resolve_strong_target` 的 `名字#n` 语法一一对应。
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    rid = str(item.get("r") or item.get("rid") or "").strip()
+    txt = str(item.get("t") or item.get("text") or "").strip()
+    desc = str(item.get("d") or item.get("desc") or "").strip()
+
+    idx = item.get("_ordinal")
+    # 优先用文字（人能读懂），没文字才退回 rid
+    name = txt or desc or rid
+    if not name:
+        return "(无名控件)"
+    if rid and name != rid:
+        label = f"{name}  (rid={rid})"
+    else:
+        label = name
+    if idx:
+        # ★ 序号用 rid 或文字都行，统一挂在后面
+        label = f"{label}  → 要指明第几个时用：{rid or name}#{idx}"
+    return label
 
 
 def _fmt_clickable(item: Any) -> str:
@@ -520,23 +776,24 @@ def _fmt_node(n: dict) -> str:
 
 
 def _step_schema_doc() -> str:
-    return """{
-  "step_done": true/false,      // 这一步的目标是否已经达成
-  "next_x": 数字,                // 要点的 x 坐标（必须来自可点项列表）
-  "next_y": 数字,                // 要点的 y 坐标
-  "why": "一句话说明为什么点这里",
-  "expect": "点完之后期望看到什么（activity=xxx 或 rid=xxx）",
-  "need_knowledge": "想查知识卡就填检索词，否则空字符串",
-  "vision_question": "需要看图才能判断就填问题，否则空字符串",
-  "give_up": false,             // 只在确实无路可走时为 true
-  "give_up_reason": "",
-  "grants_permission": false,   // 点的是系统权限框才填 true
-  "permission_name": "",        // 如 存储/相机/位置
-  "permission_decision": "",    // allow / deny / 仅本次
-  "is_dialog": false,           // 点的是挡路弹窗（含 App 自己的提示框）才 true
-  "dialog_text": "",            // 弹窗上的主要文字
-  "note": "给测试报告的补充说明"
-}"""
+    """输出格式的总说明 —— 以 `_SYSTEM` 里的 7 类契约为准。
+
+    ⚠️ 这里**只列 kind 和必填字段**，不再重复描述各字段语义。
+    早先这里有一份完整字段表（next_x/next_y/expect/note…），
+    和 `_SYSTEM` 里的描述**两处并存**，模型要自己对两套说法，
+    经常挑错键。现在单一事实来源就是 `_SYSTEM`。
+    """
+    return """每轮只输出一个 JSON 对象，`kind` 必填，取值只能是这 7 种之一：
+
+  {"kind": "tap",       "target": "控件名/rid", "why": "..."}
+  {"kind": "input",     "target": "输入框 rid", "text": "...", "why": "..."}
+  {"kind": "key",       "key": "back|home", "why": "..."}
+  {"kind": "done",      "why": "..."}
+  {"kind": "knowledge", "query": "检索词", "why": "..."}
+  {"kind": "vision",    "question": "要问的具体问题"}
+  {"kind": "give_up",   "reason": "..."}
+
+不要输出坐标。target 原样取自「当前可点项」。"""
 
 
 def decide_step(python: str, skill_root: str, payload: dict[str, Any],
@@ -678,9 +935,28 @@ def decide_step(python: str, skill_root: str, payload: dict[str, Any],
 
     clickable = payload.get("clickable") or []
     lines.append("")
-    lines.append(f"当前可点项（{len(clickable)} 个，坐标只能从这里选）：")
+    lines.append(f"当前可点项（{len(clickable)} 个）—— **直接说名字，不要给坐标**：")
+    # ★ 不把坐标给模型（用户要求：执行器只负责"下一步做什么"，
+    #   元素定位是观察层用代码干的活）。
+    #
+    # 以前每行都带 c=[x,y]，模型就会去算/抄坐标 —— 而它抄错一个数
+    # 就点到别的地方，报告里还看不出是"选错了元素"还是"坐标算错了"。
+    # 现在只给名字，坐标由 _resolve_strong_target 从观察结果解析：
+    #   唯一命中 -> 点；不唯一 -> 报错要求用 `名字#序号`；找不到 -> 报错换目标。
+    #
+    # 重名项要提前编号：176 的空课表网格 25 个格子 rid 全叫
+    # cv_empty_content，不给序号模型根本说不清要点第几个。
+    _ord: dict[str, int] = {}
     for item in clickable:
-        lines.append(f"  {_fmt_clickable(item)}")
+        if isinstance(item, dict):
+            _k = (str(item.get("r") or item.get("rid") or "").strip()
+                  or str(item.get("t") or item.get("text") or "").strip())
+            if _k:
+                _ord[_k] = _ord.get(_k, 0) + 1
+                item = dict(item)
+                item["_ordinal"] = _ord[_k]
+        lines.append(f"  {_fmt_clickable_name(item)}")
+
 
     # ★★ 当前页面的完整语义节点（"最新的页面 XML 信息"）。
     #
@@ -752,7 +1028,8 @@ def _step_via_tools(skill_root: str, payload: dict[str, Any],
     ② 不是冗余：不同网关/模型对 tools 的支持度不一致，某些会把
     tool_calls 折叠成正文。留着这条路，换模型时不用改代码。
 
-    校验一条都不放松：翻译出来的坐标照样过 _validate_action。
+    校验一条都不放松：翻译出来的 input rid 照样要能在当前可点项里找到；
+    tap 的语义目标由 act 节点用 _resolve_strong_target 解析，解析不到就报错。
     """
     from . import tools as _tools
 
@@ -770,10 +1047,10 @@ def _step_via_tools(skill_root: str, payload: dict[str, Any],
 
     got = _tools.first_tool_call(msg)
     if got is None:
-        # ② 退回 JSON 正文
+        # ② 退回 JSON 正文：必须是 7 类之一，没有 kind 就是格式错误。
         reply = str(msg.get("content") or "")
         action = _extract_json(reply)
-        return _validate_action(action, payload.get("clickable") or [])
+        return action_from_kind(action)
 
     name, args = got
     try:
@@ -782,8 +1059,16 @@ def _step_via_tools(skill_root: str, payload: dict[str, Any],
         # 未知工具名 = 格式错误，抛出去让 runner 走"可重试"那条路
         raise DecisionError(str(exc)) from exc
 
-    # need_knowledge / ask_vision / give_up / done 不带坐标，不用过坐标校验
+    # need_knowledge / ask_vision / give_up / done 不碰屏幕
     if name in ("need_knowledge", "ask_vision", "give_up", "done"):
+        return action
+
+    # ★ tap 走语义目标（tap_target），坐标由 act 节点解析 —— 这里没有坐标可校验。
+    #   input 要校验 rid 确实在当前可点项里（不然就是模型编的输入框）。
+    #   press_key 也过 _validate_action，那里校验 key 只能是 back/home。
+    if name == "tap":
+        if not str(action.get("tap_target") or "").strip():
+            raise DecisionError("tap 没有给 target")
         return action
     return _validate_action(action, payload.get("clickable") or [])
 
@@ -826,9 +1111,14 @@ def decide_fix_start(python: str, skill_root: str, payload: dict[str, Any],
 
 def assert_step(python: str, skill_root: str, payload: dict[str, Any],
                 knowledge_text: str = "", image: str | None = None,
-                max_tokens: int = DEFAULT_MAX_TOKENS,
+                max_tokens: int = ASSERT_MAX_TOKENS,
                 timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
-    """断言模式：期望结果满足了吗？"""
+    """断言模式：期望结果满足了吗？
+
+    ⚠️ 默认额度用 `ASSERT_MAX_TOKENS`（12000），**不是** `DEFAULT_MAX_TOKENS`。
+    原因见 `ASSERT_MAX_TOKENS` 的注释 —— 断言比"选下一个控件"更吃推理，
+    4000 会让正文被 reasoning 挤成空字符串，然后被记成"判定缺失"。
+    """
     lines: list[str] = []
     lines.append(f"用例：{payload.get('case_title') or payload.get('case_id')}")
     lines.append(f"进度：已走完 {payload.get('steps_done', '?')}/"
@@ -849,10 +1139,41 @@ def assert_step(python: str, skill_root: str, payload: dict[str, Any],
                      "不要求现在还停留在那个页面")
         lines.append("  · 其它文字判据      -> 按字面理解，看当前界面或走过的路径能否佐证")
 
+    # ★★★ 「可以 XX / 可 XX」这一类措辞怎么判（用户要求，planer 硬规则同源）★★★
+    #
+    # 预期原文里大量出现「可以点击保存」「可以调整上课时间」「共 10 种」这类写法。
+    # 这类话**本身不可观察** —— 屏幕上没有哪一处写着"这个可以调整"。
+    # 以前没有这段话，模型只能两种错法：
+    #   · 看到入口行`llCourseColor`就判 true（等于没验，验的是"有这行"）
+    #   · 看不到内容就判 false（冤枉产品）
+    #
+    # 正确做法是**换成能看见的东西**：要么有可观察痕迹（行内的当前值），
+    # 要么明确说"要动手才知道"→ 判 null 并写清楚缺什么，别瞎给。
+    #
+    # ⚠️ 这段只影响判定措辞，不赋予断言动作能力（执行器不做动作）。
+    lines.append("")
+    lines.append("★ 关于「可以点击 / 可调整 / 可进入 / 共 N 种」这类预期，怎么判：")
+    lines.append("  · 这类话**本身不可观察** —— 界面上不会有哪处写着「这个可调整」。")
+    lines.append("    → 不要因为「有这个入口/这一行」就判 true，那等于没验。")
+    lines.append("  · 先找**可观察的痕迹**：行内的当前值、默认值、单位、按钮的启用态。")
+    lines.append("    例：「课程时间」行显示「第1节」、「上课周数」行显示「第1-20周」")
+    lines.append("        —— 这些**已经能证明该项可调**，可判 true。")
+    lines.append("  · 若这一屏只有入口、要**点进去**才看得到内容（如「课程背景色」只有标题、")
+    lines.append("    没展开色块），说明**现有证据不足以判定**：")
+    lines.append("    → 判 passed=null，在 actual 里写「需要点开 X 才能看到」，")
+    lines.append("      **不要**判 false（产品没错，是我们没点）。")
+    lines.append("  · 带具体数量的（如「共 10 种」）：XML 里数到的个数**不能直接当结论**")
+    lines.append("    （实测会被嵌套/装饰节点干扰）。数不全就判 null，别硬报数字。")
+
     # ★ 代码算好的硬事实优先于模型的"当前界面"直觉。
     # 实测踩到：a1 要 activity=.timetable.display.TimetableActivity，
     # 判的时候早已翻到系统图库，模型照"当前"判 FAIL —— 而日志显示确实到过。
-    if payload.get("activity_reached") is not None:
+    #
+    # ⚠️ 但**复核轮**（code_verdict=False）不能给这句"应判 passed=false"：
+    #    复核轮存在的意义恰恰是"代码没搜到，请你自己看"。若还在这儿
+    #    命令它判 false，复核就变成让模型给代码背书，白花一轮。
+    recheck = payload.get("code_verdict") is False
+    if payload.get("activity_reached") is not None and not recheck:
         lines.append("")
         if payload["activity_reached"]:
             lines.append("★ 代码核对结果：判据要求的 activity "
@@ -862,15 +1183,103 @@ def assert_step(python: str, skill_root: str, payload: dict[str, Any],
             lines.append("★ 代码核对结果：判据要求的 activity "
                          "**在本次执行中从未出现过**。")
             lines.append("  → 这条应判 **passed=false**。")
+
+    # ★ 复核轮专用说明：代码说"不成立"，但那只代表它没搜到。
+    if recheck:
+        lines.append("")
+        lines.append("═" * 46)
+        lines.append("★ 这是**复核轮**：代码没能在留痕里搜到这条判据的证据。")
+        lines.append(f"  代码原话：{payload.get('code_why') or '（未提供）'}")
+        # ★ 把上一轮自己的结论摆出来。
+        #
+        # 没有这段的话，"复核 3 次"就成了把同一个问题原样问 3 遍 ——
+        # 模型每次都从零开始，极可能给出同样的答案，纯烧钱。
+        # 摆出来它才知道自己上一轮说过什么、这次该不该改口。
+        _prev = str(payload.get("prev_opinion") or "").strip()
+        if _prev:
+            lines.append(f"  ★ 你上一轮的判断是：「{_prev}」")
+            lines.append("    请对照这次的界面和控件清单，重新核对一遍：")
+            lines.append("    上一轮如果看漏了（比如判的时候已经翻页），这次就改判；")
+            lines.append("    上一轮如果是对的，就维持原判 —— 但 actual 要写得更具体。")
+        lines.append("  但这只说明**代码没找到**，不等于功能不对。常见的假失败原因：")
+        lines.append("    · 文案被拆进多个控件 / 只有部分节点带 text")
+        lines.append("    · 控件没进「可点列表」，于是没被记下来")
+        lines.append("    · YAML 里的 rid 是旧版本，实际控件换了名字")
+        lines.append("    · 断言是流程末尾统一判的，那是的屏幕早已翻页")
+        lines.append("  请**自己对证据做判断**：看当前界面、看走过的路径、看控件清单。")
+        lines.append("   · 看得出预期真的达成了 -> passed=true，并在 actual 里写清了什么")
+        lines.append("   · 看得出确实没有     -> passed=false，写清实际是什么样")
+        lines.append("   · 两样都看不清       -> passed=null（不要猜），note 里说明缺什么")
+        lines.append("═" * 46)
+
     if payload.get("activity_seen"):
         lines.append(f"本次到达过的 activity：{', '.join(payload['activity_seen'][:12])}")
     if payload.get("seen_rids"):
         lines.append(f"本次执行中见过的控件：{', '.join(payload['seen_rids'][:30])}")
     lines.append("")
-    lines.append(f"当前 activity：{payload.get('activity') or '（未知）'}")
-    lines.append("当前界面上的文字/控件：")
-    for item in (payload.get("clickable") or [])[:40]:
-        lines.append(f"  {_fmt_clickable(item)}")
+    # ★★★ 证据来源必须说清楚（用户的要求：断言只给 XML，不给图）★★★
+    #
+    # 以前这里直接印"当前界面上的文字/控件"，用的却是 payload["clickable"]
+    # —— 那是**最后那一刻**的可点列表。实测（run 68）：a6 验的是
+    # 「新建课程表」的完成按钮，拿到的却是「编辑课程」页那一屏，
+    # 于是只能答"看不到完成按钮"，被记成 BLOCKED。
+    #
+    # 现在证据按断言所属的**步骤**取（nodes._evidence_for_assert），
+    # 并把"这份证据是哪一步的"写在最前面 —— 模型得知道自己看的是哪一屏。
+    _src = str(payload.get("evidence_source") or "").strip()
+    if _src:
+        lines.append(f"★ 以下证据来自：{_src}")
+        if not payload.get("evidence_bound", True):
+            lines.append("  ⚠️ 这条断言没有绑定具体步骤，只能拿整轮最后一屏来判。")
+            lines.append("     如果这一屏明显不是该验的那个界面，请判 passed=null，")
+            lines.append("     并在 actual 里写清「该看的是哪一屏」。**不要**拿这一屏硬判。")
+    lines.append(f"该屏 activity：{payload.get('screen_activity') or payload.get('activity') or '（未知）'}")
+    lines.append("该屏界面上的文字/控件（XML）：")
+    _shown = 0
+    for item in (payload.get("screen_nodes") or [])[:60]:
+        if isinstance(item, dict):
+            lines.append(f"  {_fmt_clickable(item)}")
+            _shown += 1
+    if not _shown:
+        for item in (payload.get("screen_clickable") or [])[:40]:
+            lines.append(f"  {_fmt_clickable(item)}")
+            _shown += 1
+    if not _shown:
+        _txt = str(payload.get("screen_nodes_text") or "").strip()
+        if _txt:
+            lines.append(f"  {_txt[:2000]}")
+        else:
+            lines.append("  （这一步没有留下界面证据）")
+
+    # ★★★ 视觉通道的结论（用户要求：颜色/形状/XML 判不了的交视觉模型）★★★
+    #
+    # 这里放的是**已经问过视觉模型、它亲眼看过的结论**，不是让判定模型
+    # 自己去想象。所以语气上是"视觉员报告"，不是"请你猜"。
+    # 还要明确一条：视觉说看不清时，判定就该判 null，不能拿它当反证。
+    _vr = payload.get("vision_result") or {}
+    if isinstance(_vr, dict) and _vr.get("tried"):
+        lines.append("")
+        lines.append("═" * 46)
+        lines.append("★ 视觉核验员（已看过该步骤的截图，以下是它的报告）")
+        lines.append(f"  为什么看图：{_vr.get('why') or '（未说明）'}")
+        if not _vr.get("ok"):
+            lines.append(f"  ⚠️ 视觉核验失败：{_vr.get('error') or '未知原因'}")
+            lines.append("  → 这条**不能**因此判 false；看不清就判 null。")
+        elif _vr.get("can_answer") is False:
+            lines.append("  它说：**截图里看不到能回答该预期的内容**。")
+            lines.append(f"  原话：{_vr.get('detail') or '（未给出）'}")
+            lines.append("  → 这条应判 **passed=null**，并在 actual 里写明"
+                         "「需要点开/展开后才能核验，现有截图看不到」。")
+            lines.append("     **不要**判 false —— 产品不一定有问题，是我们没看到。")
+        elif _vr.get("can_answer") is None:
+            lines.append(f"  它给了非结构化回复：{_vr.get('detail') or '（空）'}")
+            lines.append("  → 你可参考，但**不要**基于此硬判。")
+        else:
+            lines.append(f"  它答：{_vr.get('answer') or '（无结论）'}")
+            lines.append(f"  看到的细节：{_vr.get('detail') or '（无）'}")
+            lines.append("  → 结合下面的 XML 证据一起判；两者冲突时以视觉为准"
+                         "（颜色/形状只有它看得见）。")
+        lines.append("═" * 46)
     if payload.get("visited"):
         lines.append("")
         lines.append("走过的路径（最近几段）：")
@@ -882,20 +1291,39 @@ def assert_step(python: str, skill_root: str, payload: dict[str, Any],
         lines.append(knowledge_text)
 
     lines.append("")
-    lines.append("只输出 JSON：")
+    lines.append("只输出 JSON（字段一个都不能少，顺序无所谓）：")
     lines.append("""{
-  "passed": true/false,        // 期望结果是否满足
+  "kind": "verdict",
+  "passed": true,
   "actual": "实际看到了什么（必须具体，写界面上的真实内容）",
   "evidence": "你依据哪些界面内容判断的",
-  "event_id": "证据 ID，必须从上面给的 evidence_event_ids 里原样抄一个；没有就给空字符串",
-  "confidence": "high/medium/low",
-  "note": "补充说明"
+  "event_id": "",
+  "confidence": "high",
+  "note": "",
+  "need_action": {}
 }""")
+    lines.append("")
+    lines.append("字段规则：")
+    lines.append("  · kind      —— 固定填字符串 verdict，不许改")
+    lines.append("  · passed    —— true / false / null 三选一；null = 判不了，不要猜")
+    lines.append("  · actual    —— 必填，写界面上真实看到的内容")
+    lines.append("  · event_id  —— 从上面 evidence_event_ids 里原样抄一个；没有就空字符串")
+    lines.append("  · confidence—— 只能是 high / medium / low")
+    lines.append("  · need_action—— 证据不够、需要执行器补一步动作时才填，"
+                 "否则给空对象 {}")
 
+    # ★★★ 断言判定**不给图**（用户的要求）★★★
+    #
+    # 优先级是：XML 能判就用 XML；文字要靠 OCR 才认得出走 OCR；
+    # 都不行才请视觉模型 —— 而视觉是**另一条通道**（vision.py），
+    # 不是把最后那张截图捎带塞进判定请求里。
+    #
+    # 实测代价（run 68）：带图时每条断言 51.7 万字符、图占 99.3%，
+    # 8 条断言的图 md5 完全一致，而它们要验的根本不是同一屏。
     reply = _chat(_load_config(skill_root),
-                  [{"role": "system", "content": _SYSTEM},
+                  [{"role": "system", "content": _SYSTEM_VERDICT},
                    {"role": "user", "content": "\n".join(lines)}],
-                  max_tokens=max_tokens, timeout=timeout, image=image,
+                  max_tokens=max_tokens, timeout=timeout, image=None,
                   trace=f"assert · {payload.get('assert_id') or ''}")
     verdict = _extract_json(reply)
     if "passed" not in verdict:

@@ -66,6 +66,41 @@ assertions:    # 必填，至少 1 条
 | `env` | 环境/硬件（飞行模式、亮度） | **必须给 `undo`**，收尾无条件执行。模型层会强校验 |
 | `nav` | 导航到某界面 | 建议给 `target`（去哪）+ `hint`（怎么走） |
 
+### ★★ `pm clear` 只在「首次使用」场景才写
+
+用户的原话很清楚：**「不是每个用例都需要 pm clear。只有涉及到首次使用，这种情况才清理。
+其他情况不需要清理。」**
+
+`pm clear` 会**不可逆地清掉真实账号数据**（重新登录、重新同步都回不来），
+所以它不是"默认前提"，而是**只有在用例本身就在测首次启动时**才成立：
+
+| 该写 `pm clear` | **不该**写 |
+|---|---|
+| 首次启动的权限说明框 / CTA 弹窗（03、167） | 进入课程表、看图库导入（168、176、177、183） |
+| 首次进入某功能的引导页 | 列表页、详情页、编辑页的字段与交互 |
+| 「首次使用 → 引导只出现一次」这类断言 | 「设为当前课程表」「删除课程表」这类操作 |
+
+判据一句话：**把清数据去掉，这条用例还测得出它要测的东西吗？**
+测得出 → 不该清；测不出（因为测的就是"第一次"）→ 才清，并在 `desc` 里写明为什么。
+
+```yaml
+# ✅ 该清：用例测的就是首次进入
+preconditions:
+  - kind: data
+    desc: 首次打开日历（用例原文前提「可以清空APP数据」）—— 引导框只在清数据后首次启动出现
+    do: pm clear com.zui.calendar
+
+# ❌ 不该清：用例测的是编辑页字段，跟"第一次"无关
+preconditions:
+  - kind: data
+    desc: 清数据
+    do: pm clear com.zui.calendar      # ← 这里清掉的是用户真实的课程表数据
+  - kind: nav
+    desc: 起点
+    target: 日历首页
+    assert_start: activity=.AllInOneActivity
+```
+
 字段白名单：`kind` / `desc` / `do` / `undo` / `skip_if` / `assert_start` / `target` / `hint`
 
 `skip_if` 只认 `activity` / `package` / `pkg`。写别的（如 `timetable_state`）**判不了**，
@@ -221,6 +256,44 @@ landing: activity=.timetable.display.TimetableActivity
 这些允许出现但不参与判定：`note` / `measured` / `supporting` / `computed` /
 `placeholder` / `reason` / `evidence` / `case_expect` / `desc`
 
+### ★★ 代码判不了的，就别写 `check`
+
+这条是踩出来的（176）。用例原文写了三条预期：
+「顶部标题提示『添加课程』」「不加课程也能点完成保存空课程表」「背景色 10 种」，
+YAML 却一条都没验。
+
+补的时候差点又犯同一个错 —— 给它们各写一个"看起来对"的 check：
+
+```yaml
+# ❌ 错：这三条会假 PASS
+- id: a7
+  desc: 顶部标题提示「添加课程」
+  check: {activity: .timetable.course.EditCourseActivity}   # 只说明"进了这页"
+- id: a8
+  desc: 不添加课程也能点完成
+  check: {node_present: {rid: save_view}}                   # 只说明"按钮在"
+- id: a9
+  desc: 背景色 10 种
+  check: {node_present: {rid: llCourseColor}}               # 只说明"这行在"
+```
+
+`activity=` 成立只代表进了页面，`node_present` 成立只代表控件存在 ——
+**都不是用例要的那件事**。代码判成立还会直通（不问模型），于是这三条
+会稳定地假 PASS，比不验更危险。
+
+正确写法：**不写 `check`**。`check` 为空 → `evaluate_check` 返回 `None`
+→ 交模型判，那才是"标题写了什么 / 能不能点 / 有几个颜色"该走的路。
+
+```yaml
+# ✅ 对：交模型判，在 desc 里把判点写清楚
+- id: a9
+  desc: 【预期5】课程背景色可选项共 10 种
+  # 判点：展开色板数出几个色块。数不清写"看不清"，不许猜成 10。
+```
+
+判据一句话：**你写的 `check` 成立时，用例要验的那件事就一定成立吗？**
+答不上来，就别写。
+
 ---
 
 ## 落盘前自检
@@ -228,7 +301,9 @@ landing: activity=.timetable.display.TimetableActivity
 1. 每条 `landing` 和 `assertions.check`，**`KNOWN_CHECKS` 里都有吗**？
 2. `dialog_present` 带 `rid` 了吗？（不带的会被直接丢弃）
 3. `activity=` 的短名，真的包含在目标完整类名里吗？
-4. 跑一遍检查器，**0 ERROR / 0 死字段**了吗？
+4. **每一条 `check` 成立，是否真的等于该预期的语义成立？**（见上节）
+5. `pm clear` 真的只在测"首次使用"时才写吗？（见 preconditions 节）
+6. 跑一遍检查器，**0 ERROR / 0 死字段**了吗？
 
 ---
 

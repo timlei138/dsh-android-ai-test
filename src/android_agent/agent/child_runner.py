@@ -211,9 +211,15 @@ def autopilot_resume(payload: dict, task: dict) -> dict:
 
 def run(task: dict, *, serial: str | None, diag: bool, dry: bool,
         max_loops: int = 60) -> dict:
-    root = Path(__file__).parent
-    db = root / f"child_{task['case_id']}.db"
-    report_path = root / f"report_{task['case_id']}.json"
+    # ★ 每次运行一个独立目录，和 runner.py 用同一套规矩。
+    #   原来这里是 `root / f"child_{case_id}.db"` —— root 是**源码目录**，
+    #   同一条用例跑两次互相覆盖，还会往包里丢文件。
+    #   （目前主流程不走这个 run()，但留着旧写法迟早有人踩。）
+    from .runner import _run_tag
+    root = Path(__file__).parents[3] / "tmp" / "runs" / f"{_run_tag()}_{task['case_id']}"
+    root.mkdir(parents=True, exist_ok=True)
+    db = root / "child.db"
+    report_path = root / "report.json"
 
     if dry:
         print("[dry] 任务包校验：")

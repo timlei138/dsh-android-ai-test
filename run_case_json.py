@@ -132,11 +132,13 @@ def _run_locked(*, spec, answer, serial, skill_root, spec_in,
         #   · 从 YAML 加载的用例 -> 回写（只改和实际不一致的地方）
         #   · 没有 YAML（首次跑）-> 跑完自动生成一份
         #   两种都由 runner 按 case_yaml_path 是否为 None 自动分流。
-        case_yaml_path=(str(ypath) if yaml_ref else None),
+        #   ⚠️ 用 ypath 判，不要用 yaml_ref：回退跑的时候 yaml_ref 有值
+        #      （case_name 还在）但文件不存在，用 yaml_ref 判会当成"有文件"。
+        case_yaml_path=(str(ypath) if ypath else None),
         writeback=bool(spec_in.get("writeback", True)),
         # ★ 未采纳的判据字段必须进报告。
         #   只 print 到 stdout 等于没有 —— 主 Agent 读的是报告。
-        yaml_warnings=list(warns) if yaml_ref else [],
+        yaml_warnings=list(warns) if ypath else [],
     )
 
 
@@ -184,23 +186,45 @@ def main() -> int:
         _yaml_ref = spec_in.get("case_yaml") or spec_in.get("case_name")
         # 回写目标：先置空，只有真从 YAML 加载了才填（见下方 if _yaml_ref）
         ypath = None
+        _from_yaml = False
+        # ★ 必须先初始化：没走 YAML 的分支不会赋值，
+        #   后面 `warns if _yaml_ref else []` 仍会引用它 —— 会 UnboundLocalError。
+        warns: list[str] = []
         if _yaml_ref:
             from android_agent.cases.loader import load_case, load_case_by_name
             if spec_in.get("case_name") and not spec_in.get("case_yaml"):
-                spec, warns, ypath = load_case_by_name(str(spec_in["case_name"]))
+                try:
+                    spec, warns, ypath = load_case_by_name(
+                        str(spec_in["case_name"]))
+                    _from_yaml = True
+                except FileNotFoundError:
+                    # ★ 没 YAML 但有 steps -> 照跑，跑完 runner 会"首次生成" YAML。
+                    #
+                    #   以前这里直接抛出去变成 BLOCKED「没有 YAML 无法执行」，
+                    #   于是形成死循环：没 YAML 不能跑 -> 跑完才生成 -> 永远不生成。
+                    #   （用户实测踩到：第一次报没 YAML，第二次重跑才行。）
+                    if not spec_in.get("steps"):
+                        raise
+                    print(f"[yaml] 还没沉淀 YAML（{spec_in['case_name']}），"
+                          f"用现场拆的 steps 跑；跑完会自动生成一份", flush=True)
+                    ypath = None
             else:
                 from pathlib import Path as _P
                 ypath = _P(str(_yaml_ref))
                 spec, warns = load_case(ypath)
-            # 未采纳的字段**必须报出来** —— 静默忽略正是最容易出问题的地方
-            for w in warns:
-                print(f"[yaml] ⚠️ 未采纳：{w}", flush=True)
-            # 允许调用方覆盖（如只跑某一步做调试）
-            if spec_in.get("perm_action"):
-                spec.perm_action = spec_in["perm_action"]
-            print(f"[yaml] 用例来自 {ypath.name}（{len(spec.steps)} 步 / "
-                  f"{len(spec.asserts)} 断言 / {len(warns)} 条未采纳）", flush=True)
-        else:
+                _from_yaml = True
+            if _from_yaml:
+                # 未采纳的字段**必须报出来** —— 静默忽略正是最容易出问题的地方
+                for w in warns:
+                    print(f"[yaml] ⚠️ 未采纳：{w}", flush=True)
+                # 允许调用方覆盖（如只跑某一步做调试）
+                if spec_in.get("perm_action"):
+                    spec.perm_action = spec_in["perm_action"]
+                print(f"[yaml] 用例来自 {ypath.name}（{len(spec.steps)} 步 / "
+                      f"{len(spec.asserts)} 断言 / {len(warns)} 条未采纳）",
+                      flush=True)
+        # 没走 YAML（没给 case_name，或给了但还没沉淀）-> 用现场拆的 steps 构造
+        if not _from_yaml:
             spec = CaseSpec(
                 case_id=str(spec_in.get("case_id") or "case"),
                 title=str(spec_in.get("title") or "未命名用例"),
@@ -275,7 +299,7 @@ def main() -> int:
         report = _run_locked(
             spec=spec, answer=_answer, serial=serial, skill_root=skill_root,
             spec_in=spec_in, engine=_engine, ypath=ypath,
-            yaml_ref=_yaml_ref, warns=(warns if _yaml_ref else []))
+            yaml_ref=_yaml_ref, warns=(warns if _from_yaml else []))
     finally:
         # 无论成功、异常、崩溃都要放锁 —— 否则下次直接死锁
         _lock.release()
@@ -319,9 +343,12 @@ def main() -> int:
     run_id = None
     try:
         from android_agent.reporting import store as _store
-        from android_agent.report.scratch import tmp_dir as _tmp
+        from pathlib import Path as _P
+        # ★ 产物都在本次运行的目录里（runs/<uuid>_<时间戳>_<case>/）。
+        #   报告自己带着这个路径，直接从它拼，不再去 tmp/ 根下按 case_id 猜。
+        _run_dir = _P(report.run_dir) if getattr(report, "run_dir", "") else _P()
         _rows: list = []
-        _ledger_file = _tmp() / f"clicks_{spec.case_id}.jsonl"
+        _ledger_file = _run_dir / "clicks.jsonl"
         if _ledger_file.exists():
             for _line in _ledger_file.read_text(encoding="utf-8").splitlines():
                 _line = _line.strip()
@@ -340,7 +367,6 @@ def main() -> int:
         _yaml_text = ""
         if ypath:
             try:
-                from pathlib import Path as _P
                 _yaml_text = _P(ypath).read_text(encoding="utf-8")
             except OSError:
                 _yaml_text = ""      # 读不到就不存内容，路径照样存
@@ -352,9 +378,10 @@ def main() -> int:
             ledger_rows=_rows,
             paths={
                 "ledger": str(_ledger_file),
-                "log": str(_tmp() / f"run_{spec.case_id}.log"),
-                "llm": str(_tmp() / f"llm_{spec.case_id}.md"),
+                "log": str(_run_dir / "run.log"),
+                "llm": str(_run_dir / "llm.md"),
                 "report": str(report_path),
+                "run_dir": str(_run_dir),
             },
             case_yaml_path=_yaml_path,
             case_yaml=_yaml_text,
@@ -379,6 +406,12 @@ def main() -> int:
         "dialogs_dismissed": list(report.dialogs_dismissed or []),
         "preconditions_done": list(report.preconditions_done or []),
         "restored": list(report.restored or []),
+        # ★ 模型对话原文的路径必须回给主 Agent。
+        #   payload 是**手拼**的，漏一个字段就永远不会出现 ——
+        #   之前漏了 llm_path，主 Agent 拿到的就是 None，
+        #   等于"模型对话记录了但没人知道在哪"。
+        "llm_path": getattr(report, "llm_path", "") or "",
+        "run_dir": getattr(report, "run_dir", "") or "",
         "report_path": getattr(report, "report_path", None),
     }
     return emit(payload)

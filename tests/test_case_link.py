@@ -221,8 +221,13 @@ ck("★ 迁移是幂等的（新表已有就不覆盖）",
 
 ck("★ 只有空库时才自动导入（否则会冲掉网页改的）",
    "if not st.list_cases():" in src_web)
-ck("★ 有手动同步接口", '"/api/cases/import"' in src_web)
-ck("★ 同步默认不覆盖", "importer.import_all(overwrite=ow)" in src_web)
+# 用户要求：「用例库从文件夹导入删除吧」。
+# 界面上不再有这条路 —— 新建用例走「新建用例」，原文走「编辑原文」。
+ck("★ 前端不再有「从文件夹导入」按钮",
+   "从文件夹导入" not in app and "case-sync" not in app)
+ck("★ 前端不再调 import 接口", "/api/cases/import" not in app)
+ck("★ 后端接口还在（启动空库自动导用得上）",
+   '"/api/cases/import"' in src_web)
 
 print()
 print("=" * 70)

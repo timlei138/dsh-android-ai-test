@@ -89,9 +89,13 @@ def run_with(script, spec_dict, answer=None):
     改用 run_case 本来就支持的 `device=` 注入，不依赖内部实现细节。
     """
     dev = FakeDev(script)
+    _wd = Path(__file__).resolve().parents[1] / "tmp" / "_tmp_api"
     rep = sa.run_case(sa.CaseSpec(**spec_dict), answer=answer,
                       verbose=False, device=dev,
-                      workdir=Path(__file__).resolve().parents[1] / "tmp" / "_tmp_api")
+                      # ★ 生成的 YAML 留在临时目录里 —— 不传的话会写进
+                      #   用例库，测试夹具被当成真用例（污染过 A_三步链路）。
+                      yaml_out_dir=_wd,
+                      workdir=_wd)
     return rep, dev
 
 

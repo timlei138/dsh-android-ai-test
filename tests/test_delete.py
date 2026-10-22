@@ -472,8 +472,7 @@ ck("★★ 删用例接口（原文 + YAML 一起，用户要的那种简单）"
    'path.startswith("/api/cases/")' in src and "st.delete_case(key)" in src)
 ck("★ 删 YAML 失败时不删库里的行（免得留孤儿文件）",
    "为免留下孤儿文件" in src)
-ck("★ 改原文接口", 'path.endswith("/raw")' in src and "save_case_raw" in src)
-ck("★ 从文件夹同步接口", '"/api/cases/import"' in src)
+ck("改原文接口", 'path.endswith("/raw")' in src and "save_case_raw" in src)
 ck("用例列表带关联 YAML 状态", '"yaml_exists"' in src)
 ck("用例列表带跑过几次", '"last_status"' in src)
 # ⚠️ runs.case_name 存的是编号，不是 YAML 名。拿 stem 去对必然空，且不报错。

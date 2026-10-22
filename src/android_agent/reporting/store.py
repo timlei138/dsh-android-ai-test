@@ -209,6 +209,12 @@ _ADDED_COLUMNS = (
     ("runs", "case_yaml_path", "TEXT"),
     ("runs", "case_yaml", "TEXT"),
     ("runs", "model_s", "REAL"),
+    # 本次运行的产物目录（tmp/runs/<uuid>_<时间戳>_<case>/）。
+    # 截图、XML、日志、账本、报告全在里面 —— 从记录点进去就能看到"这一次"
+    # 的全部现场。老记录没有这一列，值为空，不影响查看。
+    ("runs", "run_dir", "TEXT"),
+    # 崩溃日志（logcat 片段）。只在该次运行确实崩了时才有内容。
+    ("runs", "crash_log", "TEXT"),
 )
 
 
@@ -348,8 +354,9 @@ def save_run(
                 by_model, by_code, engine,
                 started_at, started_ts, finished_at,
                 ledger_path, log_path, llm_path, report_path,
-                case_yaml_path, case_yaml, report_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                case_yaml_path, case_yaml, report_json,
+                run_dir, crash_log
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 case_name,
                 str(report.get("case_id") or ""),
@@ -374,6 +381,8 @@ def save_run(
                 case_yaml_path or None,
                 case_yaml or None,
                 json.dumps(report, ensure_ascii=False),
+                (paths or {}).get("run_dir") or report.get("run_dir") or None,
+                report.get("crash_log") or None,
             ),
         )
         run_id = int(cur.lastrowid)

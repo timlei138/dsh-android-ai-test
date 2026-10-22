@@ -264,8 +264,6 @@ ck("★ 仪表盘口径写明「按用例最近一次」", "按用例最近一�
 ck("★ 不引图表库（自己画 SVG）",
    "echarts.init" not in app and "echarts" not in html.lower()
    and not (ROOT / "webui" / "echarts.min.js").exists())
-ck("★ 老记录明确说明没有快照",
-   "没有内容" in app or "这次没存快照" in app)
 
 
 def _func_body(src: str, name: str) -> str:
@@ -302,7 +300,9 @@ _ci = _func_body(app, "caseInfoHtml")
 ck("★ 详情页不拿当前文件冒充快照",
    "/api/case/" not in _ci and "await api(" not in _ci,
    "caseInfoHtml 里不该有任何 fetch")
-ck("详情页只用 run.case_yaml 渲染", "run.case_yaml" in _ci)
+ck("★★ 记录详情不再内嵌 YAML 内容（只给链接跳用例详情）",
+   "run.case_yaml" not in _ci,
+   "用户要求做减法：记录页只显示原始用例，YAML 给个链接")
 ck("★ key 留空的语义写在界面上", "留空保存 = 保留原值" in app)
 
 print()
@@ -348,9 +348,17 @@ else:
         m = re.search(r'<main id="main">(.*?)</main>', dom, re.S)
         return m.group(1) if m else ""
 
+    # ★ 自己造一条用例再渲染。
+    #   原来这里断言页面上有「联想日历_168」，但本测试的 root 指向
+    #   临时空目录 fake_root —— 库里一条用例都没有，能不能过
+    #   全看那台机器上别的库恰不巧有数据。现在不依赖外部数据了。
+    st.save_case("168", title="联想日历_168_图库导入入口",
+                 raw_text="操作步骤\n1. 点更多\n预期结果\n1. 打开课程表",
+                 source_path="(测试夹具)")
+
     body = render('go("cases")', "cases")
     ck("★ 用例库页面渲染出来了", "用例库" in body, body[:100])
-    ck("★ 列表里真的有用例文件", "联想日历_168" in body, body[:200])
+    ck("★ 列表里真的渲染出用例了", "联想日历_168" in body, body[:200])
 
     body = render('go("vision")', "vision")
     ck("★ 视觉配置页渲染出来了", "视觉模型" in body, body[:100])

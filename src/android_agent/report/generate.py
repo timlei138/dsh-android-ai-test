@@ -202,8 +202,19 @@ def render_case_yaml(spec: Any, *, trace: list[dict[str, Any]] | None = None,
     if asserts:
         add("assertions:")
         for a in asserts:
-            d = a if isinstance(a, dict) else {"id": getattr(a, "id", ""),
-                                               "desc": getattr(a, "desc", "")}
+            # ★ 必须把 check / note / result 一起带出来。
+            #
+            # 这里踩过：只取 id 和 desc，于是生成出来的 YAML **一条判据都没有**
+            # （176 实测：14 条断言全是光秃秃的 desc）。
+            # 下次再跑的时候，本该由代码硬判的强证据（activity/rid/数值）
+            # 全部退化成"交给 AI 看"—— 等于每跑一次，判据就退一层。
+            d = a if isinstance(a, dict) else {
+                "id": getattr(a, "id", ""),
+                "desc": getattr(a, "desc", ""),
+                "check": getattr(a, "check", None),
+                "note": getattr(a, "note", ""),
+                "result": getattr(a, "result", ""),
+            }
             add(f"  - id: {d.get('id', '')}")
             add(f"    desc: {_q(str(d.get('desc', '')))}")
             check = d.get("check")
@@ -214,6 +225,12 @@ def render_case_yaml(spec: Any, *, trace: list[dict[str, Any]] | None = None,
                     add("    check:")
                     for k, v in check.items():
                         add(f"      {k}: {_q(str(v))}")
+            # note / result 是注解，不参与判定，但它是"判据为什么这么写"的依据，
+            # 丢掉以后再回看就不知道为什么只核到这一步。
+            if str(d.get("note") or "").strip():
+                add(f"    note: {_q(str(d['note']))}")
+            if str(d.get("result") or "").strip():
+                add(f"    result: {_q(str(d['result']))}")
             add("")
 
     return "\n".join(lines).rstrip() + "\n"

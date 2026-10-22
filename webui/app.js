@@ -238,10 +238,15 @@ async function viewDashboard() {
   }).join('');
 
   /* 按用例：成功率由低到高，最该关注的排最前 */
-  const rows = cs.map((c) => {
-    // 用例名下能查到几次运行、各是什么结论
-    return c;
-  }).map((c) => {
+  //
+  /* ★ 只显示前 5 条（用户要求：每块最多 5 个，留「更多」跳过去）。
+   *
+   *   为什么不一次全铺：用例已经有 60 多条，全列出来总览页要滚三屏，
+   *   反而看不出"哪几条有问题" —— 那才是打开总览页的目的。
+   *   TOP_N 之外的一律走「更多」，到用例库按需看。
+   */
+  const TOP_N = 5;
+  const rows = cs.slice(0, TOP_N).map((c) => {
     const okPct = c.last_status === 'PASS' ? 100
       : c.last_status ? 0 : null;
     return `<div class="mod-row" data-case="${esc(c.case_name)}">
@@ -284,15 +289,21 @@ async function viewDashboard() {
     </div>
 
     <div class="panel">
-      <div class="panel-title">用例情况</div>
+      <div class="panel-title">用例情况
+        ${cs.length > TOP_N ? `<a class="ghost-link more" data-go="cases"
+           title="去用例库看全部 ${cs.length} 条">更多 ${cs.length} 条 →</a>` : ''}
+      </div>
       <div class="mod-list">${rows || '<div class="muted">无用例</div>'}</div>
     </div>
 
     <div class="panel">
-      <div class="panel-title">最近运行</div>
+      <div class="panel-title">最近运行
+        ${(s.recent || []).length > TOP_N ? `<a class="ghost-link more" data-go="runs"
+           title="去运行记录看全部">更多 →</a>` : ''}
+      </div>
       <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>耗时</th>
         <th>自动化率</th><th>开始时间</th></tr></thead>
-      <tbody>${(s.recent || []).slice(0, 8).map((r) => `<tr class="clickable" data-run="${r.run_id}">
+      <tbody>${(s.recent || []).slice(0, TOP_N).map((r) => `<tr class="clickable" data-run="${r.run_id}">
         <td class="mono">#${r.run_id}</td>
         <td class="mono">${esc(r.case_name)}</td>
         <td>${badge(r.status)}</td>
@@ -301,6 +312,17 @@ async function viewDashboard() {
         <td>${esc(r.started_at || '')}</td>
       </tr>`).join('') || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>
     </div>`;
+
+  // 「更多」入口：跳到对应模块（复用左侧导航的同一套 STATE.view）
+  main.querySelectorAll('[data-go]').forEach((a) => {
+    a.addEventListener('click', (e) => {
+      e.stopPropagation();
+      STATE.view = a.dataset.go;
+      STATE.case = null;
+      STATE.runId = null;
+      route();
+    });
+  });
 }
 
 /* ---------- 视图：用例库 ----------
@@ -329,11 +351,6 @@ async function viewCases() {
       <td>${c.yaml_exists
         ? `<span class="raw-yes">✓ 已拆解</span>`
         : '<span class="raw-no">未拆解</span>'}</td>
-      <td>${c.runs
-        ? `<span class="badge ${esc(c.last_status || 'UNKNOWN')}">${esc(c.last_status || '—')}</span>`
-        : '<span class="muted">未跑过</span>'}</td>
-      <td>${c.runs ? c.runs + ' 次' : '—'}</td>
-      <td style="color:var(--dim);font-size:12.5px">${esc(c.last_at || '')}</td>
       <td style="white-space:nowrap">
         <button class="danger sm" data-delcase="${esc(c.case_key)}"
           title="删除这条用例（原始 case 和关联的 YAML）">删除</button>
@@ -349,7 +366,6 @@ async function viewCases() {
     <div class="sub">
       共 <b>${items.length}</b> 条 · 已拆解 YAML <b>${nYaml}</b> 条 ·
       跑过 <b>${nRun}</b> 条
-      <span style="color:var(--dim)">｜原文来自 ${(j.raw_dirs || []).map((d) => `<span class="mono">${esc(d)}</span>`).join(' 和 ') || '—'}</span>
     </div>
     <div class="tabs">
       ${tab('all', '全部', items.length)}
@@ -357,16 +373,15 @@ async function viewCases() {
       ${tab('noyaml', '未拆解', items.length - nYaml)}
       ${tab('run', '跑过', nRun)}
       <span style="flex:1"></span>
-      <button class="ghost sm" id="case-sync" title="从文件夹把新增的原始 case 补进来（不覆盖网页里改过的）">从文件夹同步</button>
+      <button class="ghost sm" id="case-new" title="直接在库里新建一条用例">新建用例</button>
     </div>
-    <table><thead><tr><th>编号</th><th>用例</th><th>YAML</th>
-      <th>最近结论</th><th>跑过</th><th>最近一次</th><th></th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="7" class="empty">这个筛选下没有用例</td></tr>`}</tbody></table>
-    ${(j.orphan_yaml || []).length ? `<div class="hint" style="margin-top:16px">
-      还有 <b>${j.orphan_yaml.length}</b> 个 YAML 文件没对上任何用例编号
-      （${j.orphan_yaml.map((o) => `<span class="mono">${esc(o.name)}</span>`).join('、')}）——
-      它们在 <span class="mono">${esc(j.dir)}</span> 里，不随用例删除。
-    </div>` : ''}`;
+    <table><thead><tr><th>编号</th><th>用例</th><th>YAML</th><th></th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="4" class="empty">这个筛选下没有用例</td></tr>`}</tbody></table>`;
+
+  // ★ 不再显示"有 N 个 YAML 没对上用例编号"。
+  //   那类文件（_test_invalid.yaml）是给校验器/AI 当样本用的，
+  //   本来就不该有对应用例 —— 摆到页面上只会让人以为出了问题。
+  //   接口仍然返回 orphan_yaml，供代码侧使用，只是不渲染。
 
   bindBack();
   // 行点击交给全局委托处理（[data-casekey]），这里不再单独绑 ——
@@ -383,13 +398,45 @@ async function viewCases() {
       viewCases();
     });
   });
-  main.querySelector('#case-sync').addEventListener('click', async () => {
-    try {
-      const r = await api('/api/cases/import', { method: 'POST', body: {} });
-      toast(`已同步：新增 ${r.created} 条，跳过已存在 ${r.skipped} 条，`
-        + `关联 YAML ${r.linked} 个`);
-      await viewCases();
-    } catch (e) { toast('同步失败：' + e.message); }
+  main.querySelector('#case-new').addEventListener('click', async () => {
+    const m = modal('新建用例', `
+      <div class="meta">建在库里（不依赖文件夹）。编号就是用例号，如 <span class="mono">190</span>。</div>
+      <div class="form">
+        <label>编号 <input id="nc-key" placeholder="如 190"></label>
+        <label>题目 <input id="nc-title" placeholder="如 图库导入后裁剪"></label>
+        <label>优先级 <input id="nc-prio" placeholder="P1 / P2（可留空）"></label>
+        <label>原始用例（步骤 + 预期）
+          <textarea id="nc-raw" rows="10"
+            placeholder="把测试步骤和预期结果原样贴进来"></textarea>
+        </label>
+      </div>`,
+      `<button class="ghost" data-cancel>取消</button>
+       <button data-ok>创建</button>`);
+    m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
+    m.el.querySelector('[data-ok]').addEventListener('click', async () => {
+      const key = (m.el.querySelector('#nc-key').value || '').trim();
+      const title = (m.el.querySelector('#nc-title').value || '').trim();
+      const prio = (m.el.querySelector('#nc-prio').value || '').trim();
+      const raw = (m.el.querySelector('#nc-raw').value || '').trim();
+      if (!key) { toast('编号不能为空'); return; }
+      if (!raw) { toast('原始用例不能为空 —— 那是需求原话，拆解要照它来'); return; }
+      const btn = m.el.querySelector('[data-ok]');
+      btn.disabled = true;
+      btn.textContent = '创建中…';
+      try {
+        await api('/api/cases', {
+          method: 'POST',
+          body: { case_key: key, title, priority: prio, raw_text: raw },
+        });
+        m.close();
+        toast(`已创建用例 ${key}`);
+        await viewCases();
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = '创建';
+        toast('创建失败：' + e.message);
+      }
+    });
   });
 }
 
@@ -484,8 +531,7 @@ async function viewCase(key) {
   const rawHtml = (d.raw_text || '').trim()
     ? `<div class="codebox"><pre style="white-space:pre-wrap">${esc(d.raw_text)}</pre></div>`
     : `<div class="hint warn">这条用例还没有原文。
-        它本该来自你手写的那份 txt —— 可以用「从文件夹同步」重新导入，
-        或者直接点「编辑原文」贴进来。</div>`;
+        直接点「编辑原文」把当初写的测试步骤和预期贴进来。</div>`;
 
   // YAML：极简高亮（注释 / 列表符 / 键）。不引高亮库，看的是"哪行写了什么"。
   let yamlHtml;
@@ -499,11 +545,21 @@ async function viewCase(key) {
         .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
       return `<span class="ln"><i>${n}</i>${html}</span>`;
     }).join('\n');
-    yamlHtml = `<div class="codebox collapsed"><pre>${body}</pre></div>
+    /* ★ 保留原文之后，YAML 只留一个**入口**，不默认铺开。
+     *
+     * 用户原话：「webui的记录详情里要求带 case 的原始文本。不要带 YAML 内容。
+     *           可以留个入口点击查看。」
+     * 理由和上面一样：点开一条用例，第一眼该看到"当初要求什么"，
+     * 判据是给复核用的人按需展开的 —— 默认铺开等于让两者抢视线。
+     */
+    yamlHtml = `<details class="yaml-entry">
+      <summary>查看拆解后的判据 YAML <span class="mono dim">${esc(y.name)}</span> · ${(y.size / 1024).toFixed(1)} KB</summary>
+      <div class="codebox"><pre>${body}</pre></div>
       <div class="sub" style="margin-top:6px">
-        <span class="mono">${esc(y.path)}</span> · ${(y.size / 1024).toFixed(1)} KB ·
+        <span class="mono">${esc(y.path)}</span> ·
         改判据请直接编辑文件后重跑 —— 网页改会让旧记录变成「新判据配旧结论」。
-      </div>`;
+      </div>
+    </details>`;
   } else {
     yamlHtml = `<div class="hint">这条用例还没拆解成 YAML <b>（还没法跑）</b>。
       YAML 是执行判据（每步的落点、坑、断言），要由拆解流程生成。
@@ -669,77 +725,119 @@ async function viewVision() {
  *
  * 需求原话：「记录详情里面要包含原始 case 信息。这样就知道是哪个 case 了。」
  *
- * ## 为什么必须存快照，而不是只存路径
+ * ★★ 这里显示**原始 case**（用户写的那份「测试步骤 + 预期结果」），
+ *    不是 YAML。
  *
- * YAML 是会改的 —— 168 的 a3 判据就改过两次（先钉死 activity，
- * 再换 album_reached，最后交模型）。如果旧记录只存路径，
- * 点开看到的就是"新判据 + 旧结论"，反过来还以为当初就是照这么判的。
- * 所以跑完那一刻把内容快照进库（runs.case_yaml），这里优先显示快照。
+ * 之前是反的：`原始用例` 这个小标题下面贴的是 `runs.case_yaml` 快照
+ * （拆解后的判据：landing / pitfalls / check），而用户当初写的步骤
+ * 和预期一个字都没露出来。用户的原话是「显示是反的」——
+ * 一点没错：点开一条记录，第一眼要看到的是"这条用例当初要求什么"，
+ * 对着它才看得懂下面的 FAIL 到底是不是真问题。
  *
- * 老记录（加这个字段之前跑的）没有快照，退回显示当前文件，
- * 并**明确标出来"这是当前版本，不是你跑的那份"** —— 不要假装一样。
+ * 所以现在的顺序是：
+ *   ① 原始 case 原文（用户写的步骤 / 预期）—— 主位，默认展开
+ *   ② 执行判据 YAML 快照            —— 折叠，给要复核判据的人看
+ *
+ * ## 为什么 YAML 仍然要存快照
+ *
+ * YAML 是会改的 —— 168 的 a3 判据就改过两次。如果旧记录只存路径，
+ * 点开看到的就是"新判据 + 旧结论"。所以跑完那一刻把内容快照进库
+ * （runs.case_yaml），这里显示快照而不是当前文件。
  */
 function caseInfoHtml(run) {
-  const snap = run.case_yaml || '';
-  const path = run.case_yaml_path || '';
-  const fname = path.split(/[\\/]/).pop();
-  const rep = (() => { try { return JSON.parse(run.report_json || '{}'); } catch (_) { return {}; } })();
-  const pkg = (rep && rep.package) || '';
-
-  if (!snap && !path) {
-    return `<h2>原始用例</h2>
-      <div class="hint">这次运行没有记录用例来源（早于该功能加入）。</div>`;
-  }
-
-  /* ⚠️ 这里**只用快照**，绝不拿当前文件顶替。
-   *
-   * 之前是这样写的：没有快照时去 /api/case/<文件名> 拉当前 YAML 显示。
-   * 看着"信息更全"，实际是在骗人 —— 用户要的是"这次跑的是哪个 case"，
-   * 拿现在的文件去回答，等于把两个版本混成一份。
-   * 老记录就老实说"没存快照"，要看当前版本去用例库点。
-   */
-  const lines = snap.split('\n');
-  const body = lines.map((ln, i) => {
-    const n = String(i + 1).padStart(4, ' ');
-    let html = esc(ln);
-    if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
-    else html = html
-      .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
-      .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
-    return `<span class="ln"><i>${n}</i>${html}</span>`;
-  }).join('\n');
-
-  // 跳到这条用例的详情页。用例现在按**编号**索引（run.case_name 存的就是编号），
-  // 不是按 YAML 文件名 —— 用文件名跳过去会 404。
+  // ★ 记录页不再展示 YAML 内容（用户要求做减法）：
+  //   只留一个链接跳到用例详情，不再读 case_yaml / case_yaml_path。
   const caseKey = run.case_name || '';
-  // ★ 用例可能已经被删了（用户允许"删用例、留记录"）。
-  //   这时**不能**给"看当前版本"的链接 —— 点了会 404，看起来像页面坏了。
-  //   判据本来就在上面的快照里，记录是自足的，所以这里只需要说清楚。
   const caseGone = run.case_exists === false;
-  const head = `<div class="casebar">
-      ${fname ? `<span class="mono">${esc(fname)}</span>` : ''}
-      ${pkg ? `<span class="mono dim">${esc(pkg)}</span>` : ''}
-      ${snap ? '<span class="tag ok">跑的时候那份</span>' : ''}
-      ${caseGone
-    ? '<span class="tag gone" title="用例已删除，但这条记录和它的判据快照都还在">用例已删除</span>'
-    : caseKey ? `<a class="ghost-link" data-casekey="${esc(caseKey)}">看这条用例当前版本</a>` : ''}
-      <span style="flex:1"></span>
-      ${snap ? `<span class="muted">${lines.length} 行</span>` : ''}
-    </div>`;
 
-  if (!snap) {
-    return `<h2>原始用例</h2>
-      ${head}
-      <div class="hint warn">⚠️ 这次运行早于"记录用例快照"功能，库里有文件名但没有内容。<br>
-        为了不把<b>现在</b>的判据当<b>当时</b>的判据，这里不显示内容；${caseGone
-    ? '用例也已经删除，当前版本无处可看。'
-    : '点上面的链接可以去用例库看当前版本。'}</div>`;
+  /* ① 原始 case 原文 —— 主位。
+   *
+   * 原文不在 runs 表里（它是"用例的属性"，不是"某次运行的属性"），
+   * 但详情接口 /api/run/<id> 会把它带过来（server 端补 case_raw）。
+   * 老接口没有这个字段时老实说明，不拿 YAML 顶替。
+   */
+  const raw = (run.case_raw || '').trim();
+  const rawSrc = (run.case_raw_source || '').trim();
+  const rawUpdated = (run.case_raw_updated || '').trim();
+  const parsed = run.case_raw_parsed || null;
+
+  /* 步骤 ↔ 预期 两列对照。
+   *
+   * 用户的原话：「记录详情。显示原始的步骤和期待，不是 YAML。显示是反的。」
+   * 原文整段铺出来能读，但"第 N 步对应第 N 条预期"要靠人数 ——
+   * 并排放才对得上。这是看用例的人真正需要的那一层。
+   *
+   * 拆不出来（parsed 为空 / steps 和 expects 都空）就退化成显示原文，
+   * 绝不显示半截让人误以为用例只有这么多内容。
+   */
+  const steps = (parsed && parsed.steps) || [];
+  const expects = (parsed && parsed.expects) || [];
+  const canPair = steps.length > 0 || expects.length > 0;
+
+  let stepsBlock = '';
+  if (canPair) {
+    const n = Math.max(steps.length, expects.length);
+    const rows = [];
+    for (let i = 0; i < n; i++) {
+      const s = steps[i];
+      const e = expects[i];
+      rows.push(`<tr>
+        <td class="rp-n">${i + 1}</td>
+        <td class="rp-do">${s ? esc(s.text).replace(/\n/g, '<br>') : '<span class="dim">（无）</span>'}</td>
+        <td class="rp-ex">${e ? esc(e.text).replace(/\n/g, '<br>') : '<span class="dim">（这条没写预期）</span>'}</td>
+      </tr>`);
+    }
+    stepsBlock = `
+      ${parsed.precondition ? `<div class="raw-pre"><b>前提</b>：${esc(parsed.precondition).replace(/\n/g, '<br>')}</div>` : ''}
+      <table class="rawpair">
+        <thead><tr><th style="width:38px">#</th><th>操作步骤</th><th>预期结果</th></tr></thead>
+        <tbody>${rows.join('')}</tbody>
+      </table>
+      <div class="sub" style="margin-top:6px">步骤和预期按序号对齐 —— 条数不一样时右边空着，说明原文那条确实没写预期。</div>`;
   }
 
-  return `<h2>原始用例</h2>
-    ${head}
-    <div class="codebox collapsed"><pre>${body}</pre></div>`;
+  const rawBlock = raw
+    ? `${stepsBlock || `<div class="codebox"><pre style="white-space:pre-wrap">${esc(run.case_raw)}</pre></div>`}
+       <details style="margin-top:10px">
+         <summary class="sub" style="cursor:pointer">看原文（需求记录，不参与执行判定）</summary>
+         <div class="codebox" style="margin-top:6px"><pre style="white-space:pre-wrap">${esc(run.case_raw)}</pre></div>
+       </details>
+       <div class="sub" style="margin-top:6px">
+         ${rawSrc ? `来源 <span class="mono">${esc(rawSrc)}</span> · ` : ''}
+         ${rawUpdated ? `更新于 ${esc(rawUpdated)} · ` : ''}
+         <span style="color:var(--dim)">原文是需求记录，可在用例库里编辑。</span>
+       </div>`
+    : `<div class="hint warn">这条记录没带上原始 case 原文。
+        ${caseGone ? '用例已被删除，原文也随之没了。'
+    : '去用例库里打开这条用例可以看到原文。'}</div>`;
 
+  /* ② YAML —— 只留一个链接，跳到对应的 Case 详情。
+   *
+   * 用户原话：「记录详情只显示 原始用例（你写的步骤 / 预期）。
+   *            有YAML了就给个YAML的链接。点击可以跳到对应的Case详情。」
+   *
+   * 所以这里**不铺 YAML 内容**，连折叠都不要 —— 记录页只讲
+   * "这条用例这次跑成什么样"，YAML 是用例自己的属性，去用例页看。
+   */
+  let yamlBlock = '';
+  if (caseKey && !caseGone) {
+    yamlBlock = `<div class="sub" style="margin-top:12px">
+        <a class="ghost-link" data-casekey="${esc(caseKey)}">查看这条用例的 YAML 判据</a>
+        <span style="color:var(--dim)">（跳到用例 ${esc(caseKey)} 详情）</span>
+      </div>`;
+  }
+
+  return `<h2>原始用例（你写的步骤 / 预期）</h2>
+    <div class="casebar">
+      ${caseKey ? `<span class="mono">用例 ${esc(caseKey)}</span>` : ''}
+      ${caseGone
+    ? '<span class="tag gone">用例已删除</span>'
+    : caseKey ? `<a class="ghost-link" data-casekey="${esc(caseKey)}">去用例库打开</a>` : ''}
+      <span style="flex:1"></span>
+      ${raw ? `<span class="muted">${raw.length} 字</span>` : ''}
+    </div>
+    ${rawBlock}
+    ${yamlBlock}`;
 }
 
 /* ---------- 视图：运行记录列表 ---------- */

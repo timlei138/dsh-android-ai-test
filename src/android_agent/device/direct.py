@@ -295,6 +295,32 @@ def _center_of(bounds: str) -> list[int] | None:
     return [(x1 + x2) // 2, (y1 + y2) // 2]
 
 
+def _text_within(el: Any, limit: int = 3) -> str:
+    """取某个节点**子树内**的文字（text / content-desc），按出现顺序拼起来。
+
+    用途：可点容器自己没有文字，文字挂在不 clickable 的子节点上。
+    「更多」菜单是典型：可点 FrameLayout + 子 TextView(item_title)。
+
+    只取前 `limit` 段 —— 一个可点容器下最多放一句话，
+    取太多说明拿到的是整个列表页的容器，拼起来反而误导模型。
+    """
+    parts: list[str] = []
+    try:
+        for sub in el.iter():
+            if sub is el:
+                continue
+            t = (sub.get("text") or "").strip()
+            if not t:
+                t = (sub.get("content-desc") or "").strip()
+            if t and t not in parts:
+                parts.append(t)
+            if len(parts) >= limit:
+                break
+    except Exception:  # noqa: BLE001
+        return ""
+    return " ".join(parts)
+
+
 def parse_clickable(xml_path: str | Path, *, fg_package: str = "") -> tuple[list[dict[str, Any]], int]:
     """从落盘的 XML 提取**可点击控件**清单。
 
@@ -321,6 +347,20 @@ def parse_clickable(xml_path: str | Path, *, fg_package: str = "") -> tuple[list
 
     out: list[dict[str, Any]] = []
     for el in root.xpath('//*[local-name()="node"]'):
+        # ★ 仍然只取 clickable=true —— 这个标记是可信的，别绕开它。
+        #
+        # 实测过「更多」菜单（rv_more_menu）：文字节点 item_title 是
+        #   class=TextView clickable=false bounds=[2512,291][2883,452]
+        # 它的**父节点**才是真正接收点击的：
+        #   class=FrameLayout clickable=true bounds=[2512,291][2883,452]  ← 完全重合
+        # 也就是说 clickable=false 说的是实话：那个 TextView 确实不能点。
+        #
+        # 但旧实现只看节点自己的 text，于是这个可点 FrameLayout 的 text 是空的，
+        # 列表里只剩 4 个「没有文字的坐标」，模型根本不知道哪个是「课程表」
+        # —— 176 的 s1 每次都卡死在这里。
+        #
+        # 正确做法不是放开 clickable，而是：**可点容器自己没有文字时，
+        # 把被它包住的子节点文字收上来**（见下面的 _text_within）。
         if el.get("clickable") != "true":
             continue
         rid_full = el.get("resource-id") or ""
@@ -336,12 +376,44 @@ def parse_clickable(xml_path: str | Path, *, fg_package: str = "") -> tuple[list
         if not c:
             continue
 
-        text = el.get("text") or ""
-        desc = el.get("content-desc") or ""
+        text = (el.get("text") or "").strip()
+        desc = (el.get("content-desc") or "").strip()
+        # ★ 可点容器自己没有文字时，把**被它包住的子节点文字**收上来。
+        #
+        # 「更多」菜单就是这样：可点的 FrameLayout 自己没有 text，
+        # 文字在子节点 item_title(TextView, clickable=false) 上。
+        # 不收上来的话，模型看到四个没有文字的坐标，选不出「课程表」。
+        #
+        # 只在**自己没文字**时才往下找 —— 避免把整个页面的文字都拼到一个容器上。
+        if not text and not desc:
+            text = _text_within(el)
+
         if not text:
             text = desc
         elif desc and desc not in text:
             text = f"{text} {desc}"
+
+        # ★ 自己没有 rid、也没有文字 -> 借用**子节点里第一个 rid** 当识别名。
+        #
+        # 空课程表的格子就是这种：20 个可点 FrameLayout，
+        # 既没 resource-id 也没 text，列表里全是 `{'c': [552, 648]}`，
+        # 模型看到 20 个一模一样的无名坐标，无法说出"点第一个小节"
+        # —— 176 的 s4 就这么空转到 80 轮上限。
+        #
+        # 格子中心那个加号图标的 rid 是 iv_add_hint，拿它当名字，
+        # 模型就能说 "rid=iv_add_hint" 了。注意：这只是**识别名**，
+        # 不影响 clickable 的判断 —— 能被点的是外层格子，不是这个图标。
+        if not rid_full:
+            for sub in el.iter():
+                if sub is el:
+                    continue
+                sub_rid = (sub.get("resource-id") or "").strip()
+                if not sub_rid:
+                    continue
+                if any(d in sub_rid for d in _DECOR_PKGS):
+                    continue
+                rid_full = sub_rid
+                break
 
         node: dict[str, Any] = {"i": len(out), "c": c}
         if text:
@@ -420,6 +492,8 @@ class DirectDevice:
         self._d = u2.connect(serial) if serial else u2.connect()
         self.evidence_dir = Path(evidence_dir) if evidence_dir else Path("tmp/evidence")
         self._n = 0
+        # 崩溃时抓到的 logcat 片段（空=没崩过）。runner 收尾时带走。
+        self.crash_log = ""
         # 系统权限弹窗处理模块。加载失败是 None（权限处理降级，不影响主流程）——
         # 但要**显式暴露**出来，别让"权限框没被点"变成静默行为。
         self._perm = _load_perm()
@@ -572,6 +646,61 @@ class DirectDevice:
             raise result["err"]
         return str(result.get("xml") or "")
 
+    # ── 崩溃取证 ──────────────────────────────────────────────────────
+    def _capture_crash_log(self, outdir: Path, package: str) -> str:
+        """看一眼 logcat 里该包有没有 FATAL，有就落盘并返回内容。
+
+        返回值：
+          · 有崩溃 -> 返回提取出的堆栈（同时写 `crash.txt`）
+          · 没有     -> 返回空串（**不写文件**，避免每步都留一堆空文件）
+
+        为什么用 `-d` 而不是清空重抓：
+          `-d` 只 dump 当前缓冲、不阻塞。清空重抓会漏掉"崩溃发生在
+          上一条命令和我们之间"这种情况 —— 而那恰恰是最常见的。
+
+        为什么走 u2 的 shell 而不是 adb 子进程：
+          用户定的规矩是**设备操作一律走 uiautomator2**。
+          u2 的 `shell()` 直接复用已有的设备连接，不用再起进程、
+          不用管 adb 路径，也天然带超时。
+        """
+        pkg = (package or "").strip()
+        if not pkg:
+            return ""
+        try:
+            cmd = "logcat -d -v brief"
+            try:
+                pid = self._d.app_current().get("pid")
+            except Exception:  # noqa: BLE001
+                pid = None
+            if pid:
+                cmd += f" --pid {pid}"
+            out = self._d.shell(cmd, timeout=8) or ""
+        except Exception:  # noqa: BLE001
+            # 抓不到 log 不该影响执行 —— 崩溃本身已经被别的路径发现了。
+            return ""
+        if isinstance(out, tuple):        # 有的版本返回 (output, exit_code)
+            out = out[0] or ""
+        lines = str(out).splitlines()
+        # 判定"真崩了"：FATAL EXCEPTION 或 ANR。
+        # 只看含包名或含 FATAL 的那几段，避免把别的 App 的崩溃算到自己头上。
+        hits = [i for i, ln in enumerate(lines)
+                if ("FATAL EXCEPTION" in ln or "ANR in " in ln)]
+        if not hits:
+            return ""
+        # FATAL 后面通常跟几十行堆栈；取崩溃行起 80 行足够看清调用链。
+        start = max(0, hits[0] - 3)
+        chunk = "\n".join(lines[start:start + 80])
+
+        try:
+            (outdir / "crash.txt").write_text(chunk, encoding="utf-8")
+        except OSError:
+            pass
+        # 记在实例上 —— runner 收尾时随报告一起交出去。
+        # 只留第一次：崩溃后界面通常就定了，后面几步抓到的都是同一份。
+        if not getattr(self, "crash_log", ""):
+            self.crash_log = chunk
+        return chunk
+
     def _screenshot(self, path: str, timeout: float = 15.0) -> bool:
         """截图。同样加硬超时 —— 截图失败不该中断执行，但也不该卡死。"""
         done: dict[str, Any] = {}
@@ -641,6 +770,16 @@ class DirectDevice:
         if _dbg:
             _dbg(f"observe[{tag}] app_current {(time.time() - t_cur) * 1000:.0f}ms "
                  f"-> {cur.get('activity')}")
+
+        # ★★ 崩了就把 logcat 抓下来（用户要求：检测到崩溃就抓 log）。
+        #
+        #   为什么要抓：`crash.type` 只说"崩了"，说不出**为什么崩**。
+        #   没有堆栈就只能重跑一遍复现，而崩溃往往不是每次都复现。
+        #   抓一次 logcat 只有几十毫秒，比事后重现便宜得多。
+        #
+        #   只抓该包的 FATAL —— 整份 logcat 几千行，进报告没人看得完，
+        #   也会把断言上下文挤爆。所以按包名 grep 出崩溃栈。
+        self._capture_crash_log(outdir, cur.get("package") or "")
         try:
             t_ws = time.time()
             w, h = self._window_size()

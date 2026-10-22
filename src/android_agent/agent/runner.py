@@ -31,6 +31,7 @@ case 之间只有**数据**不同（步骤/预期/知识卡），执行骨架完
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -77,13 +78,21 @@ DEFAULT_SKILL = skill_root()
 
 
 def _run_tag() -> str:
-    """本次运行的证据子目录名：run_<年月日_时分秒>。
+    """本次运行的目录名：<uuid8>_<年月日_时分秒>_<case>。
 
-    为什么不用 run_id：落盘发生在落库之前，那时还没有 run_id。
-    时间戳够用了 —— 同一个用例不可能在同一秒跑两次（有锁，且跑一次几十秒）。
+    用户要求：**一次运行 = 一个目录**，把这次跑出来的截图、XML、日志、
+    账本、报告全装进去。这样从记录点进去就能看到"这一次"的全部证据，
+    也不会再出现两次运行互相覆盖的问题。
+
+    为什么用 uuid 而不是时间戳：
+      · 时间戳同秒会撞（并行跑多条用例时就会），uuid 不会
+      · uuid 天然全局唯一，以后要跨机器/跨库对账也不会混淆
+    时间戳保留在名字里，纯粹是为了人在文件管理器里能一眼看出先后。
     """
     import datetime as _dt
-    return "run_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    import uuid as _uuid
+    return (_uuid.uuid4().hex[:8] + "_"
+            + _dt.datetime.now().strftime("%Y%m%d_%H%M%S"))
 
 
 def _new_node_calls() -> dict[str, dict[str, float]]:
@@ -104,6 +113,71 @@ def _fmt_node_calls(calls: dict[str, dict[str, float]]) -> str:
     parts = [f"{k}×{int(v['n'])}/{v['ms'] / 1000:.1f}s"
              for k, v in items if v["n"]]
     return "  ".join(parts) if parts else "(无)"
+
+
+def _attach_coords(ans: dict, state: dict, payload: dict) -> dict:
+    """把模型的**语义目标**翻译成坐标，粘回 ans。
+
+    新契约下模型只说"点哪个控件"（tap_target），不说坐标。
+    但 runner 里所有判断——死循环检测、连点拦截、日志、到期判定——
+    都是按 (next_x, next_y) 写的。**在这里翻译一次，下游全部照旧**。
+
+    不翻译会出两件事（176 实测，两条都踩到了）：
+      ① 日志一路打「无动作」，看上去像模型什么都没说，
+         其实是它说得完全正确 —— 排查会被这句话带偏；
+      ② 死循环检测拿不到坐标，等于失效，模型可以无限点同一个控件空转到轮次上限。
+
+    解析不到**抛 DecisionError**，走已有的"回灌错误让模型重选"通道；
+    绝不猜第一个 —— 点错控件比不点更糟。
+    """
+    if not ans.get("tap_target") or ans.get("next_x") is not None:
+        return ans
+    tgt = str(ans.get("tap_target") or "").strip()
+    x, y, how = _resolve_semantic_target(
+        tgt, state.get("obs_clickable") or payload.get("clickable") or [])
+    if x is None:
+        raise DecisionError(
+            f"点不了「{tgt}」：{how}。"
+            f"请从「当前可点项」里重新选一个**存在且唯一**的目标。")
+    return {**ans, "next_x": x, "next_y": y}
+
+
+def _resolve_semantic_target(target: str,
+                             clickable: list) -> tuple[int | None, int | None, str]:
+    """把模型给的**语义目标**（控件名/rid）解析成 (x, y, 说明)。
+
+    这是新契约的关键一环：模型说「点哪个控件」，坐标由代码定。
+
+    ★ 为什么不自己写一套匹配：`nodes._resolve_strong_target` 已经是
+      "用例声明 target -> 坐标"的权威实现（支持 rid、文字、`名字#序号`
+      去重、不唯一报错）。模型指定和用例声明**本来就该是同一件事**，
+      共用一套才能保证"代码直点"和"模型指定"行为一致。
+
+    解析不到返回 (None, None, 原因)，由调用方决定是报错还是重试 ——
+    这里**绝不猜第一个**：点错控件比不点更糟。
+    """
+    try:
+        from .nodes import _resolve_strong_target
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"解析器不可用：{exc}"
+
+    # ★ 模型给的是**裸名字**（`同意` / `button1` / `cv_empty_content#2`），
+    #   而 target 表达式要求 `rid=` / `text=` 前缀。这里按可点项
+    #   **反查**它是 rid 还是文字，补上前缀再交给解析器 ——
+    #   不让模型去记表达式语法（它记不住，也不该记）。
+    tgt = str(target or "").strip()
+    if "=" not in tgt.split("#")[0]:
+        base = tgt.split("#")[0].strip()
+        rid_hit = any(
+            str((n or {}).get("r") or (n or {}).get("rid") or "").strip() == base
+            for n in clickable if isinstance(n, dict))
+        tgt = f"rid={tgt}" if rid_hit else f"text={tgt}"
+
+    try:
+        x, y, how = _resolve_strong_target(tgt, {"obs_clickable": clickable})
+    except Exception as exc:  # noqa: BLE001
+        return None, None, str(exc)
+    return x, y, how
 
 
 def _drive(app, inp, cfg, calls: dict[str, dict[str, float]],
@@ -311,23 +385,63 @@ def make_model_answer(*, skill_root: str = DEFAULT_SKILL,
             #     不抛异常、不中断用例 —— 其余断言照跑，报告照写。
             #   · unknown 不等于 PASS 也不等于 FAIL，报告里如实体现，
             #     由主 Agent 决定是否重跑。**绝不猜成 PASS**（那才是真危险）。
+            # ★ image 必须传下去（用户："我们已经提供了视觉模型"）。
+            #
+            #   之前这里只传 knowledge_text，`assert_step` 的 image 形参
+            #   一直是 None —— 断言成了**纯文本盲判**。
+            #   而 payload 的 question 里却写着"请对照截图…"，
+            #   等于让模型看一张没给它的图。
+            #
+            #   last_shot 是设备最新截图，一直在 payload 里躺着没用。
             try:
-                verdict = dc.assert_step(py, root, payload, knowledge_text=know)
+                verdict = dc.assert_step(py, root, payload,
+                                         knowledge_text=know,
+                                         image=payload.get("image") or None)
             except DecisionError as exc:
                 if emit:
                     emit(f"⚠️ 断言模型回复无法解析，本条记为 unknown（不中断用例）：{exc}")
+                # ★ 报错内容兜底。实测踩到：报告里 a4 的 error 是**空括号** `（）`，
+                #   什么信息都没有 —— 排查时完全无从下手（只知道"没判出来"）。
+                #   `str(exc)` 为空的情况确实存在（异常是用无参构造抛的），
+                #   那就至少把异常类型写出来，别留一个空串。
+                _emsg = str(exc).strip() or f"{type(exc).__name__}（异常消息为空）"
                 return {
                     "passed": None,          # None = 判不了，不是 False
-                    "actual": f"模型回复无法解析：{str(exc)[:200]}",
+                    "actual": f"模型回复无法解析：{_emsg[:200]}",
                     "evidence": "（格式错误，未做判定）",
                     "event_id": "",
                     "confidence": "low",
                     "unknown": True,
-                    "error": str(exc)[:400],
+                    "error": _emsg[:400],
+                }
+            except Exception as exc:  # noqa: BLE001
+                # ★ 断言阶段除了 DecisionError，还可能有别的异常
+                #   （读图失败、schema 校验、字段缺失……）。
+                #   原来它们会一路冒到顶层 -> exit=1 -> 整轮报告都没有。
+                #   一条断言的失败不该杀掉整条用例，记成未判定继续跑。
+                if emit:
+                    emit(f"⚠️ 断言阶段异常，本条记为 unknown：{exc}")
+                return {
+                    "passed": None,
+                    "actual": f"判定过程异常：{type(exc).__name__}: {str(exc)[:180]}",
+                    "evidence": "（异常，未做判定）",
+                    "event_id": "",
+                    "confidence": "low",
+                    "unknown": True,
+                    "error": f"{type(exc).__name__}: {str(exc)[:380]}",
                 }
             if emit:
                 emit(f"断言 {'通过' if verdict.get('passed') else '不通过'}"
                      f"（{verdict.get('confidence')}）：{verdict.get('evidence')}")
+            # ★ 这一轮是不是"代码判不成立 -> 交 AI 复核"的复核轮。
+            #
+            # payload 里带 code_verdict=False 就说明是复核轮（见 assert_node）。
+            # 打个标记传回去，assert_verdict_node 才知道该不该让 AI 的 PASS
+            # 覆盖代码的"没搜到"—— 覆盖只允许发生在复核轮，普通轮次里
+            # 代码说成立，模型说没那么回事，仍然以代码为准。
+            if payload.get("code_verdict") is False:
+                verdict["ai_recheck"] = True
+                verdict["code_why"] = payload.get("code_why") or ""
             return verdict
 
         raise DecisionError(f"未知的中断类型：{kind}")
@@ -348,6 +462,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
              device: Any = None,
              case_yaml_path: str | Path | None = None,
              writeback: bool = True,
+             yaml_out_dir: str | Path | None = None,
              yaml_warnings: list[str] | None = None,
              verbose: bool = True) -> SubagentReport:
     """跑一个 case，返回结构化报告。
@@ -366,6 +481,10 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         writeback: 是否回写。用例 PASS/FAIL 都会写 —— 因为"实际怎么走到的"
                 对两种结论都有价值；但 BLOCKED 不写（路径本身没走完，
                 写进去会把半截路径固化成"经验"）。
+        yaml_out_dir: 首次生成时 YAML 落哪个目录。默认 None = 用例库。
+                单测要传临时目录 —— 否则测试夹具会被当成真用例写进
+                用例库（实测污染过 3 份：A_三步链路 / branch_权限分支 /
+                permrec_授权留痕）。
         yaml_warnings: 加载用例 YAML 时**写了但没被采纳**的判据字段。
                 必须进报告 —— 只 print 到 stdout 等于没人知道。
                 扫描存量 8 个用例发现 14 种字段被丢弃（text_present /
@@ -415,12 +534,39 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         from ..report.scratch import tmp_dir
         root = tmp_dir()
     root.mkdir(parents=True, exist_ok=True)
-    db = root / f"child_{spec.case_id}.db"
-    report_path = root / f"report_{spec.case_id}.json"
-    log_path = root / f"run_{spec.case_id}.log"
+
+    # ★★ 一次运行 = 一个独立目录（用户要求）
+    #
+    #   tmp/runs/<uuid8>_<时间戳>/
+    #       report.json      报告
+    #       run.log          执行日志
+    #       clicks.jsonl     点击账本
+    #       child.db         checkpoint（跑完即可删，留着便于排查）
+    #       shots/step01/dump.xml + shot.png   每一步的现场
+    #
+    #   早先是平铺在 tmp/ 下、按 <case_id> 命名的：
+    #   report_167.json / run_167.log / clicks_167.jsonl ...
+    #   同一个用例跑两次就互相覆盖，库里的旧记录指向的是**新一次**的截图
+    #   （路径和文件名都对，看不出来）。现在每次运行天生隔离。
+    run_dir = root / "runs" / f"{_run_tag()}_{spec.case_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    db = run_dir / "child.db"
+    report_path = run_dir / "report.json"
+    log_path = run_dir / "run.log"
     log = _make_logger(log_path)
-    if report_path.exists():
-        report_path.unlink()
+
+    # ★★ 模型对话必须落盘（用户报「LLM的记录没有」）★★
+    #
+    # decide.py 里早就有 _llm_trace，把每轮提示词和模型回复原文打出来，
+    # 但它只在**设置了 LLM_TRACE_FILE 环境变量**时才写文件，
+    # 而这个变量从来没人设 —— 于是所有问答只进了 stdout，
+    # runs.llm_path 永远是空的，WebUI 上「模型对话」那个链接自然不出现。
+    #
+    # 这里由执行器自己指定落盘位置（本次运行目录内），
+    # 跑完把路径写进报告，WebUI 就能直接点开看每一轮问了什么、答了什么。
+    llm_path = run_dir / "llm.md"
+    os.environ["LLM_TRACE_FILE"] = str(llm_path)
 
     t0 = time.time()
 
@@ -436,9 +582,9 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     # 曾经复用 child_<case>.db + 固定 thread_id，重跑同一 case 会 resume 旧线程，
     # findings 累加（实测 steps_done 3 -> 15 -> 18 次次增长），结论完全失真。
     # checkpoint 是给"同一轮内中断恢复"用的，不是跨轮次累积用的。
-    if db.exists():
-        db.unlink()
-    for sidecar in root.glob(f"{db.name}-*"):     # sqlite wal/shm
+    # 现在 run_dir 每次都是全新的，这里天然不会命中；保留判断是为了
+    # workdir 被显式指到已有目录时也不会串味。
+    for sidecar in run_dir.glob(f"{db.name}-*"):     # sqlite wal/shm
         sidecar.unlink(missing_ok=True)
 
     python = sys.executable
@@ -452,26 +598,14 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     # ★ 点击账本：每次点击一条完整记录（控件 / 前后页面 / 耗时 / 画面变没变）。
     #   用户明确要求过"每一步点击了啥都要增加记录，好方便排查" ——
     #   只写坐标对人是没意义的，必须记清点到的是什么控件、点完变成了什么。
-    ledger_path = root / f"clicks_{spec.case_id}.jsonl"
-    if ledger_path.exists():
-        ledger_path.unlink()      # 每次运行重新记，别把上次的混进来
+    ledger_path = run_dir / "clicks.jsonl"
 
     dev = device if device is not None else DirectDevice(
         serial=serial,
-        # ★ 证据目录要**按运行隔离**，不能所有运行共用一个 shots/。
-        #
-        #   原来固定是 report_path.parent / "shots"，而 report_path 就叫
-        #   report_<case_id>.json —— 于是同一个用例每跑一次都往
-        #   tmp/shots/step03/、step04/ 里覆盖同一批文件名。
-        #   后果：库里 10 条 167 记录全都记着 tmp/shots/step04/shot.png，
-        #   而磁盘上那份是**最后一次**的，前面 9 条点开看到的是别的运行的图
-        #   （还看不出来，因为路径和文件名都对）。删除记录时也就没法判断
-        #   "这文件到底属于谁"，只能一律不删 —— 删除功能形同虚设。
-        #
-        #   现在每跑一次落一个 run_<时间戳>/ 子目录，各管各的。
-        #   旧数据不动：它们本来就共享，删的时候按"还被别人引用"保留。
-        evidence_dir=(Path(report_path).parent / "shots" / _run_tag()
-                      if report_path else None),
+        # ★ 证据目录就在本次运行的目录下：runs/<uuid>/shots/
+        #   目录天生按运行隔离，不用再套一层 run_<tag>/ 子目录，
+        #   也不会再出现"两次运行覆盖同一批文件名"。
+        evidence_dir=(run_dir / "shots"),
         ledger_path=ledger_path)
 
     if device is None:
@@ -643,6 +777,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         # 而不是"执行器崩溃、报告没写入"这种没法归因的结果。
         try:
             ans = answer_fn(payload)
+            ans = _attach_coords(ans, state, payload)
         except DecisionError as exc:
             log(f"           ⚠️ 模型回复无法解析：{str(exc)[:160]}")
             # ★★ 坐标不合法 ≠ 无路可走，**要给重试机会**。
@@ -651,7 +786,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
             # 而那一屏已经不存在这个坐标了。早先这里直接 give_up，
             # 于是**一个可修正的笔误毁掉整步**，s1/s2/s3 三步连挂。
             #
-            # 模型是能改的 —— 只要告诉它"这个坐标不在列表里，请重选"。
+            # 模型是能改的 —— 只要告诉它"这个目标不在列表里，请重选"。
             # 所以这里按"可重试"处理：同一轮内最多补偿 RETRY 次，
             # 把错误原文回灌给下一次调用（answer_fn 会带上 retry_hint）。
             # 超过次数仍不改正才放弃 —— 那时确实是模型理解不了。
@@ -659,24 +794,25 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                 retry_left = MAX_DECIDE_RETRIES - retries
                 if retry_left > 0:
                     retries += 1
-                    log(f"           -> 可修正，请模型重选坐标"
+                    log(f"           -> 可修正，请模型重选目标"
                         f"（剩 {retry_left - 1} 次机会）")
                     # 回灌错误：下一次调用把 hint 拼进 payload
                     payload = {
                         **payload,
                         "retry_hint": (
-                            f"你上一次给的坐标不合法：{str(exc)[:200]}\n"
-                            "**必须**从下面「当前可点项」里重新选一个坐标，"
-                            "不要用任何记忆里的旧坐标。"),
+                            f"你上一次的动作执行不了：{str(exc)[:200]}\n"
+                            "**必须**从下面「当前可点项」里重新选一个"
+                            "存在且唯一的目标名，不要凭记忆编控件。"),
                     }
                     try:
-                        ans = answer_fn(payload)
+                        ans = _attach_coords(answer_fn(payload), state, payload)
                         log("           -> 重试成功")
                     except DecisionError as exc2:
                         log(f"           ⚠️ 重试仍失败：{str(exc2)[:120]}")
                         ans = {"step_done": False, "give_up": True,
                                "give_up_reason":
-                                   f"连续 {retries} 次给出不合法坐标：{str(exc2)[:140]}"}
+                                   f"连续 {retries} 次给出无法执行的动作："
+                                   f"{str(exc2)[:140]}"}
                 else:
                     log("           -> 重试次数用尽，判 give_up 收尾（不猜坐标）")
                     ans = {"step_done": False, "give_up": True,
@@ -842,6 +978,11 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                     log(f"           -> 要查知识：{ans.get('need_knowledge')}")
                 elif ans.get("vision_question"):
                     log(f"           -> 要看图：{ans.get('vision_question')}")
+                elif ans.get("tap_target"):
+                    # 走到这里说明 tap_target 没被解析成坐标
+                    # （_attach_coords 正常时不会发生）。必须单独说，
+                    # 否则又是一句骗人的"无动作"。
+                    log(f"           -> 目标未解析：{ans.get('tap_target')}")
                 else:
                     log(f"           -> 无动作（模型既没给坐标、也没给"
                         f"输入/按键/知识/看图/完成）：{ans}")
@@ -862,9 +1003,37 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     if report_path.exists():
         report = SubagentReport(**json.loads(report_path.read_text(encoding="utf-8")))
     else:
+        # ⚠️ 报告文件没有，但**不等于"执行异常"**。
+        #
+        # 实测：176 跑到 max_loops 上限被强制收尾，finish 节点没来得及写文件，
+        # 于是报告写成「未产出报告（执行异常）」，steps_done=0、issues 空 ——
+        # 真正的原因（哪一步没收敛、点了几次什么）**一个字都没留下**，
+        # 只能回去翻 stderr 日志。那句话是排查的第一现场，不能说错方向。
+        _why = (
+            f"达到轮次上限 {max_loops}（共 {loops} 轮），强制收尾时未写出报告"
+            if loops >= max_loops
+            else "执行过程中没有写出报告文件（finish 节点未完成）"
+        )
         report = SubagentReport(
             case_id=spec.case_id, status="BLOCKED",
-            summary="未产出报告（执行异常）", session_id=sid)
+            summary=_why, session_id=sid)
+
+    # 产物目录随报告出去 —— 落库时用它把"这一次"的截图/XML/日志对上号。
+    report.run_dir = str(run_dir)
+    # 模型对话文件：有内容才记路径（空文件等于没记，别给个坏链接）。
+    try:
+        if llm_path.is_file() and llm_path.stat().st_size > 0:
+            report.llm_path = str(llm_path)
+    except OSError:
+        pass
+    # 崩溃日志：设备层在 observe 时顺带抓的。没有就留空。
+    try:
+        _crash = str(getattr(dev, "crash_log", "") or "")
+    except Exception:  # noqa: BLE001
+        _crash = ""
+    if _crash:
+        report.crash_log = _crash
+        log("⚠️ 检测到崩溃，已抓 logcat（见报告 crash_log / crash.txt）")
 
     # ── 未采纳的判据字段：必须进报告 ──────────────────────────────
     #
@@ -886,45 +1055,27 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                 if len(_unused) > 8:
                     log(f"     … 另有 {len(_unused) - 8} 条，见报告")
 
-    # ── 回写 YAML：把这次**实际走的路径**沉淀回去 ──────────────────
+    # ── 回写 YAML ──────────────────────────────────────────────────
     #
-    # 用户要求（原话）：
-    #   「用我们的工具完成后要生成或者把旧的YAML不合理的修改。」
-    #   「如果这个Case 第一次跑完了会生成YAML。」
+    # ★★ 已停用（用户要求做减法）★★
     #
-    # 两种情况分开处理：
-    #   · 本来就有 YAML -> 回写（只改和实际不一致的地方）
-    #   · 本来没有 YAML -> **首次生成**（这是这次跑出来的唯一成果，值得沉淀）
+    # 用户原话：
+    #   「删除所有的YAML文件。我感觉YAML现在反而给AI造成了困扰」
     #
-    # 只在 PASS/FAIL 时写：
-    #   PASS/FAIL = 路径走完了，实际怎么走到的有参考价值
-    #   BLOCKED = 路径没走完，写进去会把半截路径固化成"经验"
+    # 为什么停：
+    #   · 生成出来的 YAML 判据经常是空的/错的（断言只剩 desc、
+    #     凭空多出 targets_tried、落点写错），下一次跑反而被它带偏；
+    #   · 用例的**唯一事实来源是库里的原始文本**（cases.raw_text），
+    #     每次现场拆步骤更准，也不会出现"文件里的和经验里的不一致"；
+    #   · 少一层同步，就少一层"删了又长回来"的困惑。
     #
-    # 失败不影响结论 —— 回写/生成是附带产物，不该让一次成功的执行变 BLOCKED。
-    if writeback and not case_yaml_path and report.status in ("PASS", "FAIL"):
-        # ★ 首次生成：这次跑之前没有 YAML，跑完了就把它沉淀下来。
-        try:
-            from ..report import generate as ygen
-            _out = Path(workdir or ".") / f"{spec.case_id}.yaml"
-            if not _out.parent.exists():
-                from ..cases.paths import cases_dir
-                _out = cases_dir() / f"{spec.case_id}.yaml"
-            ygen.write_case_yaml(
-                spec, _out,
-                trace=report.action_trace or [],
-                pitfalls=getattr(report, "pitfalls", None),
-                status=report.status)
-            report.yaml_writeback = {"generated": str(_out),
-                                     "path": str(_out)}
-            if verbose:
-                log("")
-                log(f"📝 首次执行完成，已生成用例 YAML：{_out.name}")
-                log("   （只记结构与判据，不含任何坐标）")
-        except Exception as exc:  # noqa: BLE001
-            report.yaml_writeback = {"generated": "", "error": str(exc)}
-            if verbose:
-                log(f"⚠️ 生成 YAML 失败（不影响本次结论）：{exc}")
-
+    # 现在只保留回写能力给"显式给了 case_yaml_path"的调用（兼容旧入口），
+    # 不再**自动生成**新文件。
+    if writeback and not case_yaml_path:
+        report.yaml_writeback = {
+            "generated": "",
+            "note": "已停用 YAML 自动生成（按用户要求做减法），本次不产出 YAML",
+        }
     elif writeback and case_yaml_path:
         try:
             from ..report import writeback as ywb
@@ -1068,6 +1219,24 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         conn.close()
     except Exception:  # noqa: BLE001
         pass
+
+    # ★ 跑完把 checkpoint 库删掉（用户问过「每个记录下都有个 child.db 这个是干哈的」）。
+    #
+    # 它是 **LangGraph 的运行时状态库**，不是业务数据：
+    #   checkpoints 表 = 每轮中断/恢复存一份完整 state 快照
+    #   writes      表 = 每一次写操作的增量
+    # 一次正常跑就会有 150 / 891 行，撑到 8~13MB —— 而它对**看结果毫无用处**
+    # （结果都在 report.json / run.log / clicks.jsonl / shots 里）。
+    #
+    # 它唯一的价值是"同一轮内崩了能接着跑"，跑完就没有意义了。
+    # 留着只会让每次运行目录里多一个大而无用的文件。
+    for _p in (db, Path(str(db) + "-shm"), Path(str(db) + "-wal")):
+        try:
+            if _p.exists():
+                _p.unlink()
+        except OSError:
+            pass
+
     return report
 
 

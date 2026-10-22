@@ -506,33 +506,35 @@ const apply = (ctx) => {
         }
 
         // ★ 两条路：跑沉淀好的 YAML（推荐），或跑现场拆的步骤。
-        // 走 YAML 时 steps/asserts/package 都由加载器从文件读，
-        // 这里就不传 —— 传了反而会和 YAML 打架。
-        const spec = args.case_name
-          ? {
-              case_name: args.case_name,
-              serial: args.serial ?? null,
-              perm_action: args.perm_action ?? null,
-              answer: args.answer ?? "model",
-              // 只有走 YAML 时才可能回写（有真实文件）。传 false 可只跑不改。
-              writeback: args.writeback ?? true,
-              skill_root: SKILL_ROOT,
-              diag: true,
-            }
-          : {
-              case_id: args.case_id,
-              title: args.title,
-              package: args.package,
-              steps: args.steps,
-              asserts: args.asserts,
-              preconditions: args.preconditions ?? [],
-              knowledge_files: args.knowledge_files ?? [],
-              serial: args.serial ?? null,
-              perm_action: args.perm_action ?? null,
-              answer: args.answer ?? "model",
-              skill_root: SKILL_ROOT,
-              diag: true,
-            };
+        // 走 YAML 时 steps/asserts/package 都由加载器从文件读。
+        //
+        // ⚠️ 但 **case_name 找不到 YAML 时不能直接死掉** ——
+        //   首次跑一条还没沉淀的用例是正常场景，跑完 runner 会自动生成 YAML
+        //   （见 runner.py 的「首次生成」分支）。
+        //   以前这里一报 FileNotFoundError 就整个 BLOCKED，于是形成死循环：
+        //   没 YAML 不能跑 -> 跑完才会生成 YAML -> 永远跑不起来。
+        //   现在把 steps/asserts 一并传下去，后端在找不到文件时**回退**用它们跑。
+        const spec = {
+          ...(args.case_name ? { case_name: args.case_name } : {}),
+          // 只传真给了的，没给就不传 —— 从 YAML 读的时候这些是空的，
+          // 传空值会盖掉加载器读出来的内容。
+          ...(args.case_id ? { case_id: args.case_id } : {}),
+          ...(args.title ? { title: args.title } : {}),
+          ...(args.package ? { package: args.package } : {}),
+          ...(args.steps ? { steps: args.steps } : {}),
+          ...(args.asserts ? { asserts: args.asserts } : {}),
+          ...(args.preconditions ? { preconditions: args.preconditions } : {}),
+          ...(args.knowledge_files
+            ? { knowledge_files: args.knowledge_files }
+            : {}),
+          serial: args.serial ?? null,
+          perm_action: args.perm_action ?? null,
+          answer: args.answer ?? "model",
+          skill_root: SKILL_ROOT,
+          diag: true,
+          // 有 YAML 就回写，没有就"首次生成"——两种都由后端按有没有文件分流。
+          writeback: args.writeback ?? true,
+        };
 
         // ★★ 一条用例只允许一个子 Agent 在跑。
         //

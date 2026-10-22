@@ -85,13 +85,17 @@ _TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "tap",
             "description": (
-                "点屏幕上**一个控件**。x/y 必须取自「当前可点项」列表里的 c 值，"
-                "不要用记忆里的旧坐标、也不要自己算。"),
+                "点屏幕上**一个控件**。只要说清点哪个（名字/rid），"
+                "不要给坐标 —— 元素在哪由执行器自己从观察结果解析。"),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "x": {"type": "integer", "description": "x 坐标，取自可点项列表"},
-                    "y": {"type": "integer", "description": "y 坐标，取自可点项列表"},
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "要点的控件名（rid 或文字，从「当前可点项」原样抄）。"
+                            "同名多个时用 `名字#序号`，如 cv_empty_content#1"),
+                    },
                     "why": {"type": "string", "description": "为什么点它"},
                     "is_dialog": {
                         "type": "boolean",
@@ -107,7 +111,7 @@ _TOOLS: list[dict[str, Any]] = [
                     "permission_name": {"type": "string", "description": "如 存储/相机/位置"},
                     "permission_decision": {"type": "string", "description": "allow / deny"},
                 },
-                "required": ["x", "y", "why"],
+                "required": ["target", "why"],
             },
         },
     },
@@ -271,11 +275,13 @@ def tool_call_to_action(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"step_done": True, "why": why or "模型判定本步完成"}
 
     if name == "tap":
-        out = {
-            "step_done": False,
-            "next_x": a.get("x"), "next_y": a.get("y"),
-            "why": why,
-        }
+        # 模型给**语义目标**，不给坐标。
+        # tap_target 由 act 节点用 _resolve_strong_target 解析成 (x,y)。
+        # 没有 target 就是格式错误 —— 不猜坐标，也不接受旧的 x/y 写法。
+        tgt = str(a.get("target") or "").strip()
+        if not tgt:
+            raise ValueError("tap 必须给 target（要点的控件名/rid）")
+        out = {"step_done": False, "why": why, "tap_target": tgt}
         for k in ("is_dialog", "dialog_text", "grants_permission",
                   "permission_name", "permission_decision"):
             if k in a and a[k] not in (None, ""):
