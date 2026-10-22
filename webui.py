@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""本地 WebUI：看用例执行结果、账本、截图证据、自动化率。
+"""本地 WebUI：看用例执行结果、账本、截图证据、AI 判读率。
 
 ## 为什么自己写，而不是把旧 skill 的 webui.py 搬过来
 
@@ -116,33 +116,6 @@ def _save_vision(conf: dict[str, str]) -> None:
 
 # ── 用例文件 ──────────────────────────────────────────────────────────
 
-def _case_files() -> list[dict]:
-    """assets/storage/cases/*.yaml 的清单。
-
-    ⚠️ 故意**不解析**每个文件来取标题：解析要跑 YAML + pydantic 校验，
-    10 个文件还行，以后多了就慢。文件名本身就带用例名和编号。
-    case_id 从文件名前缀抠（"联想日历_168_图库导入入口" -> "168"）。
-    """
-    out = []
-    d = Path(_cases_dir())
-    if not d.is_dir():
-        return out
-    for fp in sorted(d.glob("*.yaml")):
-        name = fp.stem
-        cid = ""
-        for seg in name.split("_"):
-            if seg.isdigit():
-                cid = seg
-                break
-        out.append({
-            "name": fp.name,
-            "title": name,
-            "case_id": cid,
-            "size": fp.stat().st_size,
-            "mtime": _fmt_mtime(fp.stat().st_mtime),
-            "valid": "invalid" not in name.lower(),
-        })
-    return out
 
 
 def _fmt_mtime(ts: float) -> str:
@@ -150,13 +123,6 @@ def _fmt_mtime(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _find_case_file(name: str) -> Path | None:
-    """按文件名找用例。**只允许 cases 目录内**，防路径穿越。"""
-    root = Path(_cases_dir()).resolve()
-    cand = (root / name).resolve()
-    if not str(cand).startswith(str(root)) or not cand.is_file():
-        return None
-    return cand
 
 
 def _case_key(name: str) -> str:
@@ -185,17 +151,12 @@ def _cases_payload() -> dict:
 
     items = []
     for c in rows:
-        yname = c.get("yaml_name") or ""
         run = by_case.get(str(c["case_key"]), {})
-        ypath = cdir / yname if yname else None
         items.append({
             "case_key": c["case_key"],
             "title": c.get("title") or "",
             "priority": c.get("priority") or "",
             "raw_chars": len(c.get("raw_text") or ""),
-            "yaml_name": yname,
-            "yaml_exists": bool(ypath and ypath.is_file()),
-            "yaml_size": (ypath.stat().st_size if ypath and ypath.is_file() else 0),
             "runs": run.get("n") or 0,
             "last_status": run.get("last_status") or "",
             "last_at": run.get("last_at") or "",
@@ -203,45 +164,29 @@ def _cases_payload() -> dict:
             "updated_at": c.get("updated_at") or "",
         })
 
-    # 目录里有、但库里没关联上的 YAML（比如 _test_invalid 那种夹具，
-    # 或者编号没对上的）。**列出来而不是藏起来** —— 否则页面上
-    # "看不到这个文件"和"这个文件不存在"分不清。
-    known = {i["yaml_name"] for i in items if i["yaml_name"]}
-    orphans = []
-    if cdir.is_dir():
-        for f in sorted(cdir.glob("*.yaml")):
-            if f.name in known:
-                continue
-            orphans.append({"name": f.name,
-                            "size": f.stat().st_size,
-                            "mtime": _fmt_mtime(f.stat().st_mtime)})
-
     return {
         "items": items,
         "dir": str(cdir),
         "raw_dirs": [str(p) for p in raw_case_dirs()],
-        "orphan_yaml": orphans,
         "total": len(items),
-        "with_yaml": sum(1 for i in items if i["yaml_exists"]),
     }
 
 
 def _case_detail(key: str) -> dict | None:
-    """单条用例：原文 + 关联的 YAML 全文 + 这条用例的历史运行。"""
+    """单条用例：原文 + 这条用例的历史运行 + **回写的用例 JSON**。
+
+    ⚠️ 原本还返回关联的 YAML 全文，YAML 已整体删除。
+
+    用户：「webui 用例库每条用例关联下生成的 JSON 文件。格式好点。」
+
+    所以这里多返回一个 `learned`：最新一次运行回写的 case_learned.json。
+    这份 JSON 是"跑完自己总结出来的、下次能直接拿去跑的用例"——
+    它把原文三步 + 稳定控件(target) + 固定前置(setup)揉在一起，
+    是人最该看的东西。只放最新一份，历史版本在 runs 里各自留着。
+    """
     c = st.get_case(key)
     if not c:
         return None
-    cdir = Path(_cases_dir())
-    yname = c.get("yaml_name") or ""
-    ypath = cdir / yname if yname else None
-    yaml = {"name": "", "path": "", "content": "", "size": 0, "exists": False}
-    if ypath and ypath.is_file():
-        try:
-            content = ypath.read_text(encoding="utf-8")
-        except OSError as e:
-            content = f"(读不出来：{e})"
-        yaml = {"name": ypath.name, "path": str(ypath), "content": content,
-                "size": ypath.stat().st_size, "exists": True}
 
     runs = st.list_runs(case_name=str(c["case_key"])) if c["case_key"] else []
     return {
@@ -251,9 +196,75 @@ def _case_detail(key: str) -> dict | None:
         "raw_text": c.get("raw_text") or "",
         "source_path": c.get("source_path") or "",
         "updated_at": c.get("updated_at") or "",
-        "yaml": yaml,
         "runs": runs,
+        "learned": _latest_learned(runs),
     }
+
+
+def _learned_path(run_id: str) -> Path | None:
+    """某次运行的 case_learned.json 路径；没有就 None。
+
+    ⚠️ 必须校验 run_id 来自数据库、且文件确实落在那个 run 目录里 ——
+       不然 /api/learned/../../etc/passwd 就成了一条任意文件读取。
+       这里用 run_id 查库拿 run_dir，再拼固定文件名，两头都不接受用户输入。
+    """
+    try:
+        rid = int(str(run_id).strip())
+    except (TypeError, ValueError):
+        return None
+    # 直接从库里按主键取，不用 list_runs —— 那个默认只回 100 条，
+    # 老运行的 JSON 会查不到，而且没必要把整张表拉出来。
+    import sqlite3
+    try:
+        con = sqlite3.connect(str(st.db_path()))
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT run_dir FROM runs WHERE run_id=?", (rid,)).fetchone()
+        con.close()
+    except sqlite3.Error:
+        return None
+    rd = str((row["run_dir"] if row else "") or "")
+    if not rd:
+        return None
+    p = Path(rd) / "case_learned.json"
+    return p if p.exists() else None
+
+
+def _latest_learned(runs: list[dict]) -> dict | None:
+    """从最近几次运行里找到最新的 case_learned.json。
+
+    返回 {"run_id", "run_dir", "path", "json"} —— 找不到就 None。
+
+    ## 为什么要从新往旧找
+
+    早期运行可能根本没生成（那次没到 learn 阶段），或者被清掉了。
+    最近的那份才是"现在的知识"，所以倒序找第一份存在的。
+
+    ## 为什么要相对路径
+
+    前端只能通过 /api/file/<run_id>/... 读文件，不能直接读磁盘。
+    这里顺手给出可用 URL，前端不用自己拼。
+    """
+    for r in runs or []:
+        rd = str(r.get("run_dir") or "")
+        if not rd:
+            continue
+        p = Path(rd) / "case_learned.json"
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        return {
+            "run_id": r.get("run_id"),
+            "run_dir": rd,
+            "status": r.get("status") or "",
+            "finished_at": r.get("finished_at") or "",
+            "url": f"/api/learned/{r.get('run_id')}",
+            "json": data,
+        }
+    return None
 
 
 def _safe_under(path: Path, roots: list[Path]) -> bool:
@@ -613,19 +624,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(f"没有这个用例：{key}", 404)
             return self._json(one)
 
-        # 单个 YAML 原文（用例详情里已经并进去了，这个留着给外部/测试用）
-        if path.startswith("/api/case/"):
-            name = path[len("/api/case/"):]
-            fp = _find_case_file(name)
-            if not fp:
-                return self._err(f"没有这个用例文件：{name}", 404)
+        # 某次运行回写的用例 JSON（前端"下载/查看"用）
+        if path.startswith("/api/learned/"):
+            rid = path[len("/api/learned/"):]
+            p = _learned_path(rid)
+            if not p:
+                return self._err(f"这次运行没有回写 JSON：{rid}", 404)
             try:
-                content = fp.read_text(encoding="utf-8")
-            except OSError as e:
-                return self._err(f"读不出来：{e}", 500)
-            return self._json({"name": fp.name, "path": str(fp),
-                               "content": content,
-                               "size": fp.stat().st_size})
+                return self._json(json.loads(p.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError) as exc:
+                return self._err(f"读不出来：{exc}", 500)
 
         # --- 视觉模型配置 ---
         if path == "/api/vision":
@@ -934,22 +942,6 @@ class Handler(BaseHTTPRequestHandler):
             runs_before = st.list_runs(case_name=str(key), limit=1000)
             ids_before = [r["run_id"] for r in runs_before]
 
-            deleted_file = ""
-            yname = c.get("yaml_name") or ""
-            if yname and str(qs.get("yaml", ["1"])[0]) not in ("0", "false"):
-                fp = _find_case_file(yname)
-                if fp and fp.is_file():
-                    try:
-                        fp.unlink()
-                        deleted_file = fp.name
-                    except OSError as e:
-                        # ★ 文件删不掉就**不删库里的行**。
-                        #   反过来做的话，页面上用例没了、磁盘上文件还在，
-                        #   而库里再没有任何线索指向它 —— 成了孤儿文件。
-                        return self._err(
-                            f"YAML 删不掉（{e.strerror or e}），"
-                            "为免留下孤儿文件，这次没有删任何东西", 500)
-
             n = st.delete_case(key)
 
             # ★ 自检：删完之后把同样的记录再查一遍，逐条核对还在、内容没变。
@@ -962,26 +954,11 @@ class Handler(BaseHTTPRequestHandler):
                            r.get("status") for r in runs_before if r["run_id"] == i)]
             return self._json({
                 "ok": True, "case_key": key,
-                "deleted": n, "deleted_yaml": deleted_file,
+                "deleted": n,
                 "runs_kept": len(ids_before),
                 "runs_lost": lost,
                 "runs_changed": changed,
             })
-
-        # --- 只删 YAML、保留用例行（拆掉关联）---
-        if path.startswith("/api/case/"):
-            name = path[len("/api/case/"):]
-            fp = _find_case_file(name)
-            if not fp or not fp.is_file():
-                return self._err(f"没有这个用例文件：{name}", 404)
-            try:
-                fp.unlink()
-            except OSError as e:
-                return self._err(f"删不掉：{e.strerror or e}", 500)
-            key = st.case_number(name)
-            st.set_case_yaml(key, None)
-            return self._json({"ok": True, "case_key": key,
-                               "deleted_yaml": fp.name})
 
         return self._err("没有这个接口", 404)
 
@@ -1075,7 +1052,7 @@ def main() -> int:
         if not st.list_cases():
             _imp = importer.import_all()
             say(f"用例库: 已从文件夹导入 {_imp['files']} 条"
-                f"（关联 YAML {_imp['linked']} 个）")
+                f"（用例 {_imp.get('created', 0)} 条）")
             for _d in _imp["scanned_dirs"]:
                 say(f"  扫描: {_d}")
         else:

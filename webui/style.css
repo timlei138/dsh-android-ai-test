@@ -116,7 +116,7 @@ tr.clickable:hover{background:#fafcff; cursor:pointer}
 .chg.y{background:var(--pass-bg); color:var(--pass)}
 .chg.n{background:#f1f3f5; color:var(--dim)}
 
-/* ---------- 自动化率 ---------- */
+/* ---------- AI 判读率 ---------- */
 .ratebar{height:8px; border-radius:6px; background:#e9edf2; overflow:hidden;
   display:flex; margin:8px 0 4px; max-width:420px}
 .ratebar .code{background:var(--accent)}

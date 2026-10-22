@@ -3,13 +3,56 @@
  * 三个视图：
  *   dashboard  总览：各状态数量、每个用例最近一次结果、最近运行
  *   runs       运行记录：历次运行列表（这是"历史不再覆盖"的直接体现）
- *   run/<id>   单次详情：断言 / 账本时间轴 / 截图证据 / 自动化率 / 原始日志
+ *   run/<id>   单次详情：断言 / 账本时间轴 / 截图证据 / AI 判读率 / 原始日志
  *
  * 数据全部来自 webui.py 的 /api/*，字段名和 reporting/store.py 的列一一对应。 */
 
 const $ = (s, r = document) => r.querySelector(s);
 const main = $('#main');
 let STATE = { view: 'dashboard', case: '' };
+
+/* AI 判读率 —— 这次运行里"决定点哪"有多少次交给了模型。
+ *
+ * ## 为什么用这个指标而不是"自动化率"
+ *
+ * 用户：「把 webui 所有的自动化率改成 AI 判读率。」
+ *
+ * 对。执行器本来就是全自动跑的，"自动化率"这个词会让人以为在衡量
+ * "整个测试自动化到什么程度"；而这里真正衡量的只有一件事：
+ * **每次点击是代码算出来的，还是问了 AI**。
+ *
+ * ## 数据来源（必须准确）
+ *
+ * runs 表里的 by_code / by_model 是**点击次数**，不是步数：
+ *   by_code  —— 代码自己决定并点掉的（强证据 / setup 记忆 / 自动授权）
+ *   by_model —— 代码定不了、交给模型的
+ *
+ * 所以：
+ *   分母 = by_code + by_model  （全部点击）
+ *   分子 = by_model            （其中问过 AI 的）
+ *   判读率 = by_model / (by_code + by_model)
+ *
+ * ⚠️ 和 auto_rate 的关系：auto_rate = by_code / 总数，所以
+ *    判读率 = 1 - auto_rate。两者互补，但**这里直接从原始计数算**，
+ *    不用 1-auto_rate，避免库里老数据口径不同时算出"看着合理其实错"的数。
+ *
+ * 没有统计数据（by_code/by_model 都是 null）时返回 null，显示 "—"，
+ * 不显示 0% —— "一次点击都没有"和"全是代码点的"是两回事。
+ */
+function aiRate(r) {
+  const code = Number(r.by_code);
+  const model = Number(r.by_model);
+  if (r.by_code == null && r.by_model == null) return null;
+  const tot = (Number.isFinite(code) ? code : 0) + (Number.isFinite(model) ? model : 0);
+  if (!tot) return null;
+  return (Number.isFinite(model) ? model : 0) / tot;
+}
+
+/* 渲染成 "45%" / "—" */
+function aiRateText(r) {
+  const v = aiRate(r);
+  return v == null ? '—' : Math.round(v * 100) + '%';
+}
 
 /* ---------- 小工具 ---------- */
 const esc = (s) => String(s == null ? '' : s)
@@ -302,13 +345,13 @@ async function viewDashboard() {
            title="去运行记录看全部">更多 →</a>` : ''}
       </div>
       <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>耗时</th>
-        <th>自动化率</th><th>开始时间</th></tr></thead>
+        <th>AI 判读率</th><th>开始时间</th></tr></thead>
       <tbody>${(s.recent || []).slice(0, TOP_N).map((r) => `<tr class="clickable" data-run="${r.run_id}">
         <td class="mono">#${r.run_id}</td>
         <td class="mono">${esc(r.case_name)}</td>
         <td>${badge(r.status)}</td>
         <td>${fmtDur(r.elapsed_s)}</td>
-        <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
+        <td>${aiRateText(r)}</td>
         <td>${esc(r.started_at || '')}</td>
       </tr>`).join('') || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody></table>
     </div>`;
@@ -338,45 +381,36 @@ async function viewCases() {
   const j = await api('/api/cases');
   const items = j.items || [];
 
-  // 筛选：默认全部。用例多起来之后，"只看有 YAML 的"是最常用的一个。
+  // 筛选：默认全部。
   const f = STATE.filter || 'all';
-  const shown = items.filter((c) => (f === 'yaml' ? c.yaml_exists
-    : f === 'noyaml' ? !c.yaml_exists
-      : f === 'run' ? c.runs > 0 : true));
+  const shown = items.filter((c) => (f === 'run' ? c.runs > 0 : true));
 
   const rows = shown.map((c) => `<tr class="clickable" data-casekey="${esc(c.case_key)}">
       <td class="mono">${esc(c.case_key)}</td>
       <td>${esc(c.title || '（未命名）')}
         ${c.priority ? `<span class="prio">${esc(c.priority)}</span>` : ''}</td>
-      <td>${c.yaml_exists
-        ? `<span class="raw-yes">✓ 已拆解</span>`
-        : '<span class="raw-no">未拆解</span>'}</td>
       <td style="white-space:nowrap">
         <button class="danger sm" data-delcase="${esc(c.case_key)}"
-          title="删除这条用例（原始 case 和关联的 YAML）">删除</button>
+          title="删除这条用例">删除</button>
       </td>
     </tr>`).join('');
 
   const tab = (k, label, n) => `<button class="tab ${f === k ? 'on' : ''}"
     data-filter="${k}">${label}<span class="n">${n}</span></button>`;
-  const nYaml = items.filter((c) => c.yaml_exists).length;
   const nRun = items.filter((c) => c.runs > 0).length;
 
   main.innerHTML = `<h1>用例库</h1>
     <div class="sub">
-      共 <b>${items.length}</b> 条 · 已拆解 YAML <b>${nYaml}</b> 条 ·
-      跑过 <b>${nRun}</b> 条
+      共 <b>${items.length}</b> 条 · 跑过 <b>${nRun}</b> 条
     </div>
     <div class="tabs">
       ${tab('all', '全部', items.length)}
-      ${tab('yaml', '已拆解', nYaml)}
-      ${tab('noyaml', '未拆解', items.length - nYaml)}
       ${tab('run', '跑过', nRun)}
       <span style="flex:1"></span>
       <button class="ghost sm" id="case-new" title="直接在库里新建一条用例">新建用例</button>
     </div>
-    <table><thead><tr><th>编号</th><th>用例</th><th>YAML</th><th></th></tr></thead>
-    <tbody>${rows || `<tr><td colspan="4" class="empty">这个筛选下没有用例</td></tr>`}</tbody></table>`;
+    <table><thead><tr><th>编号</th><th>用例</th><th></th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="3" class="empty">这个筛选下没有用例</td></tr>`}</tbody></table>`;
 
   // ★ 不再显示"有 N 个 YAML 没对上用例编号"。
   //   那类文件（_test_invalid.yaml）是给校验器/AI 当样本用的，
@@ -443,8 +477,7 @@ async function viewCases() {
 /* 删除用例：原始 case 和 YAML 一起删，**历史记录保留**
  *
  * 为什么不连坐删历史：
- *   历史记录里存了 case_yaml 快照，是"当时那份判据"的唯一副本。
- *   用例删了，快照还在 —— 那条记录仍然可复核。
+ *   用例删了，历史记录仍然可复核。
  *   连坐删掉等于把证据一起销毁了。
  *   （旧 skill 是连坐的，这条刻意不学。）
  */
@@ -453,15 +486,12 @@ async function confirmDeleteCase(key) {
   try { d = await api('/api/cases/' + encodeURIComponent(key)); }
   catch (e) { toast('读不到这条用例：' + e.message); return; }
 
-  const hasYaml = d.yaml && d.yaml.exists;
   const nRuns = (d.runs || []).length;
   const m = modal('删除用例', `
     <div class="warn-text">确定删除用例 <b>${esc(key)}</b>
       ${d.title ? '「' + esc(d.title) + '」' : ''} 吗？</div>
     <div class="meta">将删除：<br>
       · 原始 case 原文（${(d.raw_text || '').length} 字）<br>
-      ${hasYaml ? `· 关联的 YAML <span class="mono">${esc(d.yaml.name)}</span><br>`
-    : '<span style="color:var(--dim)">· 这条还没有 YAML，无需删文件</span><br>'}
       <br>
       <b class="noimpact">${nRuns
     ? `${nRuns} 条已跑过的记录完全不受影响`
@@ -469,11 +499,10 @@ async function confirmDeleteCase(key) {
       ${nRuns ? `<br>
       · 记录本身、断言结果、动作账本 —— 一条不删<br>
       · 日志 / 点击账本 / 截图 / dump.xml —— 一个文件不动<br>
-      · 每条记录里存着<b>跑的时候那份 YAML 快照</b>，判据仍然可复核<br>
       <span style="color:var(--dim)">删完打开这些记录，看到的内容和现在一模一样。</span>` : ''}
       <br>
       <span style="color:var(--dim)">要清理这些记录，请到「测试记录」里逐条删（那会问你要不要连截图一起删）。</span><br>
-      <b class="danger-text">用例原文和 YAML 文件不可恢复。</b></div>`,
+      <b class="danger-text">用例原文不可恢复。</b></div>`,
     `<button class="ghost" data-cancel>取消</button>
      <button class="danger solid" data-ok>确认删除</button>`);
   m.el.querySelector('[data-cancel]').addEventListener('click', m.close);
@@ -492,7 +521,6 @@ async function confirmDeleteCase(key) {
           + `内容变化 ${(r.runs_changed || []).length} 条 —— 请立刻检查！`);
       } else {
         toast(`已删除用例 ${key}`
-          + (r.deleted_yaml ? '，含 YAML 文件' : '')
           + (r.runs_kept ? `；${r.runs_kept} 条历史记录不受影响` : ''));
       }
       // 删完回列表。用 replace 不记历史 —— 那条用例已经不在了，
@@ -522,9 +550,102 @@ async function confirmDeleteCase(key) {
  *   在网页上随手改一改，旧记录就会变成"新判据配旧结论"，等于自欺。
  *   原始 case 可以改 —— 它是需求记录，不是判据。
  */
+/* ---------- 用例 JSON 的展示 ----------
+ *
+ * 用户：「webui 用例库每条用例关联下生成的 JSON 文件。格式好点。」
+ *
+ * "格式好点" = 不要甩一坨 JSON 给用户看，要让人一眼看出：
+ *   · 哪些动作下次会由代码直接点（target）
+ *   · 哪些固定前置被记住了（setup）
+ *   · 哪些步骤还得问 AI（没 target 的）
+ *
+ * 所以这里做三块：
+ *   ① 概要 —— 几个数字，判断这条用例"成熟"到什么程度
+ *   ② 结构表 —— 每一步一行：动作 / 定位方式 / 谁来执行
+ *   ③ 原文 JSON —— 可折叠，需要复制时再展开
+ */
+function learnedHtml(L) {
+  if (!L) {
+    return `<div class="kb-bar" style="margin:22px 0 10px"><b>生成的用例 JSON</b></div>
+      <div class="hint">还没跑过，所以还没有生成的 JSON。
+        跑一次之后，执行器会把「实际怎么点的、哪些控件能稳定定位」回写成一份可复用的用例。</div>`;
+  }
+  const j = L.json || {};
+  const steps = j.steps || [];
+  const setup = j.setup || [];
+
+  // 代码能直点 = 有 target 的步骤。这是"成熟度"最直接的度量。
+  const withTarget = steps.filter((s) => s.target).length;
+  const total = steps.length;
+
+  // ① 概要
+  const summary = `<div class="cards">
+    <div class="card"><div class="n">${total}</div><div class="l">步骤</div></div>
+    <div class="card"><div class="n">${withTarget}</div>
+      <div class="l">代码可直点</div></div>
+    <div class="card"><div class="n">${setup.length}</div>
+      <div class="l">固定前置</div></div>
+    <div class="card"><div class="n">${(j.asserts || []).length}</div>
+      <div class="l">断言</div></div>
+  </div>`;
+
+  // ② 固定前置：每次跑之前会自动点掉的
+  const setupHtml = setup.length
+    ? `<div class="sub" style="margin:14px 0 6px">固定前置 —— 每次运行开始前由代码自动点，不问 AI</div>
+       <table><thead><tr><th>控件</th><th>出现次数</th><th>在哪个界面</th></tr></thead><tbody>
+       ${setup.map((s) => `<tr>
+         <td class="mono">${esc(s.rid || s.text || '?')}</td>
+         <td>${s.times == null ? '—' : esc(String(s.times))}</td>
+         <td class="mono" style="color:var(--dim);font-size:12px">${esc(shortAct(s.pkg))}</td>
+       </tr>`).join('')}</tbody></table>`
+    : `<div class="sub" style="margin:14px 0 6px">固定前置 —— 暂无（跑够 2 次才会记住）</div>`;
+
+  // ③ 步骤：每步一行，说清"谁来点"
+  const stepRows = steps.map((s) => {
+    const acts = (s.actions || []).map((a) => a.rid || a.text || '?');
+    const by = s.target
+      ? `<span class="badge PASS">代码直点</span>`
+      : `<span class="badge UNKNOWN">问 AI</span>`;
+    return `<tr>
+      <td class="mono">${esc(s.id || '')}</td>
+      <td>${esc((s.desc || '').slice(0, 40))}</td>
+      <td>${by}</td>
+      <td class="mono" style="font-size:12px">${esc(s.target || '—')}</td>
+      <td class="mono" style="font-size:12px;color:var(--dim)">${esc(acts.join(' → ') || '—')}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="kb-bar" style="margin:24px 0 10px">
+      <b>生成的用例 JSON</b>
+      <span class="badge ${j.status || 'UNKNOWN'}">${esc(j.status || '')}</span>
+      <span class="sub" style="margin:0 0 0 8px">来自运行 #${esc(String(L.run_id))}
+        ${L.finished_at ? '· ' + esc(L.finished_at) : ''}</span>
+      <span style="flex:1"></span>
+      <button class="ghost sm" id="json-toggle">展开原文 JSON</button>
+    </div>
+    ${summary}
+    ${setupHtml}
+    <div class="sub" style="margin:16px 0 6px">步骤 —— 下一步是代码点还是问 AI</div>
+    <table><thead><tr><th>#</th><th>步骤</th><th>执行者</th>
+      <th>定位（target）</th><th>记下的动作</th></tr></thead>
+      <tbody>${stepRows || '<tr><td colspan="5" class="empty">没有步骤</td></tr>'}</tbody></table>
+    <div id="json-raw" style="display:none;margin-top:12px">
+      <div class="codebox"><pre style="white-space:pre-wrap">${esc(JSON.stringify(j, null, 2))}</pre></div>
+    </div>`;
+}
+
+/* activity 名太长，列表里只留末段（com.zui.calendar.x.YActivity -> YActivity） */
+function shortAct(s) {
+  const t = String(s || '');
+  if (!t) return '';
+  const tail = t.split('.').pop();
+  const pkg = t.split('.').slice(0, 3).join('.');
+  return tail && pkg ? `${pkg}…${tail}` : t;
+}
+
 async function viewCase(key) {
   const d = await api('/api/cases/' + encodeURIComponent(key));
-  const y = d.yaml || {};
 
   // 原始 case 原文：原样显示（用 pre + 保留换行），不做任何"美化"
   // —— 用户要看到的是自己当初写的字，不是被重排过的版本。
@@ -533,46 +654,13 @@ async function viewCase(key) {
     : `<div class="hint warn">这条用例还没有原文。
         直接点「编辑原文」把当初写的测试步骤和预期贴进来。</div>`;
 
-  // YAML：极简高亮（注释 / 列表符 / 键）。不引高亮库，看的是"哪行写了什么"。
-  let yamlHtml;
-  if (y.exists) {
-    const body = y.content.split('\n').map((ln, i) => {
-      const n = String(i + 1).padStart(4, ' ');
-      let html = esc(ln);
-      if (/^\s*#/.test(ln)) html = `<span class="c-cm">${html}</span>`;
-      else html = html
-        .replace(/^(\s*)(- )/, '$1<span class="c-ds">$2</span>')
-        .replace(/^(\s*)([\w\u4e00-\u9fa5_-]+)(:)/, '$1<span class="c-k">$2</span>$3');
-      return `<span class="ln"><i>${n}</i>${html}</span>`;
-    }).join('\n');
-    /* ★ 保留原文之后，YAML 只留一个**入口**，不默认铺开。
-     *
-     * 用户原话：「webui的记录详情里要求带 case 的原始文本。不要带 YAML 内容。
-     *           可以留个入口点击查看。」
-     * 理由和上面一样：点开一条用例，第一眼该看到"当初要求什么"，
-     * 判据是给复核用的人按需展开的 —— 默认铺开等于让两者抢视线。
-     */
-    yamlHtml = `<details class="yaml-entry">
-      <summary>查看拆解后的判据 YAML <span class="mono dim">${esc(y.name)}</span> · ${(y.size / 1024).toFixed(1)} KB</summary>
-      <div class="codebox"><pre>${body}</pre></div>
-      <div class="sub" style="margin-top:6px">
-        <span class="mono">${esc(y.path)}</span> ·
-        改判据请直接编辑文件后重跑 —— 网页改会让旧记录变成「新判据配旧结论」。
-      </div>
-    </details>`;
-  } else {
-    yamlHtml = `<div class="hint">这条用例还没拆解成 YAML <b>（还没法跑）</b>。
-      YAML 是执行判据（每步的落点、坑、断言），要由拆解流程生成。
-      原文已经在库里了，随时可以拿来拆。</div>`;
-  }
-
   // 这条用例的历史运行
   const runs = d.runs || [];
   const runRows = runs.map((r) => `<tr class="clickable" data-run="${r.run_id}">
       <td class="mono">#${r.run_id}</td>
       <td>${badge(r.status)}</td>
       <td>${r.steps_done == null ? '—' : r.steps_done}/${r.steps_total == null ? '?' : r.steps_total}</td>
-      <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
+      <td>${aiRateText(r)}</td>
       <td>${fmtDur(r.elapsed_s)}</td>
       <td>${esc(r.started_at || '')}</td>
       <td style="color:var(--dim);font-size:12.5px">${esc((r.summary || '').slice(0, 46))}</td>
@@ -599,16 +687,10 @@ async function viewCase(key) {
     </div>
     <div id="raw-box">${rawHtml}</div>
 
-    <div class="kb-bar" style="margin:22px 0 10px">
-      <b>用例 YAML（执行判据，只读）</b>
-      <span style="flex:1"></span>
-      ${y.exists ? `<a class="ghost sm btnlink" href="/api/case/${encodeURIComponent(y.name)}"
-        target="_blank">单独打开</a>` : ''}
-    </div>
-    ${yamlHtml}
+    ${learnedHtml(d.learned)}
 
     <h2 style="margin-top:26px">这条用例的运行记录</h2>
-    <table><thead><tr><th>#</th><th>结果</th><th>步数</th><th>自动化率</th>
+    <table><thead><tr><th>#</th><th>结果</th><th>步数</th><th>AI 判读率</th>
       <th>耗时</th><th>开始时间</th><th>摘要</th></tr></thead>
     <tbody>${runRows || '<tr><td colspan="7" class="empty">还没跑过</td></tr>'}</tbody></table>`;
 
@@ -631,6 +713,17 @@ async function viewCase(key) {
 
   main.querySelector('#case-del').addEventListener('click',
     () => confirmDeleteCase(key));
+
+  // JSON 原文折叠 —— 默认收起，需要复制时再展开
+  const jt = main.querySelector('#json-toggle');
+  if (jt) {
+    jt.addEventListener('click', () => {
+      const box = main.querySelector('#json-raw');
+      const open = box.style.display !== 'none';
+      box.style.display = open ? 'none' : 'block';
+      jt.textContent = open ? '展开原文 JSON' : '收起 JSON';
+    });
+  }
 }
 
 /* ---------- 视图：视觉模型 ----------
@@ -811,18 +904,17 @@ function caseInfoHtml(run) {
         ${caseGone ? '用例已被删除，原文也随之没了。'
     : '去用例库里打开这条用例可以看到原文。'}</div>`;
 
-  /* ② YAML —— 只留一个链接，跳到对应的 Case 详情。
+  /* ② 跳到对应的 Case 详情。
    *
    * 用户原话：「记录详情只显示 原始用例（你写的步骤 / 预期）。
    *            有YAML了就给个YAML的链接。点击可以跳到对应的Case详情。」
    *
-   * 所以这里**不铺 YAML 内容**，连折叠都不要 —— 记录页只讲
-   * "这条用例这次跑成什么样"，YAML 是用例自己的属性，去用例页看。
+   * 记录页只讲"这条用例这次跑成什么样"，用例本身的属性去用例页看。
    */
   let yamlBlock = '';
   if (caseKey && !caseGone) {
     yamlBlock = `<div class="sub" style="margin-top:12px">
-        <a class="ghost-link" data-casekey="${esc(caseKey)}">查看这条用例的 YAML 判据</a>
+        <a class="ghost-link" data-casekey="${esc(caseKey)}">查看这条用例</a>
         <span style="color:var(--dim)">（跳到用例 ${esc(caseKey)} 详情）</span>
       </div>`;
   }
@@ -849,7 +941,7 @@ async function viewRuns(caseName) {
       <td class="mono">${esc(r.case_name)}</td>
       <td>${badge(r.status)}</td>
       <td>${r.steps_done == null ? '—' : r.steps_done}/${r.steps_total == null ? '?' : r.steps_total}</td>
-      <td>${r.auto_rate == null ? '—' : Math.round(r.auto_rate * 100) + '%'}</td>
+      <td>${aiRateText(r)}</td>
       <td>${fmtDur(r.elapsed_s)}</td>
       <td>${esc(r.started_at || '')}</td>
       <td style="color:var(--dim);font-size:12.5px">${esc((r.summary || '').slice(0, 50))}</td>
@@ -862,7 +954,7 @@ async function viewRuns(caseName) {
     <h1>${title}</h1>
     <div class="sub">${runs.length} 次运行</div>
     <table><thead><tr><th>#</th><th>用例</th><th>结果</th><th>步数</th>
-      <th>自动化率</th><th>耗时</th><th>开始时间</th><th>摘要</th><th></th></tr></thead>
+      <th>AI 判读率</th><th>耗时</th><th>开始时间</th><th>摘要</th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="9" class="empty">还没有运行</td></tr>'}</tbody></table>`;
 
   bindBack();
@@ -946,7 +1038,11 @@ async function viewRun(runId) {
     </div>`;
   }).join('');
 
-  /* 自动化率 —— 这是"代码判定 vs 模型判定"的比例，用户最关心的指标之一 */
+  /* AI 判读率 —— 这次运行里"决定点哪"有多少次是问的模型。
+   *
+   * ⚠️ 单位是**次（点击）**，不是步。by_code / by_model 记的是
+   *    "每一次点击由谁决定"，一步里可能点好几下（先展开菜单再选条目）。
+   *    早先这里写的是「步」，那是错的，会让人以为一步只算一次。 */
   const model = run.by_model || 0;
   const code = run.by_code || 0;
   const tot = model + code;
@@ -967,9 +1063,9 @@ async function viewRun(runId) {
       <div class="model" style="width:${(model / tot) * 100}%"></div>
     </div>
     <div class="rateleg">
-      <span><i style="background:var(--accent)"></i>代码判定 ${code} 步</span>
-      <span><i style="background:#f0a43a"></i>模型判定 ${model} 步</span>
-      <span>自动化率 ${Math.round((code / tot) * 100)}%</span>
+      <span><i style="background:var(--accent)"></i>代码判定 ${code} 次</span>
+      <span><i style="background:#f0a43a"></i>AI 判读 ${model} 次</span>
+      <span>AI 判读率 ${Math.round((model / tot) * 100)}%（共 ${tot} 次点击）</span>
     </div>
     ${reasons.length ? `<ul class="fallbacks">${reasons.map((r) =>
       `<li>${esc(r)}</li>`).join('')}</ul>` : ''}`
@@ -1033,7 +1129,7 @@ async function viewRun(runId) {
     <h2>断言结果</h2>
     <div class="findings">${findingsHtml || '<div class="empty">这次没有断言</div>'}</div>
 
-    <h2>自动化率 / 降级原因</h2>
+    <h2>AI 判读率 / 降级原因</h2>
     <div class="rateleg" style="margin-bottom:6px">
       <a href="/api/file/${run.run_id}/log" target="_blank">完整运行日志</a>
       <a href="/api/file/${run.run_id}/ledger" target="_blank">原始账本 jsonl</a>

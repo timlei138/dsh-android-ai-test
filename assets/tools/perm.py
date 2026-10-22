@@ -282,7 +282,7 @@ def _frame_signature(info: dict | None) -> str:
     return "|".join(parts)
 
 
-def handle(d, action: str | None = None, timeout_s: float = 0.8,
+def handle(d, action: str | None = None, timeout_s: float = 1.0,
            chain_max: int = 8, observe_only: bool = False,
            owner_package: str = "") -> dict:
     """看见权限框就点，点到框没了为止 —— 和测试员的做法完全一致。
@@ -292,6 +292,24 @@ def handle(d, action: str | None = None, timeout_s: float = 0.8,
 
     action=None → 用 DEFAULT_ACTION（grant，默认同意）。
     observe_only=True → 只检测不点击（调试/仅取证时用）。
+
+    ## 只记"点了几个"，不记坐标（用户要求）
+
+    用户原话：「坐标不要了。没意义。」
+
+    对。这里记的 x/y 是**这一台机器这一次**的位置，换设备、换分辨率、
+    换系统版本全都不成立 —— 它不是知识，只是一次性的现场。
+    真正值得留的是「授了哪几个权限」（prompts），那个跨设备成立。
+
+    ## 为什么首轮等 1s（原本 0.8s）
+
+    用户：「那就改大点是不是就行了。1s 应该够了。」
+
+    权限框是**点击的直接后果**，但要等界面切换 + 系统弹框渲染。
+    0.8s 在 168 上踩到过：点「同意」后框还没渲染出来，
+    handle 判定"没有权限框"直接返回，上层随后观察时框正好在，
+    于是被记成"前台不是被测 App" —— 看着像规则判错，其实是**看得太早**。
+    多等 0.2s 比多跑一次用例便宜得多。
 
     owner_package: 动作执行前的前台包 = **这个权限框是谁申请的**。
         为什么需要它（真机踩过）：用例预期是"点拍照导入应弹相机权限弹窗"，
@@ -310,6 +328,7 @@ def handle(d, action: str | None = None, timeout_s: float = 0.8,
         result["action"] = action or DEFAULT_ACTION
         result["action_source"] = "declared" if action else "default"
     for i in range(max(1, chain_max)):
+        # 首轮 1s 等它渲染出来；之后每轮 2s（换下一个权限也要时间）
         info = detect(d, timeout_s=timeout_s if i == 0 else 2.0)
         if not info:
             break                       # 框没了 = 点完了（或本来就没有）
@@ -331,8 +350,8 @@ def handle(d, action: str | None = None, timeout_s: float = 0.8,
         before = _frame_signature(info)
         try:
             d.click(*btn["center"])
-            result["clicks"].append({"text": btn["text"], "rid": btn["rid"],
-                                     "center": btn["center"]})
+            # ★ 只记按钮和它代表的权限，**不记坐标**（换设备没意义，见 docstring）
+            result["clicks"].append({"text": btn["text"], "rid": btn["rid"]})
             result["handled"] = True
         except Exception as e:  # noqa: BLE001
             result["click_error"] = str(e)
@@ -345,4 +364,12 @@ def handle(d, action: str | None = None, timeout_s: float = 0.8,
             # 屏幕内容和点之前一模一样 → 这一下没生效，别再连点（最坏会白等 18s）
             result["stuck"] = True
             break
+    # ★ 正面确认"框真的没了"，而不是"我没检测到"。
+    #
+    # 上面循环 break 出来的原因有好几种（框关了 / 点不动 / 没匹配按钮），
+    # 只有第一种才算处理干净。多探一次，让调用方知道**现在屏幕上是不是真的
+    # 没有权限框了** —— 上层据此决定"直接观察下一步"还是"这一步交回 AI"。
+    # 用户要的正是这个：「点完了弹窗消失，然后重新截图，开始下一步」
+    if result["handled"] and not observe_only:
+        result["cleared"] = detect(d, timeout_s=1.0) is None
     return result

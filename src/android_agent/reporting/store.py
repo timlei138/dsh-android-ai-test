@@ -79,18 +79,6 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path    TEXT,
     llm_path    TEXT,
     report_path TEXT,
-    -- ★ 这次跑的是**哪个用例文件**。没有它，报告只能告诉你 "168 跑过了"，
-    --   却指不回"当时那份 YAML 长什么样"—— 而 YAML 是会变的
-    --   （168 就改过 a3 的判据）。光看结论没法复核判据对不对。
-    --
-    --   存两份：
-    --     case_yaml_path  文件路径，点进去能看当前版本
-    --     case_yaml       跑的那一刻的内容快照
-    --
-    --   为什么要快照：YAML 改过之后，旧记录如果只存路径，看到的
-    --   就是**新判据配上旧结论**，等于在骗自己。
-    case_yaml_path TEXT,
-    case_yaml   TEXT,
     report_json TEXT              -- 完整报告，用于"详情页要什么给什么"
 );
 
@@ -166,14 +154,54 @@ CREATE TABLE IF NOT EXISTS cases (
     priority    TEXT,              -- P0/P1/P2/P3，原文里带的就存
     raw_text    TEXT NOT NULL,     -- 用户原文，原样存，不加工
     source_path TEXT,              -- 从哪个 txt 导进来的（留痕，不参与逻辑）
-    yaml_name   TEXT,              -- 关联的 YAML 文件名（不含目录），空=还没拆解
     updated_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_case   ON runs(case_name, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_actions_run ON actions(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
-CREATE INDEX IF NOT EXISTS idx_cases_yaml  ON cases(yaml_name);
+
+-- ★ 冷启动固定前置（setup）：每次跑见到了就累加，见够了才允许代码直接执行。
+--
+-- 用户的问题：「APP 如果有临时的弹窗，正好被我们捕获了。下次没有了会怎么样」
+-- 用户定的（三次确认）：
+--   · 「多次稳定的记录下来。不稳定的可以让 AI 直接介入」
+--   · 存哪里：落库新表（跨运行累积）
+--   · 几次算稳定：**≥2 次**
+--   · 只出现 1 次的：不记录，交给 AI
+--
+-- 为什么要跨运行累积数次数：
+--   单次跑的记录分不清"每次都会出现的固定前置"和"碰巧被撞见的一次性弹窗"。
+--   只按一次就写死，下次那个弹窗没了，就变成盲目点击 —— 虽然执行层
+--   找不到 rid 会跳过不硬闯（见 _run_prepare_actions），但白白多一次空转，
+--   而且 JSON 会越攒越脏。只有"见过不止一次"才配当规律。
+--
+-- 为什么用 (case_key, pkg, rid, text) 当联合主键：
+--   · case_key —— 同一条用例的前置才算数，别的用例的弹窗不该借过来
+--   · pkg      —— 谁的界面。被测 App 自己的才算固定流程；
+--                 系统权限框由工具层处理、不进这张表；外来包是干扰，也不进
+--   · rid      —— 首选定位手段（换设备/换分辨率都还在）
+--   · text     —— 没有 rid 时靠文案兜底
+--   四个一起才能唯一定位"同一个东西"；只用 rid 会把不同屏幕上的
+--   同名 rid（比如两屏都有 button1）混成一条。
+--
+-- seen_times ：见到它出现了几次（不管点没点成功）
+-- done_times ：其中点成功的次数
+--   分开记的原因：出现过但点不动（被挡、变灰）的不该算"稳定可用的前置"，
+--   只有"见到"和"点成功"都够数，才允许下次直接执行。
+CREATE TABLE IF NOT EXISTS case_setup_actions (
+    case_key   TEXT NOT NULL,
+    pkg        TEXT NOT NULL DEFAULT '',
+    rid        TEXT NOT NULL DEFAULT '',
+    text       TEXT NOT NULL DEFAULT '',
+    sig        TEXT NOT NULL DEFAULT '',
+    ord        INTEGER NOT NULL DEFAULT 0,  -- 在 setup 序列里的次序
+    seen_times INTEGER NOT NULL DEFAULT 1,
+    done_times INTEGER NOT NULL DEFAULT 1,
+    last_run   TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (case_key, pkg, rid, text)
+);
 """
 
 
@@ -206,8 +234,6 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 #:    "table runs has no column named case_yaml_path" —— 而我们的
 #:    save_run 是吞异常的，于是变成"跑完了但没落库"这种难查的问题。
 _ADDED_COLUMNS = (
-    ("runs", "case_yaml_path", "TEXT"),
-    ("runs", "case_yaml", "TEXT"),
     ("runs", "model_s", "REAL"),
     # 本次运行的产物目录（tmp/runs/<uuid>_<时间戳>_<case>/）。
     # 截图、XML、日志、账本、报告全在里面 —— 从记录点进去就能看到"这一次"
@@ -215,6 +241,13 @@ _ADDED_COLUMNS = (
     ("runs", "run_dir", "TEXT"),
     # 崩溃日志（logcat 片段）。只在该次运行确实崩了时才有内容。
     ("runs", "crash_log", "TEXT"),
+    # setup 记忆的组合判据（xpath=//*[@resource-id='..'][@text='..']）。
+    #
+    # 为什么补这一列：原来只存 rid 末段（button1），而 button1 是 Android
+    # 公共按钮 id，全系统到处都有 —— 光看 rid 分不清是「同意」还是「知道了」。
+    # 存下完整判据才能下次照着精确点，不会误点别的 button1。
+    # 老数据这一列为空，读取侧会退回按 rid 拼（行为不变）。
+    ("case_setup_actions", "sig", "TEXT"),
 )
 
 
@@ -300,8 +333,6 @@ def save_run(
     report: dict[str, Any],
     ledger_rows: list[dict[str, Any]],
     paths: dict[str, str] | None = None,
-    case_yaml_path: str = "",
-    case_yaml: str = "",
     db: str | Path | None = None,
 ) -> int:
     """把一次运行整体落库，返回 run_id。
@@ -314,10 +345,10 @@ def save_run(
 
     真要"实时看进度"，那是另一个功能（tail 日志），不该靠半截库凑。
 
-    ## case_yaml_path / case_yaml
+    ## 关于用例快照
 
     记下这次跑的是**哪个文件**、**当时那份内容**。
-    只存路径不够：YAML 会被改（168 的 a3 判据就改过），
+    只存路径不够：用例会被改（168 的 a3 判据就改过），
     旧记录只存路径的话，点开看到的是"新判据 + 旧结论"，等于自欺。
     """
     con = connect(db)
@@ -354,9 +385,9 @@ def save_run(
                 by_model, by_code, engine,
                 started_at, started_ts, finished_at,
                 ledger_path, log_path, llm_path, report_path,
-                case_yaml_path, case_yaml, report_json,
+                report_json,
                 run_dir, crash_log
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 case_name,
                 str(report.get("case_id") or ""),
@@ -378,9 +409,7 @@ def save_run(
                 (paths or {}).get("log"),
                 (paths or {}).get("llm"),
                 (paths or {}).get("report") or report.get("report_path"),
-                case_yaml_path or None,
-                case_yaml or None,
-                json.dumps(report, ensure_ascii=False),
+                                              json.dumps(report, ensure_ascii=False),
                 (paths or {}).get("run_dir") or report.get("run_dir") or None,
                 report.get("crash_log") or None,
             ),
@@ -465,9 +494,8 @@ def list_runs(*, case_name: str = "", limit: int = 100,
               db: str | Path | None = None) -> list[dict[str, Any]]:
     """运行列表，新的在前。
 
-    不返回 report_json / case_yaml —— 列表页用不上，还占带宽
-    （case_yaml 一个就 5-8KB，100 条就是近 1MB）。
-    列表里只带 case_yaml_path，够显示"这条跑的是哪个文件"了。
+    不返回 report_json —— 列表页用不上，还占带宽
+    （一个就 5-8KB，100 条就是近 1MB）。
     """
     con = connect(db)
     try:
@@ -475,8 +503,7 @@ def list_runs(*, case_name: str = "", limit: int = 100,
                " steps_done, steps_total, auto_rate, elapsed_s, model_s,"
                " by_model, by_code,"
                " engine, started_at, finished_at, ledger_path, log_path, llm_path,"
-               " case_yaml_path,"
-               " (case_yaml IS NOT NULL) AS has_yaml"
+               " report_path, run_dir, crash_log"
                " FROM runs")
         args: list[Any] = []
         if case_name:
@@ -554,11 +581,11 @@ def save_case(case_key: str, *, title: str = "", priority: str = "",
       · 新行 + 空文本 -> 建成 (空壳)，backend 仍会写一行，raw_text 存空串
       · 已有行 + 空文本 -> 不动它，报 skipped
 
-    ## 为什么 yaml_name 不在这个函数里
+    ## 为什么用例关联不在这个函数里
 
     YAML 关联是**扫描目录**得出的，跟"人改了原文"是两件事。
     混在一起写，人一保存原文就会把刚链好的 YAML 冲掉。
-    单独 set_case_yaml。
+
     """
     text = (raw_text or "").strip()
     con = connect(db)
@@ -609,17 +636,6 @@ def list_cases(*, db: str | Path | None = None) -> list[dict[str, Any]]:
         con.close()
 
 
-def set_case_yaml(case_key: str, yaml_name: str | None, *,
-                  db: str | Path | None = None) -> int:
-    """把用例关联到某个 YAML 文件（或解除关联，yaml_name=None）。返回影响行数。"""
-    con = connect(db)
-    try:
-        cur = con.execute("UPDATE cases SET yaml_name = ? WHERE case_key = ?",
-                          (yaml_name or None, case_key))
-        con.commit()
-        return cur.rowcount or 0
-    finally:
-        con.close()
 
 
 def set_case_title(case_key: str, title: str, *,
@@ -656,6 +672,101 @@ def save_case_raw(case_key: str, raw_text: str, *,
             (text, _fmt_ts(time.time()), case_key))
         con.commit()
         return (cur.rowcount or 0) > 0
+    finally:
+        con.close()
+
+
+#: 见到几次才允许代码直接执行。
+#:
+#: 用户定的：「多次稳定的记录下来。不稳定的可以让 AI 直接介入」——
+#: 阈值选了 **≥2 次**：只撞见一次的分不清是"固定前置"还是"临时弹窗"，
+#: 那种情况交给 AI 现场判断更安全。
+SETUP_STABLE_TIMES = 2
+
+
+def save_setup_actions(case_key: str, actions: list[dict[str, Any]], *,
+                       run_key: str = "",
+                       db: str | Path | None = None) -> int:
+    """把本次跑见到的 setup 动作累加进库。返回写入的行数。
+
+    每次跑完调一次：见过就 seen_times += 1，点成功再 done_times += 1。
+    这样跑两遍之后，稳定的那几条自然达到 SETUP_STABLE_TIMES，
+    一次性的临时弹窗只停在 1，永远不会被当成规律。
+    """
+    rows = [a for a in (actions or []) if (a.get("rid") or a.get("text"))]
+    if not case_key or not rows:
+        return 0
+    con = connect(db)
+    now = _fmt_ts(time.time())
+    n = 0
+    try:
+        for i, a in enumerate(rows):
+            rid = str(a.get("rid") or "")
+            text = str(a.get("text") or "")
+            pkg = str(a.get("pkg") or "")
+            # 组合判据。老数据没有这一列/为空时退回空串，读取侧再兜底拼 rid。
+            sig = str(a.get("sig") or "")
+            ok = 1 if a.get("ok", True) else 0
+            try:
+                con.execute(
+                    "INSERT INTO case_setup_actions"
+                    "(case_key, pkg, rid, text, sig, ord, seen_times,"
+                    " done_times, last_run, updated_at)"
+                    " VALUES(?,?,?,?,?,?,1,?,?,?)"
+                    " ON CONFLICT(case_key, pkg, rid, text) DO UPDATE SET"
+                    "  seen_times = seen_times + 1,"
+                    "  done_times = done_times + excluded.done_times,"
+                    "  ord = excluded.ord,"
+                    "  sig = excluded.sig,"
+                    "  last_run = excluded.last_run,"
+                    "  updated_at = excluded.updated_at",
+                    (case_key, pkg, rid, text, sig, i, ok, run_key, now))
+                n += 1
+            except sqlite3.Error:
+                continue          # 单条写不进去不该坏了整次记录
+        con.commit()
+    finally:
+        con.close()
+    return n
+
+
+def get_setup_actions(case_key: str, *, stable_only: bool = True,
+                      db: str | Path | None = None) -> list[dict[str, Any]]:
+    """取出这条用例积累下来的 setup 动作，按原有次序。
+
+    stable_only=True（默认）只返回见过次数够的 —— 那才是能直接执行的。
+    取不到就返回空列表，调用方据此退回 AI，不是报错。
+    """
+    if not case_key:
+        return []
+    con = connect(db)
+    try:
+        sql = ("SELECT case_key, pkg, rid, text, sig, ord, seen_times,"
+               " done_times, last_run FROM case_setup_actions"
+               " WHERE case_key = ?")
+        if stable_only:
+            sql += (" AND seen_times >= ? AND done_times >= ?")
+            args: tuple[Any, ...] = (case_key, SETUP_STABLE_TIMES,
+                                     SETUP_STABLE_TIMES)
+        else:
+            args = (case_key,)
+        sql += " ORDER BY ord ASC"
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def delete_setup_actions(case_key: str, *,
+                         db: str | Path | None = None) -> int:
+    """清掉某条用例的 setup 记忆（网页里"忘记这几下"用）。"""
+    con = connect(db)
+    try:
+        cur = con.execute("DELETE FROM case_setup_actions WHERE case_key = ?",
+                          (case_key,))
+        con.commit()
+        return cur.rowcount or 0
     finally:
         con.close()
 
@@ -865,7 +976,11 @@ def stats(*, db: str | Path | None = None) -> dict[str, Any]:
             "SELECT status, COUNT(*) n FROM runs GROUP BY status")}
         total = sum(by_status.values())
         rows = [dict(r) for r in con.execute(
-            "SELECT run_id, case_name, status, elapsed_s, auto_rate, started_at"
+            "SELECT run_id, case_name, status, elapsed_s, auto_rate, started_at,"
+            # by_code / by_model 是"每次点击由谁决定"的原始计数。
+            # 仪表盘要显示 AI 判读率 = by_model / (by_code + by_model)，
+            # 只给 auto_rate 是不够的 —— 前端拿不到分子分母。
+            " by_code, by_model"
             " FROM runs ORDER BY run_id DESC LIMIT 30")]
         avg = con.execute("SELECT AVG(elapsed_s) FROM runs").fetchone()[0]
         cases = [dict(r) for r in con.execute(

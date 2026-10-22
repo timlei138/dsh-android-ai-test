@@ -36,6 +36,12 @@ from .vision import VisionError, ask_image
 # 真机上每次检索都要读文件，而步骤毫无进展纯属烧时间。
 MAX_KNOWLEDGE_LOOKUPS = 8
 
+# 一步最多几轮 decide（保护 2：防死循环）。
+MAX_ROUNDS_PER_STEP = 40
+
+# 换目标查找上限（rid 太严，有些控件本来就没 rid）。
+MAX_LOCATE_ATTEMPTS = 3
+
 # ★ 一步落点不符，最多试这么多次（含首次），仍不符就 BLOCKED 停整个人 case。
 #
 # 为什么是 3：用户定的。1 次太急 —— 页面还在加载就会被误判；
@@ -107,7 +113,7 @@ class StepSpec(BaseModel):
     locate: str | None = Field(default=None, description="定位方式，如 rid=iv_more")
     # ★ 强证据目标：这一步要点的东西，怎么**在与分辨率无关的前提下唯一确定**它。
     #
-    #   写法（docs/执行机制.md 4.2）：
+    #   写法（docs/执行链路-边走边验.md）：
     #     rid=iv_more                    可点清单里精确匹配，必须唯一
     #     xpath=//*[@resource-id="..."]  落盘 XML 里算命中数，必须恰好 1 个
     #     text=课程表                     可点清单里按文案匹配，必须唯一
@@ -323,11 +329,6 @@ class SubagentReport(BaseModel):
     # ★ 每步实际走的路径（回写 YAML 的依据，也给主 Agent 核对）。
     # 形如 [{"step":"s3","actions":[{"key":"back"},{"rid":"btnImportFromGallery"}]}]
     action_trace: list[dict[str, Any]] = Field(default_factory=list)
-    # ★ YAML 回写结果：改了哪几步、跳过哪些、为什么。
-    # 用户要求：「用我们的工具完成后要生成或者把旧的 YAML 不合理的修改」——
-    # 改了就必须说清楚，否则用户不知道文件被动过。
-    yaml_writeback: dict[str, Any] = Field(default_factory=dict)
-
     # ★★ 用例 YAML 里**写了但代码没用上**的判据字段。
     #
     # 为什么必须进报告：加载器一直在 alerts 里打印
@@ -419,6 +420,20 @@ class ChildState(TypedDict, total=False):
     # 做完一步就把这一步的断言判掉、判完再走下一步 ——
     # 判的时候界面还停在那一屏，证据是拿得到的。
     assert_step: NotRequired[str]
+    # ★ 这一步已经走完、该验了（用户定的「合入」：边走边验，不回头验）。
+    #
+    # 「AI走的时候第一轮就边走边验证了。能拿到所有的记录。然后最后根据
+    #   记录写json。而不是回过头就复验证。」
+    #
+    # 非空 = 本步完成、正在验它名下的预期；验完清空、推进下一步。
+    verify_step: NotRequired[str]
+    # ★ 正在判哪一条预期（nodes_new 用）。
+    #   单独记一份是为了"恢复时不重复问同一条"——
+    #   interrupt 挂起后恢复，节点从头重跑，靠它能认出当前这条。
+    verify_assert: NotRequired[str]
+    # ★ 为了看清而点开了东西时，AI 说的"看完怎么关回去"（按钮文字）。
+    #   跨轮次留着，重判时还得知道。空 = 不用关。
+    _close_with: NotRequired[str]
     # ★ 补证据点开之后，看完要点的那个"关闭/取消"按钮的文字。
     #
     # 用户的原话：「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。
@@ -539,6 +554,11 @@ class ChildState(TypedDict, total=False):
     crash: dict[str, Any] | None         # 崩溃信息（若命中）
     pc_done: list[str]                   # 已执行的前提
     pc_skipped: list[str]                # 因 skip_if 已满足而跳过的前提
+    # ★ 本轮 prep 里用"记住的固定前置"（setup 记忆）直接点掉的控件。
+    #
+    # 用户：「这种固定的步骤那就转成setup就行了」——
+    # 记住并直接执行的那几下要留痕，否则报告里看不出"这里没问 AI 是谁做的"。
+    setup_applied: list[str]
     # ★ 来自 type: goto 的"要到达哪、怎么去"。
     #   不执行命令，交给 decide 的 fix_start 模式让模型走过去。
     nav_wants: list[dict[str, Any]]
@@ -615,7 +635,7 @@ class ChildState(TypedDict, total=False):
     #
     # 每条：{"step": "s3", "action": {"rid": "x"} | {"key": "back"} | {}}
     # 只记**能表达成 YAML** 的形态（rid/text/key）；纯坐标点空白处记成 {}，
-    # 因为坐标写进 YAML 换设备必失效，回写时会被跳过（见 yaml_writeback）。
+    # 因为坐标写进用例换设备必失效，所以坐标不作为「怎么点」的经验被采纳。
     action_trace: Annotated[list[dict[str, Any]], operator.add]
 
     # 控制
@@ -1023,9 +1043,34 @@ def _run_prepare_actions(dev, acts: list[dict[str, Any]],
         try:
             out = dev.observe_raw() or {}
             clickable = out.get("next") or []
-            hit = next((c for c in clickable
-                        if str(c.get("rid") or "").split("/")[-1] == rid
-                        or str(c.get("r") or "") == rid), None)
+            # ★ 三种定位方式，优先用最精确的：
+            #   1. target（组合 xpath，如 //*[@resource-id='..'][@text='..']）
+            #      —— setup 记忆用的就是这个，能区分同 rid 的不同按钮
+            #   2. rid（末段匹配）
+            #   3. text
+            hit = None
+            _tgt = str(a.get("target") or "").strip()
+            if _tgt:
+                # _resolve_strong_target 要求"唯一命中" —— 命中 0 个或多个
+                # 都返回 None，正好是我们要的"拿不准就别点"。
+                _x, _y, _how = _resolve_strong_target(_tgt, {
+                    "obs_clickable": clickable,
+                    # observe_raw() 把落盘路径放在 evidence.xml 里，不是顶层
+                    "obs_xml_path": str(
+                        (out.get("evidence") or {}).get("xml") or ""),
+                })
+                if _x is not None and _y is not None:
+                    hit = {"r": rid or _tgt, "c": [_x, _y]}
+                else:
+                    fail_n += 1
+                    issues.append(
+                        f"前提动作跳过了：当前屏（{out.get('activity') or ''}）"
+                        f"定位不到 {_tgt}（{_how}）")
+                    continue
+            if hit is None:
+                hit = next((c for c in clickable
+                            if str(c.get("rid") or "").split("/")[-1] == rid
+                            or str(c.get("r") or "") == rid), None)
             if not hit:
                 fail_n += 1
                 act_now = out.get("activity") or ""
@@ -1114,7 +1159,7 @@ def _looks_like_prose(cmd: str) -> bool:
     return head not in known
 
 
-def prep_node(state: ChildState) -> dict[str, Any]:
+def _base_prep_node(state: ChildState) -> dict[str, Any]:
     """前提准备：跑 data 类清理 + 全局起点断言。
 
     ⚠️ 起点不对**不 BLOCKED**：像人类测试员那样，自己在知识卡里查
@@ -1278,17 +1323,104 @@ def prep_node(state: ChildState) -> dict[str, Any]:
         or "桌面" in (n.get("target") or "")
         for n in nav_wants)
     pkg = task.get("package") or ""
+    # ★ 前提跑完后的首屏 —— 记下来交给后面的节点。
+    #
+    # 为什么必须记：strong_target 要判"当前前台是不是被测 App"，
+    # 靠的是 state 里的 last_package。而这个字段只有 act/verify/finish
+    # 会写，**prep 之后到第一次 act 之前它是空的**。
+    # 实测 168：首轮 strong_target 拿到
+    #     last_activity = com.zui.calendar.AllInOneActivity   （有）
+    #     last_package  = ""                                  （空）
+    # 于是把日历自己的界面判成"未知包名 → 不是被测 App"，
+    # 白问了一次模型。信息明明就在手上：
+    #     out["package"] = com.zui.calendar
+    # 这里观察到的就是它，别丢掉。
+    _prep_obs: dict[str, Any] = {}
     if pkg and done and not _goto_off_app and not any("monkey" in c for c in done):
         try:
             out = dev.observe_raw()
+            _prep_obs = out or {}
             cur = str(out.get("package") or "")
             if cur and not cur.startswith(pkg):
                 dev.shell(
                     f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
                 done.append(f"[auto] 前提跑完不在 {pkg}（当前 {cur}），已拉起")
                 time.sleep(3)
+                # ★ 拉起后**重新观察一次**，别把旧画面丢掉或留着。
+                #
+                # 第一版这里写的是 `_prep_obs = {}`（作废、等后面自己观察），
+                # 结果 168 复测仍然报"未知包名" —— 因为 pm clear 后前台是桌面，
+                # 走的就是这条拉起分支，清空之后 last_package 一路是空。
+                # 拉起后真正的前台正是被测 App，这才是该交给下面的那一屏。
+                try:
+                    _prep_obs = dev.observe_raw() or {}
+                except Exception as exc:  # noqa: BLE001
+                    _prep_obs = {}
+                    issues.append(f"拉起后观察失败（交下游自己观察）：{exc}")
         except Exception as exc:  # noqa: BLE001
             issues.append(f"自动拉起 {pkg} 失败：{exc}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # ★ 执行"记住的固定前置"（setup）
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # 用户原话：
+    #   「我意思这种固定的步骤那就转成setup就行了。」
+    #   「清空后看着这个也会跟着点。而且这个也是固定路径。应该要记录下来。
+    #     这样下次通过json文件的时候。就可以直接操作了。而不是还每一步问AI了」
+    #   「多次稳定的记录下来。不稳定的可以让AI直接介入」
+    #
+    # 所以这里读出库里**见够次数**的那几条，直接点，不问 AI。
+    # 只见过一次的临时弹窗不会出现在这里（见 store.SETUP_STABLE_TIMES）。
+    #
+    # ⚠️ 两个"不硬闯"的保证：
+    #   1. 找不到控件就**跳过**，不盲点 —— _run_prepare_actions 里做了
+    #      （`if not hit: continue`）。临时弹窗下次没了，最多白跑一次查找。
+    #   2. 整段包在 try 里。记不住/读不出都不该让用例起不来 ——
+    #      读不到就是"还没有记忆"，照常交给后面的 AI，不是错误。
+    _setup_tried: list[str] = []
+    try:
+        from ..reporting import store as _store
+        _ck0 = str(task.get("case_id") or "")
+        _remembered = _store.get_setup_actions(_ck0) if _ck0 else []
+        if _remembered:
+            _acts: list[dict[str, Any]] = []
+            for r in _remembered:
+                one: dict[str, Any] = {"op": "tap"}
+                # ★ 优先用记下来的组合判据（xpath 里带 rid 全名 + text）。
+                #
+                # 为什么会存这个：`android:id/button1` 是 Android 公共按钮 id，
+                # 「同意」「知道了」都叫这个名。只按 rid 点，换一屏就可能
+                # 点到完全不同的按钮。存下完整判据后，点的是
+                # 「那个写着「知道了」的 button1」，不会误点。
+                if r.get("sig"):
+                    one["target"] = str(r["sig"])
+                elif r.get("rid"):
+                    one["rid"] = r["rid"]
+                elif r.get("text"):
+                    one["text"] = r["text"]
+                else:
+                    continue
+                # 只有被测 App 自己的界面才照记忆点。别的包（外部干扰）
+                # 结构不受我们控制，交给 AI 现看更稳 ——
+                # 用户：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。」
+                _rp = str(r.get("pkg") or "")
+                if pkg and _rp and not (_rp == pkg or _rp.startswith(pkg)):
+                    issues.append(
+                        f"setup 跳过 {one.get('rid') or one.get('text')}："
+                        f"记的是 {_rp} 的界面，不是被测 App 的")
+                    continue
+                _acts.append(one)
+            if _acts:
+                _ok, _bad, _s_issues = _run_prepare_actions(dev, _acts,
+                                                            pkg_hint=pkg)
+                _setup_tried = [f"{a.get('rid') or a.get('text')}"
+                                for a in _acts]
+                done.append(f"[setup] 记住的固定前置 {len(_acts)} 步"
+                            f"（成功 {_ok}，跳过/失败 {_bad}）")
+                issues += _s_issues
+    except Exception as exc:  # noqa: BLE001
+        issues.append(f"setup 记忆读取失败（不影响用例，交给 AI）：{exc}")
 
     # ★ nav 目标交给起点检查：把它当成"起点要求"，不满足就由模型走过去
     updates: dict[str, Any] = {
@@ -1298,6 +1430,22 @@ def prep_node(state: ChildState) -> dict[str, Any]:
                            + (f"｜{len(nav_wants)} 条要走过去" if nav_wants else "")
                            + (f"｜{skipped[0]}" if skipped else ""))],
     }
+    # ★ 把前提下跑完看到的那一屏交出去（见 _prep_obs 处的说明）。
+    #   只写"谁在前台"这两样：strong_target 判归属要用，
+    #   和 act/verify 写的是同一组字段，语义一致。
+    #
+    # ⚠️ 刚跑过 setup 的话要**重新观察**：那几下已经把界面点变了，
+    #    再交旧画面等于让 strong_target 拿前一屏的包名/activity 去判归属。
+    if _setup_tried:
+        try:
+            _prep_obs = dev.observe_raw() or _prep_obs
+        except Exception as exc:  # noqa: BLE001
+            issues.append(f"setup 之后观察失败（交下游自己观察）：{exc}")
+    if _prep_obs:
+        updates["last_activity"] = str(_prep_obs.get("activity") or "")
+        updates["last_package"] = str(_prep_obs.get("package") or "")
+    if _setup_tried:
+        updates["setup_applied"] = _setup_tried
     if nav_wants:
         updates["nav_wants"] = nav_wants
     if prepare_wants:
@@ -1334,81 +1482,9 @@ def prep_node(state: ChildState) -> dict[str, Any]:
     return updates
 
 
-def start_check_node(state: ChildState) -> dict[str, Any]:
-    """起点断言：确认现在真的在用例期望的起点。
-
-    不通过时**不直接放弃** —— 交给 AI 决定怎么走回去（它可查知识卡）。
-    这里只负责把"实际起点 vs 期望起点"如实告诉它。
-    """
-    dev = _ctx().device
-    task = state.get("task") or {}
-    want = task.get("start_assert")
-
-    # ★ nav 目标也参与起点判定：不在目标状态就得先走过去。
-    #
-    # task.start_assert 是 `assert` 类前提给的；nav_wants 是 `goto` 类前提给的。
-    # 两者语义相同：都在说"开工前应该站在哪"。合并起来判，
-    # 避免"goto 说要进课程表、assert 说要停在首页"这种前后矛盾被静默忽略。
-    _nav = state.get("nav_wants") or []
-    _nav_want = next((str(n.get("assert_start")) for n in _nav
-                      if n.get("assert_start")), "")
-    if _nav_want and not want:
-        want = _nav_want
-    elif _nav_want and want and _nav_want != want:
-        # 两个要求不一样：以 assert 为准（它的 check 是精确写的），
-        # 但把 goto 的提示保留在 state 里给模型参考。
-        pass
-    try:
-        out = dev.observe_raw()
-    except ToolError as exc:
-        msg = str(exc)
-        if "terminated" in msg.lower() or "incomplete recording" in msg.lower():
-            return {"status": "BLOCKED", "summary": f"起点检查被硬终止：{msg}",
-                    "issues": [f"起点 observe 被拒（硬终止）：{msg}"]}
-        return {"status": "BLOCKED", "summary": f"起点检查失败：{exc}",
-                "issues": [f"起点 observe 失败：{exc}"]}
-
-    # ⚠️ 崩溃信号在两处 observe 都要查 —— 只查 observe_node 会漏掉
-    # "起点检查时就已经崩了"这种情况（App 启动即崩正是最典型的一类）。
-    if out.get("terminate") or out.get("blocked"):
-        reason = out.get("terminate_reason") or (out.get("crash") or {}).get("type") \
-            or "被测包崩溃"
-        return {"status": "BLOCKED",
-                "summary": f"检测到崩溃，硬终止：{reason}",
-                "issues": [f"crash terminate（起点检查）：{reason}"],
-                "crash": out.get("crash")}
-
-    act_now = out.get("activity") or ""
-    clickable = out.get("next") or []
-    updates: dict[str, Any] = {
-        "last_activity": act_now,
-        "last_shot": (out.get("evidence") or {}).get("png") or "",
-        "last_event_ids": [str(e) for e in (out.get("event_ids") or [])],
-        "obs_clickable": clickable,
-        "obs_nodes_text": _screen_text(out),
-        # 整屏文案留档，供 text_present 判"过程中出现过"
-        "seen_screens": [_screen_text(out)],
-        # 语义节点列表：模型据它看"这页到底有什么"（含不可点的文字）
-        "obs_nodes": _brief_nodes(out.get("nodes")),
-        "obs_xml_path": _screen_xml_path(out),
-        "obs_fresh": True,
-    }
-
-    if want:
-        hit, why = match_landing(want, activity=act_now, clickable=clickable,
-                                 nodes_text=updates["obs_nodes_text"],
-                                 state_pkg=str(updates.get("last_package") or ""))
-        if not hit:
-            updates["start_mismatch"] = (
-                f"起点不符：期望 {want}，实际 activity={act_now}（{why}）")
-            updates["issues"] = [updates["start_mismatch"]]
-        else:
-            # ✅ 已回到起点：清掉 mismatch，正式进入步骤执行
-            updates["start_mismatch"] = None
-    return updates
 
 
-def plan_node(state: ChildState) -> dict[str, Any]:
+def _base_plan_node(state: ChildState) -> dict[str, Any]:
     """进入一步：准备该步的上下文（步骤 + 它的坑 + 检索到的知识）。"""
     task = state["task"]
     idx = state.get("step_index", 0)
@@ -1475,61 +1551,6 @@ def plan_node(state: ChildState) -> dict[str, Any]:
     }
 
 
-def observe_node(state: ChildState) -> dict[str, Any]:
-    """看一眼当前屏幕。只读，无副作用。
-
-    ⚠️ 只写「观测」字段，**不碰 action** ——
-    早先把 clickable 塞进 pending 再被 act_node 读取，结果 decide 的答复
-    覆盖了观测、观测又覆盖了答复，动作被静默丢弃（真机表现为"只 observe 不 act"）。
-    现在两者分开：obs_* 是观测，action 是待执行动作。
-
-    ⚠️ 崩溃硬终止：工具层检测到被测包崩溃时会 terminate_session，
-    之后 observe/act 全被拒。若图不认这个信号，会疯狂重试到轮次上限，
-    报出误导性的"未收敛"。这里直接转 BLOCKED。
-    """
-    dev = _ctx().device
-    try:
-        out = dev.observe_raw()
-    except ToolError as exc:
-        # 会话被终止 / 会话已锁 —— 属于硬终止，不再重试
-        msg = str(exc)
-        if "terminated" in msg.lower() or "incomplete recording" in msg.lower():
-            return {"status": "BLOCKED", "summary": f"会话被硬终止：{msg}",
-                    "issues": [f"observe 被拒（硬终止）：{msg}"]}
-        return {"issues": [f"observe 失败：{exc}"], "status": "BLOCKED",
-                "summary": f"observe 失败（拿不到屏幕，没执行完）：{exc}"}
-
-    shot = (out.get("evidence") or {}).get("png")
-
-    # 崩溃终止信号（observe.py 的 terminate）
-    if out.get("terminate") or out.get("blocked"):
-        reason = out.get("terminate_reason") or (out.get("crash") or {}).get("type") \
-            or "被测包崩溃"
-        return {
-            "last_activity": out.get("activity") or "",
-            "last_shot": shot or "",
-            "last_event_ids": [str(e) for e in (out.get("event_ids") or [])],
-            "obs_clickable": out.get("next") or [],
-            "status": "BLOCKED",
-            "summary": f"检测到崩溃，硬终止：{reason}",
-            "issues": [f"crash terminate：{reason}"],
-            "crash": out.get("crash"),
-        }
-
-    return {
-        "last_activity": out.get("activity") or "",
-        "last_shot": shot or "",
-        "last_event_ids": [str(e) for e in (out.get("event_ids") or [])],
-        "obs_clickable": out.get("next") or [],
-        "obs_nodes_text": _screen_text(out),
-        "obs_nodes": _brief_nodes(out.get("nodes")),
-        "obs_xml_path": _screen_xml_path(out),
-        # ★ 按步骤留一份证据（见 _step_evidence_of 的说明）
-        "step_evidence": _step_evidence_of(state, out),
-        "seen_rids": _seen_rids(out.get("next"), out.get("nodes")),
-        "seen_texts": _seen_texts(out.get("next"), out.get("nodes")),
-        "seen_screens": [_screen_text(out)],
-    }
 
 
 def _step_evidence_of(state: ChildState, out: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1740,25 +1761,60 @@ def _trace_by_step(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _strong_stats(state: ChildState) -> dict[str, Any]:
-    """强证据直点的自动化率：多少步是代码直点的、多少步落回了模型。
+    """代码点击率：这次运行里**每次点击**是谁决定的。
 
-    为什么值得记：用户要的是"能直判的别问模型"。
-    只有把"代码走了几步 / 模型走了几步"记下来，才谈得上验证这个目标 ——
-    否则跑完只能说"感觉快了"，说不出到底省了多少。
+    用户定的口径（原话）：
+      「代码点击率应该是所有的步骤里有代码自动点击的有多少。
+        问 AI 的有多少。」
+
+    所以分子分母都是**点击次数**，不是步数、也不是决策轮次。
+    三类来源全部计入：
+
+      · 代码直点（strong_target 命中唯一）—— 省了一次模型调用
+      · setup 记忆（清空数据后那几下固定弹窗）—— 也是代码点的
+      · 工具层自动授予权限（点「允许」）—— 也是代码点的
+
+    ## 为什么以前只算第一类（错的口径）
+
+    早先只统计 `strong_hits` —— 那是**步骤内决策**的记录。
+    setup 和权限框根本不写进 strong_hits（它们不经过 decide），
+    于是"同意"明明是代码点的，报表里却看不见，代码点击率虚低。
+
+    168 实测：改前报 0%（看着像机制没生效），
+    实际「同意」早就由 setup 点掉了 —— 只是没被算进去。
+
+    ## by_model 怎么来的
+
+    `strong_hits` 里 by=model 的那些是"代码定不了、交给模型"的决策，
+    一次决策对应一次点击，所以可以直接当点击次数用。
     """
     hits = state.get("strong_hits") or []
     by_code = [h for h in hits if h.get("by") == "code"]
     by_model = [h for h in hits if h.get("by") == "model"]
-    total = len(by_code) + len(by_model)
+
+    # setup：清冷启动弹窗那几下（代码按记忆点的，没问模型）
+    _setup_n = len(state.get("setup_applied") or [])
+    # 工具层自动授予的权限（点「允许」/「全部允许」）
+    _perm_n = len(state.get("runtime_permissions") or [])
+
+    code_n = len(by_code) + _setup_n + _perm_n
+    model_n = len(by_model)
+    total = code_n + model_n
+
     fallbacks: list[str] = []
     for h in by_model:
         r = str(h.get("reason") or "")
         if r and r not in fallbacks:
             fallbacks.append(r)
     return {
-        "by_code": len(by_code),
-        "by_model": len(by_model),
-        "auto_rate": round(len(by_code) / total, 3) if total else 0.0,
+        # 兼容老字段名：by_code/by_model 就是点击次数
+        "by_code": code_n,
+        "by_model": model_n,
+        # 拆开也留着，方便看"代码点的这几次分别是谁"
+        "by_code_strong": len(by_code),
+        "by_code_setup": _setup_n,
+        "by_code_permission": _perm_n,
+        "auto_rate": round(code_n / total, 3) if total else 0.0,
         "fallback_reasons": fallbacks,
     }
 
@@ -2156,7 +2212,7 @@ def _recent_actions(state: ChildState, n: int = 3) -> list[dict[str, Any]]:
     return out
 
 
-def decide_node(state: ChildState) -> dict[str, Any]:
+def _base_decide_node(state: ChildState) -> dict[str, Any]:
     """AI 判断点：这一步做完了吗？下一步点哪？（interrupt，无副作用）
 
     两种模式：
@@ -2472,6 +2528,11 @@ class StepAction(BaseModel):
         description=("本步走不通且已修正过一次仍不行 -> 置 true 转入下一步并记问题。"
                      "对应 SKILL「停在别的页面 -> 尝试修正一次，仍不中才停」"))
     give_up_reason: str = ""
+    stuck: bool = Field(
+        default=False,
+        description=("仅代码内部使用：这条 give_up 是不是「整条用例都别跑了」的"
+                     "真卡死（页面根本没变 / 死循环）。"
+                     "模型不用填 —— 填了也没人信，见 check 的处理。"))
     note: str = ""
 
     # ── 副作用声明 ──────────────────────────────────────────────
@@ -2543,7 +2604,7 @@ def _trace_of_tap(action: dict[str, Any],
     return {}
 
 
-def act_node(state: ChildState) -> dict[str, Any]:
+def _base_act_node(state: ChildState) -> dict[str, Any]:
     """执行点击。【无 interrupt】—— 保证恢复不重放。
 
     ⚠️ 关键：act 的返回里已经带了动作后的画面（activity/next/checkpoint），
@@ -2831,11 +2892,14 @@ def act_node(state: ChildState) -> dict[str, Any]:
                 "step": state.get("step_index", 0),
                 "button": c.get("text") or "",
                 "rid": c.get("rid") or "",
-                "x": (c.get("center") or [None, None])[0],
-                "y": (c.get("center") or [None, None])[1],
+                # ★ 不记坐标（用户：「坐标不要了。没意义。」）
+                #
+                # 这里的 x/y 只是**这次在这台机器上**的位置：换设备、换分辨率、
+                # 换系统版本全都不成立。留着容易被人误当成"可以照着点"，
+                # 反而比不记更危险。真正跨设备成立的是「授了哪个权限」
+                # （下面的 permission / owner_package），那个留着。
                 "action": perm.get("action") or "grant",
                 "action_source": perm.get("action_source") or "default",
-                "trigger_click": [int(action["next_x"]), int(action["next_y"])],
                 "event_ids": [str(e) for e in (res.event_ids or [])],
                 # 申请方包名。和被测 App 包名一比就知道是不是被测 App 的权限。
                 #
@@ -2958,137 +3022,8 @@ def act_node(state: ChildState) -> dict[str, Any]:
     return updates
 
 
-def knowledge_node(state: ChildState) -> dict[str, Any]:
-    """子 Agent 自主检索知识卡/路径图（只读，无设备副作用）。
-
-    ⚠️ 关键：查完之后必须**回到 decide** 让模型用上这些内容。
-    早先的实现把命中塞进 action["knowledge"] 就直接去 act/check 了，
-    模型从没看到自己要求检索的东西 —— 这就是 run_168.log 里 knowledge: 0 的根因
-    （检索分支从未真正闭合）。
-
-    同时把 need_knowledge 清掉，并记录**已查过的关键词**：
-    否则模型看到"无命中"可能换个说法再问，同一页反复查形成死循环
-    （实测：不加这个上限时，一个检索词能来回跑满 20 轮直到 max_loops）。
-    """
-    action = state.get("action") or {}
-    kw = (action.get("need_knowledge") or "").strip()
-    if not kw:
-        return {}
-    asked = list(state.get("knowledge_asked") or [])
-    # 上限：一条用例最多查这么多次。防的是模型反复换词检索却不推进
-    # （真机上是纯烧时间——每次检索都要读文件，而步骤毫无进展）。
-    if len(asked) >= MAX_KNOWLEDGE_LOOKUPS:
-        return {"action": {**action, "need_knowledge": "", "knowledge": ""},
-                "issues": [f"知识检索已达上限 {MAX_KNOWLEDGE_LOOKUPS} 次，"
-                           f"「{kw}」跳过"]}
-    if kw in asked:
-        # 同一个词不再重复查，直接把"已查过"告诉模型，逼它自己拿主意
-        return {"action": {**action, "need_knowledge": "", "knowledge": ""},
-                "issues": [f"知识卡「{kw}」已查过，不再重复检索"]}
-    task = state["task"]
-    files = task.get("knowledge_files", [])
-
-    # ★ 两段式：先试"按章节取整节"，没有再退到"全文关键词检索"。
-    #
-    # 为什么要分两步而不是只看关键词：
-    #   模型看到目录后，最自然的动作是说章节名（"导航入口"）。
-    #   如果只做关键词匹配，"导航入口"能命中，但"滚轮"这种
-    #   只出现在 ### 标题里的词，关键词检索只能给到零散几行，
-    #   而模型真正要的是那一整节的上下文。
-    #
-    # 章节匹配优先，是因为它精确 —— 命中了就是作者分好的完整一节。
-    sec_hit = knowledge_mod.best_section(
-        _ctx().skill_root, files, kw)
-    if sec_hit:
-        hit = sec_hit
-    else:
-        hit = knowledge_mod.search(_ctx().skill_root, files, kw, limit=40)
-
-    asked.append(kw)
-    # ★ 把「查了什么、查到什么」单独攒一份，供最后回写 JSON 用
-    #   （用户要求的三样之一：「或者知识卡查询到的知识」）。
-    #   只留前 1200 字：回写要的是"下次能用上的结论"，不是整篇原文。
-    return {"action": {**action, "need_knowledge": "", "knowledge": hit},
-            "knowledge_asked": asked,
-            "knowledge_used": [{"keyword": kw,
-                                "content": str(hit or "")[:1200]}]}
 
 
-def vision_node(state: ChildState) -> dict[str, Any]:
-    """看图（可选）。子 Agent 需要视觉判据时调它，不依赖主模型多模态。
-
-    ## ★ 为什么"看不成"必须真的失败，不能静默
-
-    167 真机（2026-10-20）踩到的：视觉后端因为 max_tokens 被 reasoning
-    吃光而返回空文本，vision 节点把错误写进 issues 就完事了。
-    结果模型**根本不知道没看成**，下一轮又问同一个问题，又空。
-    连续 16 轮、白烧 100 多秒，最后靠模型瞎猜对一个坐标才走出来。
-
-    日志上是这样的（注意它连失败都看不出来）：
-
-        -> 无动作（模型既没给坐标、也没给输入/按键/完成）：
-           {'step_done': False, 'vision_question': '菜单里四项是什么？'}
-
-    机制上的病根：**"问了"和"看到了"之间没有反馈闭环**。
-    模型只能靠自己猜"是不是图里没信息"，而它猜不出来 ——
-    它连"我这次看图失败了"都不知道。
-
-    所以这里做两件事：
-
-      ① 失败次数记进 state，用 `vision_failures` 累计
-      ② 达到上限后，**把 vision_question 从 action 里摘掉**，
-         并明确告诉模型"别再看图了，用现有信息决定"
-
-    ② 是关键：光是再次失败没用，必须让路由不再回到 vision。
-    否则任你怎么报错，它下一轮照样问 —— 因为它手上有个合法动作。
-    """
-    action = state.get("action") or {}
-    q = (action.get("vision_question") or "").strip()
-    shot = state.get("last_shot") or ""
-
-    if not q:
-        return {}
-
-    # ── 看图失败太多次：强制停止这条路 ────────────────────────────
-    #
-    # 阈值 2：第一次失败可能是偶发（网络抖动），给一次重试机会；
-    # 同一个问题失败两次，就不是偶发了，再问也不会有新答案。
-    _fails = int(state.get("vision_failures") or 0)
-    if _fails >= VISION_MAX_FAILURES:
-        _clean = {k: v for k, v in action.items()
-                  if k not in ("vision_question", "vision", "vision_error")}
-        return {
-            "action": _clean,
-            "issues": [
-                f"视觉通道连续失败 {_fails} 次，已强制停止看图，"
-                f"要求模型用现有信息判断（最后一次原因："
-                f"{state.get('vision_error') or '未知'}）"],
-            "progress": [_tick("vision",
-                               f"视觉已连续失败 {_fails} 次，禁止再看图")],
-        }
-
-    if not shot:
-        # 没有截图 ≠ 模型问错了。这是环境的锅，但**必须让模型知道**，
-        # 否则它会以为"图里没有这个信息"，然后一直换着法子问。
-        return _vision_failed(
-            state, action,
-            "拿不到截图（last_shot 为空），这次没看成")
-
-    try:
-        answer = ask_image(_ctx().python, _ctx().skill_root, shot, q)
-    except VisionError as exc:
-        return _vision_failed(state, action, str(exc))
-
-    # 成功：失败计数清零，答案同时挂回 action（本轮用）和 last_vision（下一轮 decide 用）
-    #
-    # ⚠️ last_vision 是必需的，不是冗余：
-    #    vision 之后路由去 observe → 重新 decide，而 action 会被新的
-    #    observe/decide 覆盖。只写 action 的话，模型下一轮就看不到答案了 ——
-    #    这正是 167 连问 21 次的**真正原因**（比 max_tokens 更根本）。
-    return {"action": {**action, "vision": answer},
-            "last_vision": answer,
-            "vision_failures": 0,
-            "vision_error": ""}
 
 
 def _vision_failed(state: ChildState, action: dict[str, Any],
@@ -3398,646 +3333,10 @@ def target_present(locate: str, *, clickable: list[dict[str, Any]] | None = None
     return hit
 
 
-def step_check_node(state: ChildState) -> dict[str, Any]:
-    """判本步是否达成本步目的（用落点判据），决定进下一步还是重试。
-
-    双重保险：AI 说 done 之后，**代码再用 landing 复核一次**。
-    AI 可能乐观（"看起来到了"），代码可不信。
-    """
-    action = state.get("action") or {}
-    task = state["task"]
-    idx = state.get("step_index", 0)
-    step = task["steps"][idx]
-
-    done = bool(action.get("step_done"))
-    give_up = bool(action.get("give_up"))
-    rounds = state.get("round_in_step", 0)
-    limit = state.get("max_rounds_per_step", 8)
-
-    issues: list[str] = []
-    landing = (step.get("landing") or "").strip()
-    act_now = state.get("last_activity") or ""
-
-    # ★ 屏幕上还是**系统权限框**时，本步一律不算完成。
-    #
-    # 真机踩到的判错（168 轮07）：点了「从图库导入」后系统弹出运行时权限框，
-    # 模型看到 next 里只有 button1 就判了"本步完成" —— 于是权限框被当成
-    # "到达图库"，照片权限从没被授予，整条用例判 FAIL。
-    #
-    # 判据用**包名**（用户给的）：系统权限框的包名固定是 permissioncontroller，
-    # App 自己的界面/弹窗包名就是被测 App。不按 activity 认 ——
-    # 权限框是浮层，浮着时被测 App 的 activity 根本不变。
-    front_pkg = state.get("last_package") or ""
-    app_pkg = str(task.get("package") or "")
-    on_sys_perm = is_system_permission_pkg(front_pkg)
-    if done and on_sys_perm:
-        issues.append(
-            f"{step['id']} 声明完成，但屏幕上仍是**系统权限框**"
-            f"（包名 {front_pkg}）—— 权限框不是本步目标，等它被处理完再判")
-        done = False
-
-    if done and landing:
-        hit, why = match_landing(landing, activity=act_now,
-                                 clickable=state.get("obs_clickable"),
-                                 state_pkg=front_pkg)
-        if not hit:
-            issues.append(
-                f"{step['id']} 声明完成但落点不符：期望 {landing}，"
-                f"实际 activity={act_now}（{why}）")
-
-    # 主动放弃：AI 判定本步走不通（已修正过一次）。
-    #
-    # ★ 后续步骤是否继续，取决于**为什么**放弃（会话 #84 实测区分）：
-    #
-    #   ① 偶发/局部原因（找不到某个控件、落点没到）—— 记问题、进下一步。
-    #      这类放弃是"这一步没成"，后面几步说不定还在正常路径上。
-    #
-    #   ② **判定卡死**（同一点连点无效、拒绝换目标）—— 必须**整条用例终止**。
-    #      实测：169 的 s3 在系统相机里连点 intent_back_button 十几轮，
-    #      代码已判定"卡死，终止本用例"，结果 **s4 立刻接着跑**，
-    #      又在同一个相机页卡了 4 分钟。页面根本没变，"进下一步"毫无意义 ——
-    #      后面每一步都只会重演同一个死循环。
-    if give_up and not done:
-        reason = action.get("give_up_reason") or "未给出原因"
-        # 卡死类放弃：终止整条用例，不再推进
-        stuck = any(k in reason for k in ("卡死", "still_stuck", "放弃"))
-        if stuck:
-            return {
-                "status": "BLOCKED",
-                "summary": (f"{step['id']} 判定卡死（{reason}），"
-                            f"整条用例终止（当前 activity={act_now}）"),
-                "issues": issues + [f"{step['id']} 卡死终止：{reason}"],
-                "abort": f"{step['id']} 卡死：{reason}",
-                "findings": [{"kind": "step", "step": step["id"],
-                              "desc": step["desc"], "landing": act_now,
-                              "status": "give_up"}],
-                "progress": [_tick("stuck",
-                                   f"{step['id']} 卡死，终止整条用例",
-                                   step=step["id"])],
-            }
-        # ★ 本步放弃了 -> 记下来，后续步骤照常走。
-        #
-        # 早先这里写的是"整条用例退出纯回放"：因为回放是沿着 YAML 假设的
-        # 路径按坐标一路点下去的，一处断了后面必然全断。
-        # 现在没有回放了 —— 每一步都是拿当前屏重新判断，
-        # 上一步放弃**不会传染**，不需要、也不应该让它影响后面的步骤。
-        return {"step_index": idx + 1,
-                "strong_hits": [{"step": step["id"], "by": "model",
-                                 "reason": f"{step['id']} 放弃"}],
-                "issues": [f"{step['id']} 放弃：{reason}"],
-                "progress": [_tick("fallback",
-                                   f"{step['id']} 放弃，进入下一步",
-                                   step=step["id"])],
-                "findings": [{"kind": "step", "step": step["id"],
-                              "desc": step["desc"], "landing": act_now,
-                              "status": "give_up"}]}
-
-    # ★ 本步判"完成"了，但**代码复核落点不符** —— 该怎么办？
-    #
-    # 用户定的规则：**最多试 3 次，仍不符就 BLOCKED，并停止后续步骤。**
-    #
-    # 为什么不能直接认了：落点不符往往意味着
-    #   ① 页面还在加载（再试一次就好）② 界面真的变了（得叫模型想办法）。
-    # 但也不能无限试：同一个动作反复三次都到不了目标页，说明这条路径本身
-    # 就不成立 —— 那是"关键路径没找到"，属于 BLOCKED 的定义。
-    #
-    # ⚠️ 必须是 BLOCKED 而不是 FAIL：FAIL 的语义是"所有路径都走完了、
-    #    只是结果和预期不符"。而这里连"走没走到"都确定不了，
-    #    后续步骤更没依据，所以必须停下，不能拿它当 FAIL 报出去。
-    #
-    # ⚠️ 这个判断必须放在 `if done:` **之前** ——
-    #    放后面的话 done 分支已经 return 了，永远走不到（写完测试才发现的）。
-    #
-    # ★★★ 这里原本还挂着 `and not state.get("fallback_reason")`，是错的 ★★★
-    #
-    # 167 实测：s0 判完成后停在课程表引导页（要求 AllInOneActivity），
-    # 日志里**一次都没重试**就进了 s1。直接问代码，两种情况的区别很清楚：
-    #
-    #     fallback_reason 为空  -> step_index=None, retry_landing=1  （重试）
-    #     fallback_reason 非空  -> step_index=1,    retry_landing=None（跳过）
-    #
-    # fallback_reason 的语义是「代码定不准，交给模型」—— 说的是**谁来点**，
-    # 跟**点完到没到**是两件事。挂在它上面等于：越是代码没把握的步骤，
-    # 越不做落点核对。而这类步骤恰恰最容易走偏（167 就是点完权限框
-    # 闪出引导页），最该核对。守卫写反了方向。
-    if done and issues:
-        tried = state.get("retry_landing", 0)
-
-        if tried + 1 < LANDING_MAX_TRIES:
-            return {
-                "retry_landing": tried + 1,
-                "issues": issues,
-                "progress": [_tick(
-                    "retry",
-                    f"{step['id']} 落点未到，"
-                    f"第 {tried + 2}/{LANDING_MAX_TRIES} 次尝试（当前 {act_now}）",
-                    step=step["id"])],
-            }
-        why = issues[-1]
-        return {
-            "status": "BLOCKED",
-            "retry_landing": tried + 1,
-            "issues": issues + [
-                f"🚫 {step['id']} 落点不符：试了 {LANDING_MAX_TRIES} 次都没到目标页"
-                f"（期望 {step.get('landing')}，实际停在 {act_now}）。"
-                f"关键路径没找到，后续步骤不再执行"],
-            "findings": [{"kind": "step", "step": step["id"],
-                          "desc": step["desc"],
-                          "landing": act_now,
-                          "status": "blocked"}],
-            "action": None,
-            "summary": (f"{step['id']} 落点不符（{LANDING_MAX_TRIES} 次），"
-                        f"关键路径没找到，用例未执行完"),
-            "progress": [_tick(
-                "blocked",
-                f"{step['id']} 试满 {LANDING_MAX_TRIES} 次仍没到目标页，"
-                f"BLOCKED 终止：{why}",
-                step=step["id"])],
-        }
-
-    if done:
-        # ⚠️ 必须带 kind="step" —— _steps_done() 按它计数。
-        # 曾经漏了这个键，导致 steps_done 恒为 0、闸门失效（3 步全没过却报 PASS）。
-        return {"step_index": idx + 1, "issues": issues,
-                "progress": [_tick("step", f"{step['id']} 完成（{act_now}）",
-                                   step=step["id"])],
-                "findings": [{"kind": "step", "step": step["id"],
-                              "desc": step["desc"],
-                              "landing": act_now,
-                              "status": "ok" if not issues else "landing_miss"}]}
-
-    # ★ 收口：两条路都堵住。
-    #
-    #   `rounds`（round_in_step）只在 act 里自增 —— 模型光说 done 不点时它不动。
-    #   `check_rounds` 由本节点自己数，专门堵"说了 done 又没推进"这条路。
-    #   缺一个就会空转到轮次上限（167 实测连挂 2 次）。
-    crounds = state.get("check_rounds", 0)
-    if rounds >= limit or crounds >= limit:
-        why2 = ("本步一直没动手" if crounds >= limit else f"重试 {rounds} 次")
-        return {"status": "BLOCKED",
-                "summary": f"{step['id']} {why2}仍未收敛，停止",
-                "issues": issues + [
-                    f"{step['id']} 未收敛（act {rounds} 轮 / check {crounds} 轮，"
-                    f"上限 {limit}）"],
-                "step_index": idx + 1,
-                "findings": [{"kind": "step", "step": step["id"],
-                              "desc": step["desc"], "landing": act_now,
-                              "status": "not_converged"}],
-                "progress": [_tick("blocked",
-                                   f"{step['id']} 反复判完成却没推进"
-                                   f"（check {crounds} 轮），停这一步",
-                                   step=step["id"])]}
-
-    # ★ 本步**没判完成**（还有动作没做完）时不需要在这里处理 ——
-    # 路由会把控制权交回 strong_target / decide，它们会给出下一个动作。
-    # 这里只管"做完了但落点不对"，已在上面处理。
-    # ★ 本步还没完成时，看看声明的目标还在不在 —— 不在就记录"换目标"。
-    #
-    # 用户要求：「可以找，但次数要有个限制，不能无限次找，记录里要提示出来」。
-    # 所以这里做三件事：
-    #   1) 如实查目标是否还在当前屏（静默点空是最难查的失败）
-    #   2) 每次不在都留痕 —— 事后能看出"是 UI 变了还是模型在乱试"
-    #   3) 超过上限就停这一步，不拖垮整条用例
-    locate = (step.get("locate") or "").strip()
-    attempts = state.get("locate_attempts", 0)
-    max_attempts = state.get("max_locate_attempts", 3)
-    extra: dict[str, Any] = {}
-
-    if locate:
-        here = target_present(locate, clickable=state.get("obs_clickable"),
-                              nodes_text=state.get("obs_nodes_text", ""))
-        if here is False:
-            attempts += 1
-            extra["locate_attempts"] = attempts
-            why = (action.get("why") or "").strip()
-            mark = {
-                "step": step["id"],
-                "attempt": attempts,
-                "of": max_attempts,
-                "locate": locate,
-                "activity": act_now,
-                "why": why,
-            }
-            extra["locate_tried"] = [mark]
-            note = (f"{step['id']} 第 {attempts}/{max_attempts} 次换目标找："
-                    f"目标 {locate} 不在当前屏（activity={act_now}）"
-                    + (f"，理由：{why}" if why else ""))
-            issues.append(note)
-
-            if attempts > max_attempts:
-                # 超限：停这一步，走 on_fail 语义（记问题 + 推进，不卡死）
-                on_fail = (step.get("on_fail") or "BLOCKED").strip()
-                return {
-                    "status": "BLOCKED",
-                    "summary": (f"{step['id']} 换目标找了 {max_attempts} 次仍找不到 "
-                                f"{locate}，按 on_fail={on_fail} 停止"),
-                    "issues": issues + [
-                        f"{step['id']} 查找次数用尽（上限 {max_attempts}）"],
-                    "step_index": idx + 1,
-                    "findings": [{"kind": "step", "step": step["id"],
-                                  "desc": step["desc"], "landing": act_now,
-                                  "status": "locate_exhausted"}],
-                    "progress": [_tick(
-                        "stuck",
-                        f"{step['id']} 换目标找 {max_attempts} 次仍找不到 {locate}"
-                        f"，停在 {act_now}", step=step["id"])],
-                    **extra,
-                }
-
-    return {"issues": issues,
-            # ★ 自己记一个"同一步里被重新问了几次"的计数，不依赖 act 自增。
-            #
-            #   原先只靠 round_in_step（act 里 +1）来收口，于是有一个
-            #   **无出口的死循环**：
-            #     模型每轮都报 done -> check 复核不通过 -> plan 清 action
-            #     -> decide 再问 -> 又说 done …… 全程**没有 act**，
-            #     round_in_step 恒为 0，上面 `rounds >= limit` 永远不成立。
-            #   真机实测（167，两次）：decide 80 / plan 79 / check 78，
-            #   act 只有 1 次，一路空转到轮次上限，最后报 BLOCKED，
-            #   看起来像环境问题，其实是判定卡住。
-            #
-            #   这里用 check_rounds 自己数：每进一次 check 就 +1，
-            #   换步时由 plan 归零。够 limit 次还在这步没结论，就停。
-            "check_rounds": state.get("check_rounds", 0) + 1,
-            "progress": [_tick("retry",
-                               f"{step['id']} 第 {rounds + 1} 轮：{act_now}"
-                               + (f"｜{issues[-1]}" if issues else ""),
-                               step=step["id"])],
-            **extra}          # 回 decide 重试
 
 
-def assert_node(state: ChildState) -> dict[str, Any]:
-    """断言节点（外层壳）：负责清理"补证据"标记，然后转调真正的实现。
-
-    ## 为什么要有这层壳
-    `_assert_node_inner` 里有 6 个 return 分支，每个都要带上"清掉
-    assert_fix_task"这件事。写在里面就得改 6 处，以后加分支还会漏。
-    包一层是唯一能保证**任何出口都清干净**的写法。
-
-    ## 为什么必须清
-    assert_fix_task 是"请执行器去点一下"的标记：
-      · 不清 -> route_after_observe 一直送回 assert（标记还在 → 死循环）
-      · 不清 -> route_after_verdict 一直送回 act（点个没完）
-    执行器点完、observe 完，回到这里就是"补完了"，标记必须在进来时失效。
-
-    ## 为什么清理放在最外面
-    assert_node 是 interrupt 节点，恢复时**整个节点从头重跑**。
-    写在 interrupt 之后的清理，恢复那一轮可能根本不执行 —— 那就白写了。
-    """
-    out = _assert_node_inner(state)
-    if state.get("assert_fix_task"):
-        out = {**out, "assert_fix_task": {}}
-    return out
 
 
-def _assert_node_inner(state: ChildState) -> dict[str, Any]:
-    """逐条收预期（一次一条）。"""
-    from langgraph.types import interrupt
-    task = state["task"]
-    idx = len(state.get("findings", [])) - _steps_done(state)
-    asserts = task["asserts"]
-
-    # 已收完
-    done_assers = len([f for f in state.get("findings", []) if f.get("kind") == "assert"])
-    if done_assers >= len(asserts):
-        return {"pending": {"kind": "finish"}}
-
-    # ★★ 挑哪一条断言：**先判当前这一步的**（用户的要求）★★
-    #
-    # 「一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
-    #
-    # 早先是死按 asserts 的书写顺序取（asserts[done_assers]），
-    # 而进入 assert 的时机又是"所有步骤都走完" —— 于是判 a13 时
-    # 编辑弹窗早就关了，色块一个都看不到。
-    #
-    # 现在：如果 state 里有"刚做完的这一步"，先把它名下没判的断言收掉。
-    # 没有标记（比如起头就没步骤了）就退回原来的顺序取法。
-    a = None
-    _cur = str(state.get("assert_step") or state.get("last_step_id") or "")
-    if _cur:
-        _mine = _pending_asserts_for_step(state, _cur)
-        if _mine:
-            a = _mine[0]
-    if a is None:
-        a = asserts[done_assers]
-
-    # ★★ 复核循环的"再问一次"出口。
-    #
-    # 上一轮 assert_node 交出去问模型时留了一个标记 `assert_pending_for`
-    # （= 这是哪条断言的复核）。现在带着模型的回复回来了：
-    #   · AI 说成立      -> 交 verdict 落 PASS（verdict 里有 ai_recheck 例外）
-    #   · AI 说不成立/看不清，且复核次数没用完 -> **再问一次**
-    #     （模型上一轮可能是看漏了，也可能这次给的上下文更全 ——
-    #       把上一轮的意见塞进 payload，让它知道"你上次是这么说的"）
-    #   · 次数用完       -> 交 verdict，以代码结论收口
-    #
-    # ⚠️ 为什么"再问一次"一定要在这里做、不能交给路由：
-    #    interrupt() 恢复时整个节点会**从头再跑一遍**，所以"问了没"这件事
-    #    必须由 state 里的标记判，不能靠"代码走到哪一行"来判。
-    pend = state.get("pending") or {}
-    if pend.get("ai_recheck") and pend.get("assert_id") == a["id"]:
-        n = int(state.get("assert_ai_rounds") or 0)
-        if pend.get("passed") is not True and n < ASSERT_AI_RECHECK_MAX:
-            print(f"  [assert] {a['id']} AI 复核第 {n} 次未采信，"
-                  f"再问一次（{n + 1}/{ASSERT_AI_RECHECK_MAX}）",
-                  file=sys.stderr)
-            seen_acts2: set[str] = set()
-            for v in (state.get("visited") or []):
-                s = str(v)
-                if "->" in s:
-                    left, right = s.split("->", 1)
-                    seen_acts2.add(left.strip())
-                    seen_acts2.add(right.strip())
-                else:
-                    seen_acts2.add(s.strip())
-            if state.get("last_activity"):
-                seen_acts2.add(str(state["last_activity"]))
-            last = str(pend.get("actual") or "")
-            steps0 = task.get("steps", [])
-            idx_step0 = min(state.get("step_index", 0), max(len(steps0) - 1, 0))
-            step_ctx0 = steps0[idx_step0] if steps0 else {}
-            # 复核轮也取"这条断言该看的那一步"的证据（与首次判定同一份）
-            _ev2 = _evidence_for_assert(state, a)
-            _evd2 = _ev2["data"]
-            # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
-            _vis2 = _vision_for_assert(state, a, _evd2)
-            recheck_payload = {
-                "kind": "assert",
-                "index": done_assers + 1, "total": len(asserts),
-                "assert_id": a["id"], "desc": a["desc"],
-                "check": a.get("check"), "assert_expect": a.get("check"),
-                "case_title": task.get("title"),
-                "step_desc": step_ctx0.get("desc"),
-                "step_landing": step_ctx0.get("landing"),
-                "steps_done": _steps_done(state),
-                "step_total": len(steps0),
-                "activity": state.get("last_activity"),
-                "activity_reached": _activity_reached(
-                    state, str(a.get("check") or "")),
-                "code_verdict": False,
-                "code_why": str(pend.get("code_why") or ""),
-                "prev_opinion": last,
-                # ★ 复核轮同样**不给图**（与首次判定保持一致）。
-                #   复核的意义是"请再核对一遍 XML 证据"，不是"换张图看"。
-                #   真要图，得走 vision 通道 —— 见下面 evidence 那几项。
-                "evidence_source": _ev2["source"],
-                "evidence_bound": _ev2["bound"],
-                "screen_activity": _evd2.get("activity") or "",
-                "screen_nodes_text": _evd2.get("nodes_text") or "",
-                "screen_nodes": _evd2.get("nodes") or [],
-                "screen_clickable": _evd2.get("clickable") or [],
-                "vision_result": _vis2,
-                "image": "",
-                "question": (
-                    f"这是第 {n + 1}/{ASSERT_AI_RECHECK_MAX} 次复核。"
-                    f"上一轮你的判断是「{last or '（未给出）'}」。"
-                    "如果上一轮是你没看仔细，这次请重新核对界面内容和控件清单；"
-                    "如果上一轮的判断是对的，直接维持 passed=false 并在 actual 里"
-                    "写清实际是什么样。仍然看不清就 passed=null。"),
-                "activity_seen": sorted(seen_acts2),
-                "evidence_event_ids": state.get("last_event_ids", []),
-                "visited": state.get("visited", [])[-8:],
-                "clickable": state.get("obs_clickable", []),
-                "seen_rids": sorted(set(state.get("seen_rids") or [])),
-                "knowledge": (state.get("action") or {}).get("knowledge") or "",
-                "knowledge_files": task.get("knowledge_files", []),
-            }
-            answer = interrupt(recheck_payload, response_schema=AssertVerdict)
-            if isinstance(answer, AssertVerdict):
-                answer = answer.model_dump()
-            answer["ai_recheck"] = True
-            # ★ code_why 必须一路带下去。
-            #   复核轮再问一次时，payload 里要写的"代码原话"就是它 ——
-            #   丢了的话第 2、3 次复核拿不到"代码为什么说不成立"，
-            #   模型只能瞎猜，等于复核质量一轮比一轮差。
-            answer["code_why"] = str(pend.get("code_why") or "")
-            # 记下这一轮的判断，下一轮复核当"你上次是这么说的"用。
-            return {"pending": answer, "assert_ai_rounds": n + 1,
-                    "assert_ai_last": str(answer.get("actual") or "")}
-
-    # 带上步骤上下文：断言要对照"哪一步、期望什么"才判得准。
-    # 第一次真跑时只给了断言描述，模型看到系统图库就判 FAIL
-    # ——它不知道 a1 其实在 s1 之后就该成立，而当时早已走过 s3。
-    steps = task.get("steps", [])
-    idx_step = min(state.get("step_index", 0), max(len(steps) - 1, 0))
-    step_ctx = steps[idx_step] if steps else {}
-
-    # ★ 代码判定"该 activity 本次是否到达过" —— 不靠模型回头翻路径。
-    # 见 _activity_reached 的说明：断言在流程末尾判，"当前在哪"天然不可靠。
-    visited_acts = [str(v) for v in (state.get("visited") or [])]
-    seen_acts: set[str] = set()
-    for v in visited_acts:
-        if "->" in v:
-            left, right = v.split("->", 1)
-            seen_acts.add(left.strip())
-            seen_acts.add(right.strip())
-    if state.get("last_activity"):
-        seen_acts.add(str(state["last_activity"]))
-
-    check_s = str(a.get("check") or "")
-    activity_reached = _activity_reached(state, check_s)
-
-    # ★ 结构化判据的代码判定结果（复用用例 YAML 的 check 形状）。
-    # None = 代码判不了（要看图），交回模型；True/False = 硬事实。
-    code_verdict, code_why = evaluate_check(a.get("check"), state=state)
-
-    # ★ 代码判定成立 -> 强证据直通，**不问模型**。
-    #
-    # 为什么成立时可以跳过：activity= / node_present= / package= 这类判据是
-    # 硬事实 —— 设备报上来的 activity 名、dump 里有没有这个 rid，
-    # 没有解释空间。让模型"确认"一遍只会多烧一轮 LLM 和几十秒，
-    # 而它除了照抄代码的结论也做不了别的（原实现就是把结论塞进 prompt
-    # 再让它复述一遍）。
-    #
-    # ★★ 但**代码判定不成立时，必须让 AI 介入复核**（用户要求）。
-    #
-    # 为什么"不成立"和"成立"不能对称处理：
-    #   "成立"只要证据出现在留痕里就是硬事实；
-    #   "不成立"却是**代码搜不到** —— 它可能是真没有，也可能是
-    #   `seen_screens` 截断 / 文案被拆分到多个节点 / rid 改了名 /
-    #   控件没进可点列表。拿"我没搜到"直接当"功能坏了"，就是让
-    #   YAML 里的一个过期 rid 变成对产品的指控。
-    #
-    #   实测（177 a4）：`text ✘ 周末是否有课` 判 FAIL，但那个文案到底
-    #   在不在页面上，代码其实说不清 —— 报出来的只是"我没在留痕里搜到"。
-    #
-    # 所以 FAIL 方向交回模型看图判，最多 ASSERT_AI_RECHECK_MAX 次
-    # （用户定的"AI 判断 3 次上限"）。模型也判不了时**维持代码结论**，
-    # 不因为"没复核成"就改判 PASS。
-    if code_verdict is True:
-        print(f"  [assert] {a['id']} 代码强判定：成立（{code_why}），不问模型",
-              file=sys.stderr)
-        return {"pending": {
-            "kind": "verdict", "assert_id": a["id"],
-            "passed": True,
-            "actual": f"[代码判定] {code_why}",
-            "event_id": (state.get("last_event_ids") or [""])[0],
-            "by_code": True,
-        }}
-
-    if code_verdict is False:
-        n = int(state.get("assert_ai_rounds") or 0)
-        if n < ASSERT_AI_RECHECK_MAX:
-            # 这条断言该看的那一步的证据（与常规判定同一份）
-            _ev1 = _evidence_for_assert(state, a)
-            _evd1 = _ev1["data"]
-            # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
-            _vis1 = _vision_for_assert(state, a, _evd1)
-            print(f"  [assert] {a['id']} 代码判定不成立（{code_why}），"
-                  f"交 AI 复核 第 {n + 1}/{ASSERT_AI_RECHECK_MAX} 次",
-                  file=sys.stderr)
-            # ★★★ 这里必须**真的 interrupt 去问模型** ★★★
-            #
-            # 之前这里 `return {"pending": {"kind":"assert", ...}}` ——
-            # 只是把"我要问模型"这个**请求**当 state 返回，**没有任何地方
-            # 把它交给模型**：图按 route_after_assert 把它送进 verdict 节点，
-            # 而 verdict 节点的 `v = state["pending"]` 是**模型回复**的位置，
-            # 读出来自然没有 passed / actual。
-            #
-            # 结果就是报告里那句假话：「模型回复无法解析，本条未做判定（）」
-            # —— 模型连问题都没看到，却被记成"它答得乱七八糟"。
-            # 176 的 a4/a5 两条就是这么变的 BLOCKED，查了半天才发现
-            # 日志里 a4/a5 **一条提示词都没有**（对比 a6 有完整问答）。
-            #
-            # 教训：`pending` 有两个语义完全不同的用途 ——
-            #   · "要问模型的东西" → 必须 interrupt()
-            #   · "模型已经答的"    → 可以直接 return
-            # 混用就会出现这种"请求被当成答案"的静默错误。
-            _recheck_payload = {
-                "kind": "assert",
-                "index": done_assers + 1, "total": len(asserts),
-                "assert_id": a["id"], "desc": a["desc"],
-                "check": a.get("check"), "assert_expect": a.get("check"),
-                "case_title": task.get("title"),
-                "step_desc": step_ctx.get("desc"),
-                "step_landing": step_ctx.get("landing"),
-                "steps_done": _steps_done(state),
-                "step_total": len(steps),
-                "activity": state.get("last_activity"),
-                "activity_reached": activity_reached,
-                "code_verdict": code_verdict,
-                "code_why": code_why,
-                # ★ 明确告诉模型：代码说"不成立"，但那是**代码没搜到**，
-                #   不是判决。请你看图/看控件上下文自己判。
-                "question": (
-                    f"代码按判据 {a.get('check')!r} 没搜到证据"
-                    f"（{code_why}），但**这只说明代码没找到，不代表功能不对**："
-                    "可能是文案被拆分到多个控件、控件没进可点列表、"
-                    "或 YAML 里的 rid 已经改名。"
-                    f"证据来自{_ev1['source']}，只有 XML 文字（**没有图片**）。"
-                    "请对照下面的控件清单自行判断这条预期是否达成。"
-                    "真的没达成 -> passed=false；看得出达成了 -> passed=true；"
-                    "看不清 -> passed=null 并在 actual 说明看不清什么。"),
-                # ★ 与首次判定一致：**不给图**，按步取 XML 证据
-                "evidence_source": _ev1["source"],
-                "evidence_bound": _ev1["bound"],
-                "screen_activity": _evd1.get("activity") or "",
-                "screen_nodes_text": _evd1.get("nodes_text") or "",
-                "screen_nodes": _evd1.get("nodes") or [],
-                "screen_clickable": _evd1.get("clickable") or [],
-                "vision_result": _vis1,
-                "image": "",
-                "activity_seen": sorted(seen_acts),
-                "evidence_event_ids": state.get("last_event_ids", []),
-                "visited": state.get("visited", [])[-8:],
-                "seen_rids": sorted(set(state.get("seen_rids") or [])),
-                "knowledge": (state.get("action") or {}).get("knowledge") or "",
-                "knowledge_files": task.get("knowledge_files", []),
-            }
-            _ans = interrupt(_recheck_payload, response_schema=AssertVerdict)
-            if isinstance(_ans, AssertVerdict):
-                _ans = _ans.model_dump()
-            # 打上"这是复核轮"的标记：verdict 节点靠它豁免 activity 改判。
-            return {"pending": {**_ans, "ai_recheck": True},
-                    "assert_ai_rounds": n + 1,
-                    "assert_ai_last": str(_ans.get("actual") or ""),
-                    "assert_pending_for": a["id"]}
-
-        # 复核次数用尽：以代码结论收口，并**如实记一条**
-        print(f"  [assert] {a['id']} 代码判定不成立，"
-              f"AI 复核 {ASSERT_AI_RECHECK_MAX} 次未能改判，维持代码结论",
-              file=sys.stderr)
-        # 读 AI 最后一次意见：它会由 assert_verdict_node 写进 assert_ai_last。
-        # 读不到就只报代码结论，不编。
-        _last = str(state.get("assert_ai_last") or "").strip()
-        return {"pending": {
-            "kind": "verdict", "assert_id": a["id"],
-            "passed": False,
-            "actual": (f"[代码判定·AI已复核{ASSERT_AI_RECHECK_MAX}次] {code_why}"
-                       + (f"｜AI 意见：{_last}" if _last else "")),
-            "event_id": (state.get("last_event_ids") or [""])[0],
-            "by_code": True,
-        }, "assert_ai_rounds": 0}
-
-    # 取这条断言该看的那一步的证据（见 _evidence_for_assert）
-    _ev = _evidence_for_assert(state, a)
-    _evd = _ev["data"]
-    # ★ 颜色/形状/数不准的预期：先问一次视觉（用该步骤那一张图）
-    _vis = _vision_for_assert(state, a, _evd)
-
-    payload = {
-        "kind": "assert",
-        "index": done_assers + 1, "total": len(asserts),
-        "assert_id": a["id"], "desc": a["desc"], "check": a.get("check"),
-        "assert_expect": a.get("check"),
-        "case_title": task.get("title"),
-        "step_desc": step_ctx.get("desc"),
-        "step_landing": step_ctx.get("landing"),
-        "steps_done": _steps_done(state),
-        "step_total": len(steps),
-        # ★★★ 这里**不给图**，只给 XML 证据 ★★★
-        #
-        # 用户定的优先级：XML 能判就用 XML；文字要靠 OCR 才认得出就走 OCR；
-        # 两个都不行才请视觉模型。**图片只走 vision 那条独立通道**，
-        # 不随断言一股脑塞给判定模型。
-        #
-        # 为什么必须撤掉（run 68 实测，8 条断言）：
-        #   · 每条提示词 51.7 万字符，其中图片 51.4 万 —— 占 99.3%，
-        #     文字证据只有 3.4 千；
-        #   · 8 条断言的图片 base64 **md5 完全一致**（都是最后那张 step16），
-        #     而它们要验的是不同时刻的不同界面；
-        #   · 提示词里**没有一句话**说明这张图是哪一步的。
-        #   结果是 a6 拿着「编辑课程」那张图去找「新建课程表」的完成按钮，
-        #   只能答"看不到" —— 看起来像模型不行，其实是证据给错了。
-        #
-        # 现在给的是**这条断言所属那一步**的快照（见 _evidence_for_assert），
-        # 并且明确写上"证据来自哪一步"，让模型知道自己在看哪一屏。
-        "evidence_source": _ev["source"],
-        "evidence_bound": _ev["bound"],
-        "screen_activity": _evd.get("activity") or "",
-        "screen_nodes_text": _evd.get("nodes_text") or "",
-        "screen_nodes": _evd.get("nodes") or [],
-        "screen_clickable": _evd.get("clickable") or [],
-        "screen_dump": _evd.get("dump") or "",
-        "vision_result": _vis,
-        "image": "",          # ★ 判定不给图，看图请走 vision 通道
-        "activity": _evd.get("activity") or state.get("last_activity"),
-        # 代码算好的硬事实：None=不适用，True/False=到达过没有
-        "activity_reached": activity_reached,
-        "code_verdict": code_verdict,
-        "code_why": code_why,
-        "activity_seen": sorted(seen_acts),
-        "evidence_event_ids": state.get("last_event_ids", []),
-        "visited": state.get("visited", [])[-8:],
-        # 整个执行过程中见过的控件 —— 供 node_present=rid=X 这类判据使用。
-        "seen_rids": sorted(set(state.get("seen_rids") or [])),
-        "knowledge": (state.get("action") or {}).get("knowledge") or "",
-        "knowledge_files": task.get("knowledge_files", []),
-        "question": (
-            # ★ 代码判得了的，就别让模型猜 —— 直接告诉它结论。
-            f"代码已判定该判据**{'成立' if code_verdict else '不成立'}**"
-            f"（{code_why}），请按此结论作答。"
-            if code_verdict is not None else
-            f"证据来自{_ev['source']}，只有 XML 文字（**没有图片**）。"
-            "这条预期达成了吗？actual 写具体现象；"
-            "event_id 必须取自 evidence_event_ids。"
-            "XML 里确实找不到依据、且你认为必须看图才能判 -> passed=null，"
-            "并在 actual 里写清要看的到底是什么。"),
-    }
-    answer = interrupt(payload, response_schema=AssertVerdict)
-    if isinstance(answer, AssertVerdict):
-        answer = answer.model_dump()
-    return {"pending": answer}
 
 
 class AssertVerdict(BaseModel):
@@ -4124,38 +3423,6 @@ def _steps_done(state: ChildState) -> int:
 
 
 
-def _activity_reached(state: ChildState, check: Any) -> bool | None:
-    """代码判定 activity= 判据是否"本次到达过"。
-
-    返回 None 表示该判据不是 activity= 类型（不适用）。
-
-    ⚠️ 为什么必须是代码判：断言是**流程走完后**统一判的，
-    那时早就翻到下一页了。"当前在哪"和"到达过没有"是两回事，
-    而 activity= 判据问的是后者。
-    实测踩到：a1 要 .timetable.display.TimetableActivity，
-    判的时候停在系统图库，模型照"当前"判了 FAIL —— 日志显示第 5-8 轮确实到过。
-
-    ⚠️ check 现在可能是**字典**（用例 YAML 的结构化判据），所以先排除非字符串
-    —— 那种情况交给 evaluate_check，不要在这里 str(dict) 出个乱字符串去比对。
-    """
-    if not isinstance(check, str):
-        return None
-    check_s = check.strip()
-    if not check_s.startswith("activity="):
-        return None
-    want = check_s.split("=", 1)[1].strip().strip('"\'')
-    acts: set[str] = set()
-    for v in (state.get("visited") or []):
-        s = str(v)
-        if "->" in s:
-            left, right = s.split("->", 1)
-            acts.add(left.strip())
-            acts.add(right.strip())
-        else:
-            acts.add(s.strip())
-    if state.get("last_activity"):
-        acts.add(str(state["last_activity"]))
-    return any(want in act for act in acts)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -4337,570 +3604,8 @@ def evaluate_check(check: Any, *, state: ChildState) -> tuple[bool | None, str]:
 
     ⚠️ 别在这里重新启用——除非有一套在真机上验证过、不会误判的判据。
     """
-    return None, "判据已停用，断言一律交 AI 现场判断"
-
-    # 字符串形式：沿用 --expect 语法（activity=A,rid=B）
-    if isinstance(check, str):
-        s = check.strip()
-        if not s:
-            return None, "空判据"
-        if s.startswith("activity="):
-            r = _activity_reached(state, s)
-            return r, ("activity 到达过" if r else "activity 从未出现")
-        hit, why = match_landing(s, activity=str(state.get("last_activity") or ""),
-                                 clickable=state.get("obs_clickable"),
-                                 nodes_text=state.get("obs_nodes_text", ""),
-                                 state_pkg=str(state.get("last_package") or ""))
-        return hit, why
-
-    if not isinstance(check, dict):
-        return None, f"判据形状不认识：{type(check).__name__}"
-
-    results: list[bool] = []
-    notes: list[str] = []
-
-    # 见过的所有 rid（累加）—— 断言在流程末尾判，那时控件可能早已翻页
-    seen = {str(r) for r in (state.get("seen_rids") or [])}
-    now_rids = {str(n.get("r") or "") for n in (state.get("obs_clickable") or [])}
-    all_rids = seen | now_rids
-    screen = str(state.get("obs_nodes_text") or "")
-    last_pkg = str(state.get("last_package") or "")
-
-    # ★ 文案判据要搜**过程中所有屏**，不只最后一屏。
-    #
-    # 同上道理：断言在流程末尾才判，那时人早翻走了。
-    # 177 a4 要判「周末是否有课」—— 那是页面上一个**没有 rid 的标题行**，
-    # 进不了 seen_texts；末尾判时停在别的页，`want in screen` 必然 False。
-    # 结果是把"过程中明明出现过"判成"不成立"，用例白跑一遍。
-    #
-    # 所以：只要在**任何一屏**里出现过就算成立。
-    # 这不降低严格性 —— 判据的语义本来就是"这个过程里有没有过这个文案"，
-    # 不是"现在这一刻还在不在"（后者应该用 node_present 判当前屏）。
-    _screens = [screen]
-    for s in (state.get("seen_screens") or []):
-        s = str(s or "")
-        if s and s not in _screens:
-            _screens.append(s)
-
-    def _text_seen(want: str) -> bool:
-        if not want:
-            return False
-        return any(want in s for s in _screens)
-
-    for key, val in check.items():
-        if key in ANNOTATION_CHECKS:
-            continue
-        if key not in KNOWN_CHECKS:
-            # ★ 不认识的判据 -> 显式报错，绝不静默跳过
-            notes.append(f"⚠️ 不认识的判据键 `{key}`（未实现，未参与判定）")
-            continue
-
-        if key in ("activity", "activity_changed_to"):
-            want = str(val).strip()
-            ok = _activity_reached(state, f"activity={want}") is True
-            results.append(ok)
-            notes.append(f"activity {'✔' if ok else '✘'} {want}")
-
-        elif key == "package":
-            want = str(val).strip()
-            # 包名只反映**当前**前台；历史包名没留痕，所以只判当前
-            ok = bool(last_pkg) and (want in last_pkg)
-            results.append(ok)
-            notes.append(f"package {'✔' if ok else '✘'} {want}（当前 {last_pkg or '未知'}）")
-
-        elif key == "permission":
-            # ★ 判"**被测 App** 有没有被授予某个权限"。
-            #
-            # 用户的原则：
-            #   「我们测试是测试APP。同意了才能打开相机。只要打开就行了。
-            #     哪怕打开后相机APP权限。那不是我们这个case关心的。」
-            #
-            # 所以判**授权结果**，不判"屏幕上有没有出现过弹窗"——
-            # 弹窗只是过程，而且系统权限框是系统的（包名固定
-            # com.android.permissioncontroller），App 弹窗是 App 自己的，
-            # 两者都不该拿来当"权限给没给"的判据。
-            #
-            # 写法：permission: {CAMERA: true} / {"READ_MEDIA_IMAGES": true}
-            #   true  = 必须已授予
-            #   false = 必须未授予
-            #
-            # 数据来源：执行期把状态查下来存进 state["granted_permissions"]
-            # （见 snapshot_permissions）。查不到就是 None —— **不猜**。
-            granted = state.get("granted_permissions") or {}
-            if isinstance(val, dict):
-                items = list(val.items())
-            else:
-                items = [(str(val), True)]
-            if not granted:
-                # 没查过 -> 判不了，交模型。绝不默认"成立"。
-                return None, "没有查到权限授予状态（无法判定）"
-            for pname, want in items:
-                want_ok = bool(want) if not isinstance(want, str) else \
-                    want.strip().lower() not in ("false", "no", "0", "denied")
-                name = str(pname)
-                # 允许写短名：CAMERA -> android.permission.CAMERA
-                full = name if name.startswith("android.permission.") \
-                    else f"android.permission.{name}"
-                got = granted.get(full)
-                if got is None:
-                    results.append(not want_ok)
-                    notes.append(
-                        f"permission {'✘' if want_ok else '✔'} {name}"
-                        f"（被测 App 未声明该权限）")
-                    continue
-                ok = (bool(got) == want_ok)
-                results.append(ok)
-                notes.append(
-                    f"permission {'✔' if ok else '✘'} {name}"
-                    f"（当前{'已' if got else '未'}授予）")
-
-        elif key in ("node_present", "rid_present", "nodes_present"):
-            if isinstance(val, dict):
-                want = str(val.get("rid") or "").strip()
-            elif isinstance(val, (list, tuple)):
-                want = ""
-                for one in val:
-                    if isinstance(one, dict) and one.get("rid"):
-                        ok = str(one["rid"]) in all_rids
-                        results.append(ok)
-                        notes.append(f"rid {'✔' if ok else '✘'} {one['rid']}")
-                continue
-            else:
-                want = str(val).strip()
-            ok = want in all_rids
-            results.append(ok)
-            notes.append(f"rid {'✔' if ok else '✘'} {want}")
-
-        elif key == "node_absent":
-            want = str((val or {}).get("rid") if isinstance(val, dict) else val).strip()
-            ok = want not in all_rids
-            results.append(ok)
-            notes.append(f"rid 缺席 {'✔' if ok else '✘'} {want}")
-
-        elif key in ("node_text", "text_present"):
-            if isinstance(val, dict):
-                want = str(val.get("equals") or val.get("text") or "").strip()
-                rid = str(val.get("rid") or "").strip()
-                if rid:
-                    # ★ 先看**过程中见过**的文案，再看当前屏。
-                    # 断言是末尾才判的，那时控件多半已经翻页翻走了 ——
-                    # 只看当前屏会把"过程中明明对"判成"不成立"
-                    # （168 的 a1 就这么被误判成 FAIL 的）。
-                    got = ""
-                    for rec in reversed(state.get("seen_texts") or []):
-                        if str(rec.get("rid") or "") == rid:
-                            got = str(rec.get("text") or "")
-                            break
-                    if not got:
-                        for n in (state.get("obs_clickable") or []):
-                            if str(n.get("r") or "") == rid:
-                                got = str(n.get("t") or n.get("text") or "")
-                                break
-                    if not got:
-                        # ★ 值节点（clickable=false）不在可点列表里，但在语义节点里。
-                        #   178 的 tv_lesson_duration「50分钟」就是这种 ——
-                        #   只查可点列表永远读不到它的文案，于是 a2/a3 判不出。
-                        for n in (state.get("obs_nodes") or []):
-                            if str(n.get("r") or n.get("rid") or "") == rid:
-                                got = str(n.get("t") or n.get("text") or "")
-                                break
-                    if not got:
-                        # 控件压根没带文案（或没进可点列表）：只能靠整屏文案兜底。
-                        # ★ 这里必须把"兜底命中"和"真没出现"分开写。
-                        #   原来两种情况都记「没见过该控件」，于是会出现
-                        #   `text ✔ alertTitle=…（没见过该控件）` 这种自相矛盾的
-                        #   备注 —— 判是过了，但排查的人会以为证据缺失。
-                        ok = _text_seen(want)
-                        how = ("（控件没进可点列表，整屏文案里出现过）" if ok
-                               else "（整屏文案里也没有）")
-                    else:
-                        ok = got == want
-                        how = f"（实际「{got}」）"
-                    results.append(ok)
-                    notes.append(f"text {'✔' if ok else '✘'} {rid}={want}{how}")
-                else:
-                    ok = _text_seen(want)
-                    results.append(ok)
-                    notes.append(f"text {'✔' if ok else '✘'} {want}")
-            else:
-                want = str(val).strip()
-                ok = _text_seen(want)
-                results.append(ok)
-                notes.append(f"text {'✔' if ok else '✘'} {want}")
-
-        elif key in ("dialog_present", "dialog_present_on_tap", "dialog_on_tap"):
-            # 判据是"某弹框在不在"。弹框的可靠标志：**包名是系统权限框**
-            # （用户定的规则），或者目标 rid 出现在当前可点项里。
-            want_rid = ""
-            if isinstance(val, dict):
-                want_rid = str(val.get("rid") or "").strip()
-            if want_rid:
-                ok = want_rid in now_rids or want_rid in all_rids
-            else:
-                ok = False
-            results.append(ok)
-            notes.append(f"弹框 {'✔' if ok else '✘'} rid={want_rid or '(未指明)'}")
-
-        elif key == "after_tap":
-            # 嵌套子判据：点了之后应该出现的东西。就地展开递归判。
-            if isinstance(val, dict) and val:
-                sub, sub_why = evaluate_check(val, state=state)
-                if sub is None:
-                    notes.append(f"after_tap 判不了（{sub_why}）")
-                else:
-                    results.append(sub)
-                    notes.append(f"点击后 {'✔' if sub else '✘'} {sub_why}")
-            else:
-                notes.append(f"after_tap 形状不认识：{val!r}")
-
-        else:  # pragma: no cover - 上面已穷举
-            notes.append(f"（{key} 未处理）")
-
-    if not results:
-        return None, "；".join(notes) or "无有效判据"
-    return all(results), "；".join(notes)
 
 
-def assert_verdict_node(state: ChildState) -> dict[str, Any]:
-    """落 finding（含证据校验）。副作用集中在这里。"""
-    dev = _ctx().device
-    task = state["task"]
-    done_assers = len([f for f in state.get("findings", []) if f.get("kind") == "assert"])
-    a = task["asserts"][done_assers]
-    v = state.get("pending") or {}
-
-    valid = set(state.get("last_event_ids") or [])
-    got = str(v.get("event_id", "") or "").strip()
-    actual = str(v.get("actual", ""))
-    # ★ "判不了" 必须和 "判失败" 分开。
-    #
-    # v["unknown"] 由 subagent._answer 在**模型回复解析不了**时置位。
-    # 以前这里写的是 `passed = bool(v.get("passed"))`，None 会被转成 False
-    # → 一条格式错误被静默算成"断言失败" → 用例 FAIL。
-    # 那是**猜**，而且猜的是最坏的方向：把"没验成"说成"功能坏了"。
-    #
-    # 现在的处理：
-    #   · 先看代码判据（check 是结构化的就能直接定论）
-    #   · 代码也判不了 → 这条记 UNKNOWN，不冒充 PASS/FAIL
-    unreviewed = bool(v.get("unknown"))
-    # ⚠️ 显式区分三态。`bool(None)` 会变 False —— 那就是"把没验成当成验失败"，
-    #    正是上面注释里批评过的那类错。模型回 null = 它没看清，
-    #    这时应该走 unknown，交给代码判据或记成未判定。
-    _p = v.get("passed")
-    if _p is None:
-        unreviewed = True
-        passed = False
-    else:
-        passed = bool(_p)
-
-    issues: list[str] = []
-    # ★ 代码判定的结论不需要模型给证据 ID —— 它的证据是设备状态本身
-    #   （activity 名、dump 里的 rid），比模型随手贴的 event_id 更硬。
-    #   不加这个例外的话，直通结论会被误记成"缺证据"。
-    #
-    # ⚠️ 必须在"补证据"那段之前取 —— 那段要用 by_code 判"这是不是代码定论"。
-    #    放到后面会 UnboundLocalError（实测踩过）。
-    by_code = bool(v.get("by_code"))
-    # ★★★ 证据不够 → 请执行器补一步动作，**这一条先不落 finding** ★★★
-    #
-    # 用户的需求（原话）：
-    #   「检查 10 个色块。条件不满足了。那就退回执行增加个步骤呗」
-    #   「最多 3 次，但要防止一直点相同的」
-    #   「那就如果报 FAIL。验证不报 BLOCK」
-    #
-    # 触发条件三条同时成立：
-    #   ① 模型这轮判不了（passed=None）—— 判得了就不该再折腾
-    #   ② 它给了 need_action（带 related_elements）—— 知道该点哪
-    #   ③ 这条断言补证据次数还没到上限
-    #
-    # 拦截点必须在落 finding **之前**：一旦写了 finding，这条断言就算"已收"，
-    # 后面 route_after_verdict 会拿 done_assers 推进到下一条，再也回不来了。
-    _na = v.get("need_action") or {}
-    _na_ok = isinstance(_na, dict) and (
-        _na.get("verify_target") or _na.get("related_elements"))
-    _fix_rounds = int(state.get("assert_fix_rounds") or 0)
-    _fix_for = str(state.get("assert_fix_for") or "")
-    # 换了一条断言就重置计数（和 assert_ai_rounds 同一个道理）
-    if _fix_for and _fix_for != a["id"]:
-        _fix_rounds = 0
-    # ⚠️⚠️ 判据必须用 `_p`（模型原始回复），**不能用 `passed`**。
-    #
-    #   上面那行 `if _p is None: passed = False` 是给"落 finding"用的：
-    #   null 最终要落成 BLOCKED，所以内部先记 False 再由 unreviewed 兜住。
-    #   但补证据这段判的是"模型这轮判没判得了" —— 那是 `_p is None`。
-    #   用 `passed is None` 恒为假，整个补动作机制**一次都不会触发**。
-    #   （实测：a13 模型明明给了完整 need_action，日志里却一个"补动作"都没有。）
-    if _p is None and _na_ok and not by_code and _fix_rounds < ASSERT_FIX_MAX:
-        _tried = list(state.get("assert_fix_tried") or []) if _fix_for == a["id"] else []
-        # ★ 把任务卡翻成一个**能直接执行的动作**（act_node 认 tap_target）。
-        #
-        # 从 related_elements 里挑第一个**可点且没试过**的：
-        #   · 用户要求「防止一直点相同的」—— 试过的签名记在 assert_fix_tried，
-        #     这里跳过，避免 3 次都点在同一个元素上原地打转。
-        #   · rid 优先（唯一性好），没 rid 才退回 text。
-        _pick: dict[str, Any] = {}
-        for _e in (_na.get("related_elements") or []):
-            if not isinstance(_e, dict):
-                continue
-            _rid = str(_e.get("rid") or "").strip()
-            _txt = str(_e.get("text") or "").strip()
-            _sig = f"rid={_rid}" if _rid else (f"text={_txt}" if _txt else "")
-            if not _sig or _sig in _tried:
-                continue
-            _pick = {"sig": _sig, "tap_target": _sig}
-            break
-        _act = {}
-        if _pick:
-            _act = {"tap_target": _pick["tap_target"],
-                    "why": f"补证据：{_na.get('verify_target') or a['desc']}"}
-            _tried = _tried + [_pick["sig"]]
-            print(f"  [assert] {a['id']} 判定为「看不清」，补动作 "
-                  f"{_fix_rounds + 1}/{ASSERT_FIX_MAX}：点 {_pick['sig']}",
-                  file=sys.stderr)
-        else:
-            # 没有可点的新元素 —— 说明该点的都点过了，这一轮补不出新东西。
-            # 直接把轮次推到上限，下一轮就按「补满仍看不清 → FAIL」收口，
-            # 免得空转三次。
-            print(f"  [assert] {a['id']} 没有新的可点元素，直接收口",
-                  file=sys.stderr)
-            return {
-                "assert_fix_rounds": ASSERT_FIX_MAX,
-                "assert_fix_for": a["id"],
-                "assert_fix_tried": _tried,
-                "assert_fix_task": {},
-                "pending": None,
-                "issues": [f"{a['id']} 可点的相关元素都已试过，"
-                           f"无法再补证据"],
-            }
-        return {
-            "assert_fix_rounds": _fix_rounds + 1,
-            "assert_fix_for": a["id"],
-            "assert_fix_tried": _tried,
-            "assert_fix_note": str(_na.get("why_insufficient") or ""),
-            # 模型说点开之后怎么关回去（下一轮重判落定后点它）
-            "assert_fix_close": str(_na.get("close_with") or "").strip(),
-            # 记一笔"这次为了看见它做了什么"，最后回写进 JSON
-            "verify_actions": [{
-                "assert_id": a["id"],
-                "verify_target": str(_na.get("verify_target") or a["desc"]),
-                "why_insufficient": str(_na.get("why_insufficient") or ""),
-                "open": _pick.get("sig") or "",
-                "close": str(_na.get("close_with") or "").strip(),
-            }],
-            # ★ 交给执行器的"任务卡"：要验什么、缺什么、该找什么元素
-            "assert_fix_task": {
-                "assert_id": a["id"],
-                # ★ 这个补动作产出的画面，归到**断言绑定的那一步**名下。
-                #
-                # 用户：「打开又关闭。AI如果为了验证某个条件多加的步骤应该也记录下来
-                #        并截图。dump xml 和普通路径一样。」
-                #
-                # 不记正确的话会出这种错（run 78 实测）：a13 绑 s4，补动作却是
-                # 在 s5 之后执行的，截图被打上 s5 的标签；重判 a13 时按 s4 取
-                # 证据，拿到的还是**色板没展开**的旧图 —— 点开了也白点。
-                "bind_step": str(a.get("step") or ""),
-                "verify_target": str(_na.get("verify_target") or a["desc"]),
-                "why_insufficient": str(_na.get("why_insufficient") or ""),
-                "related_elements": [
-                    e for e in (_na.get("related_elements") or [])
-                    if isinstance(e, dict)][:12],
-                "tried": _tried,
-                "round": _fix_rounds + 1,
-                "max": ASSERT_FIX_MAX,
-            },
-            "action": _act,
-            # 不落 finding，pending 清掉，路由会把我们送去 act
-            "pending": None,
-            "issues": [f"{a['id']} 证据不足，回执行补动作"
-                       f"（第 {_fix_rounds + 1}/{ASSERT_FIX_MAX} 次）："
-                       f"{_na.get('why_insufficient') or '未说明'}"],
-        }
-    if _p is None and _na_ok and not by_code and _fix_rounds >= ASSERT_FIX_MAX:
-        # 补满了还是看不清 —— 用户定的：**判 FAIL，不报 BLOCKED**。
-        #
-        # 但要把"补过几次、试过什么、为什么还是看不到"写进 actual，
-        # 否则报告里就一句 FAIL，看不出是我们没找到还是产品没做到。
-        _tried_txt = "、".join(state.get("assert_fix_tried") or []) or "（无）"
-        passed = False
-        unreviewed = False
-        actual = (f"{actual}".rstrip()
-                  + f"\n[补证据 {ASSERT_FIX_MAX} 次仍看不到，判 FAIL]"
-                  + f" 试过的动作：{_tried_txt}")
-        issues.append(f"{a['id']} 补动作 {ASSERT_FIX_MAX} 次仍无法核验，"
-                      f"按约定判 FAIL（不是 BLOCKED）")
-
-    # ★ 代码判定的结论不需要模型给证据 ID —— 它的证据是设备状态本身
-    #   （activity 名、dump 里的 rid），比模型随手贴的 event_id 更硬。
-    #   不加这个例外的话，直通结论会被误记成"缺证据"。
-    #   （by_code 已在上面「补证据」段之前取好，这里不再重复定义。）
-    if unreviewed:
-        issues.append(
-            f"{a['id']} 判定缺失：模型回复无法解析，本条未做判定"
-            f"（{str(v.get('error') or '')[:160]}）")
-    if not by_code:
-        if not got:
-            # ★ 断言阶段「没有 event_id」通常**不是模型的问题**。
-            #
-            # 断言是在整个流程走完之后统一判的。那时最后一步的点击早已过去，
-            # `last_event_ids` 是空的（见 176 实测：a7/a8/a9 全被判 PASS，
-            # 却每条都挂一条「缺证据 ID」，看起来像证据缺失，实际什么都缺）。
-            #
-            # 所以只在**真的没有可信证据**时才报：本会话没走过任何步骤，
-            # 或者 valid 为空（说明连一次 act 的证据都没攒下）。
-            # 走过步骤且 valid 非空时，证据在 actions 表和截图里，
-            # 只是"当前这一瞬"的 last_event_ids 过期了 —— 不该诬告模型。
-            if not valid:
-                issues.append(f"{a['id']} 缺证据 ID（本次没有任何可绑定的动作证据）")
-        elif got not in valid:
-            issues.append(f"{a['id']} 证据 ID {got} 不属于本会话")
-    if not actual.strip():
-        issues.append(f"{a['id']} actual 为空")
-
-    # ⚠️ 记账问题（缺 event_id）**不该改写判定结论**。
-    # 早先这里 if issues: passed=False，结果模型判 PASS 的三条断言
-    # 全被改判 FAIL，最终用例结论从 PASS 变成 FAIL ——
-    # 这是"因为记不上账所以判失败"，与事实相反。
-    # 现在：缺 ID 只记问题，判定仍以模型看到的事实为准。
-
-    # ★ 代码与模型矛盾时**以代码的硬事实为准**（仅限能确定的那一种）。
-    # activity= 判据是纯字符串比对，代码说了到达过就是到达过，
-    # 不存在"模型看得更准"的空间 —— 它只是容易把"当前"当成"到达过"。
-    # 这里直接纠正，并如实记一条问题，不偷偷改判。
-    #
-    # ⚠️ 复核轮的 PASS 要豁免下面那条"改判 FAIL"：
-    #   代码说"这个 activity 没出现过"，AI 复核说"我看到了" ——
-    #   如果这里无条件翻回 FAIL，assert_node 的复核又白做了。
-    #   注意"到达过"是纯字符串比对，理论上不该出现"代码没搜到但真有"，
-    #   所以豁免的同时要把 code_why 记进 issues，让改判留痕可查。
-    _ai_pass_now = bool(v.get("ai_recheck") and passed)
-    reached = _activity_reached(state, a.get("check"))
-    if reached is True and not passed:
-        issues.append(
-            f"{a['id']} 判定纠正：模型判 FAIL，但代码核对该 activity "
-            f"本次确实到达过（{a.get('check')}）→ 改判 PASS")
-        passed = True
-    elif reached is False and passed and not _ai_pass_now:
-        issues.append(
-            f"{a['id']} 判定纠正：模型判 PASS，但代码核对该 activity "
-            f"本次从未出现（{a.get('check')}）→ 改判 FAIL")
-        passed = False
-    elif reached is False and passed and _ai_pass_now:
-        issues.append(
-            f"{a['id']} 代码说该 activity 本次未出现，但 AI 复核判成立"
-            f"（{a.get('check')}）→ 以 AI 复核为准记 PASS，疑似"
-            f"activity 名/短名写法与实际不符，建议核对")
-
-    # ★ 结构化判据：代码判得了的一律以代码为准 —— **除了"代码说不成立、
-    #   AI 复核后判成立"这一种**。
-    #
-    # 为什么留这个例外（用户要求"代码判定失败就让 AI 介入"）：
-    #   代码判"不成立"的含义只是"我没在留痕里搜到"，它可能是真没有，
-    #   也可能是文案被拆进多个节点 / 控件没进可点列表 / rid 改名。
-    #   而 AI 是对着截图和控件上下文判的，它能看见"字在，只是结构变了"。
-    #   如果这里无条件把 AI 的 PASS 再翻回 FAIL，那 assert_node 里加的
-    #   复核就白做了 —— 模型说"我看到了"和这一行冲突时，错的多半是代码。
-    #
-    #   反过来的方向（代码说成立、模型说不成立 / 代码说成立、模型说看不清）
-    #   仍然以代码为准：搜到证据是硬事实，不需要谁再确认一遍。
-    ai_rechecked_pass = (v.get("ai_recheck") and passed)
-    if ai_rechecked_pass:
-        issues.append(
-            f"{a['id']} 代码判据未命中，但 AI 复核判成立"
-            f"（代码结论：{v.get('code_why') or ''}）→ 以 AI 复核为准记 PASS")
-        passed = True
-        unreviewed = False
-
-    code_verdict, code_why = evaluate_check(a.get("check"), state=state)
-    if not ai_rechecked_pass:
-        if code_verdict is True and not passed:
-            issues.append(
-                f"{a['id']} 判定纠正：模型判 FAIL，但代码核对判据成立"
-                f"（{code_why}）→ 改判 PASS")
-            passed = True
-            unreviewed = False          # 代码已经给出确定结论，不再是"判不了"
-        elif code_verdict is False and passed:
-            issues.append(
-                f"{a['id']} 判定纠正：模型判 PASS，但代码核对判据不成立"
-                f"（{code_why}）→ 改判 FAIL")
-            passed = False
-            unreviewed = False
-
-    # ★ 模型回复解析不了、代码判据也判不了 → 这条是 UNKNOWN，不是 FAIL。
-    #
-    # 为什么必须是单独的 status：
-    #   写成 FAIL 等于**替产品下结论**（"功能坏了"），但我们其实没验；
-    #   写成 PASS 更糟（"功能好的"），完全是编。
-    #   执行器有 BLOCKED 这个现成的语义（"没走到/没验成"），就用它。
-    #   报告里的 issues 会写明"模型回复无法解析"，主 Agent 能一眼看出
-    #   这是执行问题还是产品问题 —— 这个区分正是用户反复强调的。
-    tool_failed = False
-    # ★★ 补过证据之后，点「取消/关闭」把那一层收掉 ★★
-    #
-    # ⚠️ 这里**绝对不许按 back**（run 79 的教训，代价是一整轮跑崩）。
-    #
-    # 早先点不到关闭按钮时回退到 dev.key("back")。但 back 是**不可控的导航**：
-    # 它退到哪取决于当时的导航栈，代码毫不知情。
-    # 实测（run 79）：a6 补证据补满 → 关回去时按了 back →
-    #   人从 TimetableActivity 退到 AllInOneActivity →
-    #   s4 的强证据 cv_empty_content#1 找不到 →
-    #   模型乱试 → 再按 back → 退到桌面 launcher →
-    #   a7~a14 全部对着桌面判，整轮报废。
-    #
-    # 一条 back 引发的雪崩，比"没关回去"严重得多。
-    # 所以现在的策略是：**点得到就点，点不到就原地不动**。
-    # 画面停在色板那一层没关系 —— 下一条断言取的是它自己那一步的证据，
-    # 不会因为"多开了一层"就判错。
-    _close = str(state.get("assert_fix_close") or "").strip()
-    if _close and _fix_rounds > 0:
-        _esc = _close.replace('"', '\\"')
-        _expr = f'//*[@text="{_esc}"]'
-        try:
-            _r = dev.click_xpath(_expr)
-            if _r is None:
-                # 找不到就**什么都不做**。不按 back，不猜坐标。
-                print(f"  [assert] {a['id']} 没找到「{_close}」唯一命中，保持画面不动",
-                      file=sys.stderr)
-                issues.append(f"{a['id']} 补证据后没找到「{_close}」，画面未收，保持原样")
-            else:
-                print(f"  [assert] {a['id']} 补完证据，已点「{_close}」收回",
-                      file=sys.stderr)
-        except ToolError as exc:
-            issues.append(f"{a['id']} 补证据后点「{_close}」失败：{exc}")
-    if unreviewed:
-        status = "BLOCKED"
-        if not actual.strip():
-            actual = "（模型回复无法解析，本条未做判定）"
-    else:
-        status = "PASS" if passed else "FAIL"
-    try:
-        # --event-id 必须是整数；没有就干脆不传这个参数，
-        # 传 "(none)" 会被 argparse 拒掉，进而让整个 finding 写不进去、
-        # 连带 finish 也失败（"FAIL requires a FAIL finding"）。
-        if got and got.isdigit():
-            dev.finding(status, got,
-                        f"{a['desc']}" + (f" [{a['check']}]" if a.get("check") else ""),
-                        actual)
-        else:
-            dev.finding_no_evidence(status,
-                                    f"{a['desc']}" + (f" [{a['check']}]" if a.get("check") else ""),
-                                    actual)
-    except ToolError as exc:
-        tool_failed = True
-        issues.append(f"{a['id']} finding 写入失败：{exc}")
-
-    return {
-        "findings": [{"kind": "assert", "id": a["id"], "desc": a["desc"],
-                      "status": status, "actual": actual,
-                      "event_id": got, "issues": issues}],
-        "issues": issues,
-        "pending": None,
-        # ★ 换断言时把复核计数归零 —— 计数是"这一条断言"的，不是整轮的。
-        #   不归零的话：a1 用完 3 次，a2 一进来就没有复核机会了。
-        "assert_ai_rounds": 0,
-        "assert_pending_for": "",
-        # 留给下一条断言用的"AI 最后意见"，换条时清掉。
-        "assert_ai_last": actual if v.get("ai_recheck") else "",
-    }
 
 
 def build_learned_case(state: ChildState) -> dict[str, Any]:
@@ -4962,6 +3667,25 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
             acted.setdefault(sid, []).append(t.get("action") or {})
 
     steps_out: list[dict[str, Any]] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    # setup 不在这里算
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # 用户原话：「我意思这种固定的步骤那就转成setup就行了。」
+    #
+    # 冷启动那几下固定的清障（168：用户协议「同意」→ 课程表引导
+    # 「我知道了」）必须从 steps 里挪出去，否则 s1.actions 会变成
+    # [button1, 允许, 我知道了, iv_more, item_title] 一大坨
+    # —— 清弹窗、进菜单、选课程表三件事混在一条里，下次照着点必错。
+    #
+    # 但这里算不出来：`action_trace` 里的动作是 `_trace_of_tap` 压过的，
+    # **只有 rid/text、没有坐标**；而 `dialogs_dismissed` 里的弹窗
+    # rid 又常常是空的（168 实测 `"rid": ""`）。两边对不上。
+    #
+    # 只有点击账本同时有 rid 和坐标，所以这件事交给
+    # `_split_setup_from_steps` 在 learn 节点里做（那里能读文件）。
+
     for s in (task.get("steps") or []):
         sid = str(s.get("id") or "")
         # 只有"验证动作"没有正常动作的步骤不算推进过（如 s0 被放弃）
@@ -5053,13 +3777,20 @@ def build_learned_case(state: ChildState) -> dict[str, Any]:
         "title": task.get("title"),
         "package": task.get("package"),
         "status": state.get("status") or "",
+        # ★ 这份回写的 JSON 能不能直接拿去重跑。
+        # 用户定的（B 方案）：BLOCKED 也生成，只是标成不可用 ——
+        # 生成是为了让人看"跑到哪儿断了"，标 usable=false 是为了
+        # 别让下一次把它当可靠用例直接复用。
+        "usable": (state.get("status") or "") == "PASS",
+        # setup 由 _split_setup_from_steps 在 learn 节点里补上
+        # （要读点击账本才知道哪些点击是"点掉弹窗"）。
         "steps": steps_out,
         "asserts": asserts_out,
         "knowledge": [k for k in (state.get("knowledge_used") or [])][:8],
     }
 
 
-def learn_node(state: ChildState) -> dict[str, Any]:
+def _base_learn_node(state: ChildState) -> dict[str, Any]:
     """在 finish **之前**把这一轮的经验回写成 JSON。
 
     放在 finish 之前（而不是之后）是因为 finish 之后 state 就不再往前传了，
@@ -5085,6 +3816,62 @@ def learn_node(state: ChildState) -> dict[str, Any]:
         # xml_before/xml_after —— 这是最可靠的原始记录，直接读它，
         # 不指望 assert 那一刻还记得住路径。
         _fill_evidence_from_ledger(learned, run_dir / "clicks.jsonl")
+        # ★ 把冷启动清障那几下从 steps 挪进 setup（原地改）。
+        #   用户：「我意思这种固定的步骤那就转成setup就行了。」
+        _split_setup_from_steps(learned, run_dir / "clicks.jsonl",
+                                state.get("dialogs_dismissed") or [])
+        # ★ 回灌 target：把这次**能稳定定位**的控件写成下次的 target。
+        #
+        # 用户：「这个回灌应该是每个 case 跑完后总结的时候自己就做了」
+        # 没有这一步，跑出来的知识下次用不上，代码点击率永远是 0。
+        #
+        # ⚠️ **必须在 _split_setup_from_steps 之后**。
+        #    顺序反了会踩坑：拆 setup 之前 actions 里还混着清弹窗的动作，
+        #    回灌就会把「允许」（系统权限框的按钮）当成 s1 的入口。
+        #    168 实测踩到：s1.target 成了 rid=permission_allow_button_two，
+        #    下次照着点就会去点权限框，而不是点「更多」。
+        _backfill_targets(learned, run_dir / "clicks.jsonl")
+        # ★ 把这次见到的 setup 动作累加进库。
+        #
+        # 用户的问题：「APP 如果有临时的弹窗，正好被我们捕获了。
+        #              下次没有了会怎么样」
+        # 用户定的：「多次稳定的记录下来。不稳定的可以让 AI 直接介入」
+        #
+        # 所以这里**只是记数**，不决定用不用 —— 见够了（≥2 次）才会
+        # 出现在 get_setup_actions(stable_only=True) 里，被 prep 拿去直接执行。
+        # 只撞见一次的临时弹窗永远停在 1，下次照样问 AI。
+        _ck = str((state.get("task") or {}).get("case_id") or "")
+        if _ck and learned.get("setup"):
+            try:
+                from ..reporting import store as _store
+                _n_setup = _store.save_setup_actions(_ck, learned["setup"])
+                if _n_setup:
+                    print(f"  [learn] 累加 setup 记忆 {_n_setup} 条"
+                          f"（见够 {_store.SETUP_STABLE_TIMES} 次才直接执行）",
+                          file=sys.stderr)
+                # ★ JSON 里的 setup 以**库里的稳定项**为准，不是"这次见到的"。
+                #
+                # 用户定的：「多次稳定的记录下来。不稳定的可以让 AI 直接介入」
+                # 所以只出现过一次的临时弹窗**不该出现在这份 JSON 里** ——
+                # 它是下一次要拿去执行的东西，写进一次性的动作等于埋雷。
+                #
+                # 踩到过：第 3 次跑时 button1 是 prep 阶段点的，不在步骤账本里，
+                # 于是按"这次见到的"算出来的 setup 只剩 timetable_guide_button ——
+                # 跟库里积累的规律对不上。JSON 是给人看/给下次用的成果物，
+                # 应该反映积累下来的结论，而不是某一次执行路径的副产品。
+                _stable = _store.get_setup_actions(_ck)
+                learned["setup"] = [
+                    ({**({"rid": r["rid"]} if r.get("rid")
+                         else {"text": r.get("text") or ""}),
+                      # 组合判据：下次照着它点，不会误点同名的别的按钮
+                      **({"sig": r["sig"]} if r.get("sig") else {}),
+                      "times": r.get("seen_times"),
+                      "pkg": r.get("pkg") or ""})
+                    for r in _stable
+                ]
+            except Exception as exc:  # noqa: BLE001
+                # 记不住不该坏了整次回写，更不该影响用例结论
+                out.setdefault("issues", []).append(f"setup 记忆未落库：{exc}")
         path = run_dir / "case_learned.json"
         path.write_text(json.dumps(learned, ensure_ascii=False, indent=2),
                         encoding="utf-8")
@@ -5145,7 +3932,336 @@ def _fill_evidence_from_ledger(learned: dict[str, Any], ledger: Path) -> None:
         a["verify_count"] = len(got)
 
 
-def finish_child_node(state: ChildState) -> dict[str, Any]:
+def _sig_from_xml(xml_path: str, xy: tuple[int, int] | None) -> str:
+    """从落盘 XML 里，按点击坐标找到那个节点，生成**组合判据**字符串。
+
+    返回 `xpath=//*[@resource-id='android:id/button1'][@text='知道了']`
+    这样的表达式；查不到就返回空串。
+
+    ## 为什么用组合 xpath 而不是 rid=（用户提的）
+
+    用户原话：「能否用 xpath 那种方式。多个组合。rid 和 text 那种是不是更稳点」
+
+    对，稳得多。踩到的具体问题：
+
+      `android:id/button1` 是 Android 的**公共按钮 id**，
+      用户协议的「同意」、弹窗的「知道了」、别的 App 的对话框，
+      全都叫这个名字（实测同一个用例里就有 2 处）。
+
+      只写 `rid=button1` 命中的是「第几个叫 button1 的」，
+      换个界面就可能点到完全不同的东西。
+
+      组合写法则命中「那个写着「知道了」的 button1」——
+      **这才是我们真正想表达的意思**，换设备、换分辨率都不受影响。
+
+    ## 为什么要用全名
+
+    账本里存的是末段（`button1`），全名（`android:id/button1`）得回 XML 查。
+    差异很关键：全名自带命名空间，System 的 button1 和 App 自己的 button1
+    天然分开，误点风险小一大截。
+
+    ## 为什么按坐标找节点
+
+    账本的 `target.c` 就是这一下的点击中心，XML 里 bounds 包含它的就是那个节点。
+    比按 rid 反查更准 —— 同一 rid 可能有多个（比如 item_title 有 4 个）。
+    """
+    if not xml_path or xy is None:
+        return ""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(xml_path).getroot()
+    except Exception:  # noqa: BLE001
+        return ""
+    x, y = int(xy[0]), int(xy[1])
+    for el in root.iter():
+        b = str(el.get("bounds") or "")
+        if "[" not in b or "]" not in b:
+            continue
+        try:
+            a, z = b.split("][")
+            x1, y1 = [int(v) for v in a.strip("[").split(",")]
+            x2, y2 = [int(v) for v in z.strip("]").split(",")]
+        except (ValueError, AttributeError):
+            continue
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            continue
+        # 命中第一个包含该点的节点 —— 从外到内遍历，最外层先命中，
+        # 但我们要的是**可点的那个**，所以优先返回 clickable 的。
+        full = str(el.get("resource-id") or "").strip()
+        txt = str(el.get("text") or "").strip()
+        if str(el.get("clickable", "")).lower() != "true":
+            continue
+        # 有 rid 就带上（全名，不是末段）
+        parts = []
+        if full:
+            parts.append(f"@resource-id='{full}'")
+        if txt:
+            parts.append(f"@text='{txt}'")
+        if not parts:
+            continue
+        return "xpath=//*[" + "][".join(parts) + "]"
+    return ""
+
+
+def _split_setup_from_steps(learned: dict[str, Any], ledger: Path,
+                            dialogs: list[dict[str, Any]]) -> None:
+    """把冷启动那几下固定清障从 steps 里挪进 setup（原地改 learned）。
+
+    用户原话：「我意思这种固定的步骤那就转成setup就行了。」
+              「系统权限就不管了。你放上反而有印象。」
+
+    ## 为什么在这里做，不在 build_learned_case 里
+
+    `action_trace` 存的动作是 `_trace_of_tap` 压出来的，**只有 rid/text、
+    没有坐标**（坐标故意不留 —— 换设备必失效）。而 `dialogs_dismissed`
+    里点掉的那些弹窗 rid 又常常是空的（168 实测 `"rid": ""`）。
+    两边都缺东西，只有**点击账本**同时有"点了哪个 rid"和"点在哪个坐标"。
+
+    ## 判据
+
+    账本某一条点击，若它的坐标命中 `dialogs_dismissed` 里
+    **step==0 且非系统权限**的记录 —— 那就是冷启动清障，归 setup：
+
+      · step==0 之外的不动：s2 点完「从图库导入」弹的「知道了」是流程
+        的一部分，必须留在 s2。
+      · 系统权限框不进 setup：它是工具层自动点掉的（见 nodes 里那条
+        责任划分）。写进用例等于告诉后来人"这里要手动点允许"，是错的
+        印象 —— 用户明确说了「系统权限就不管了，你放上反而有印象」。
+
+    ## 剔除按坐标，不按 rid
+
+    踩过：setup 里是 button1「同意」，而 s2 里那个「知道了」rid 也是
+    button1。按 rid 剔会把 s2 流程必需的动作一起删掉，下次重跑 s2
+    就少了关键一步。所以必须按坐标判 —— 这也正是非读账本不可的原因。
+    """
+    if not learned or not ledger.exists():
+        return
+
+    # 第一屏上、App 自己的那些弹窗的坐标
+    want: set[tuple[int, int]] = set()
+    # 系统权限框的坐标 —— 工具层自动点的，**哪里都不要出现**。
+    # 用户：「系统权限就不管了。你放上反而有印象。」
+    sys_pos: set[tuple[int, int]] = set()
+    for d in dialogs or []:
+        try:
+            _p = (int(d.get("x")), int(d.get("y")))
+        except (TypeError, ValueError):
+            continue
+        if d.get("is_system_permission"):
+            sys_pos.add(_p)
+            continue
+        if int(d.get("step") or 0) != 0:
+            continue
+        try:
+            want.add((int(d.get("x")), int(d.get("y"))))
+        except (TypeError, ValueError):
+            continue
+    if not want:
+        return
+
+    # 扫账本：setup 序列 + 每个 step 自己还剩哪些动作（按坐标剔除）
+    setup: list[dict[str, Any]] = []
+    setup_pos: set[tuple[int, int]] = set()
+    per_step: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tgt = o.get("target") or {}
+            # 坐标在 target["c"]（形如 [1795, 1583]），不是 action ——
+            # action 只是个字符串 "click"。
+            _c = tgt.get("c")
+            pos: tuple[int, int] | None = None
+            if isinstance(_c, (list, tuple)) and len(_c) >= 2:
+                try:
+                    pos = (int(_c[0]), int(_c[1]))
+                except (TypeError, ValueError):
+                    pos = None
+            rid = str(tgt.get("rid") or "").strip()
+            one: dict[str, Any] = {"rid": rid} if rid else {
+                "text": str(tgt.get("text") or "")}
+
+            # 系统权限框：工具层自动点的，用例里不体现 —— 用户
+            # 「系统权限就不管了。你放上反而有印象。」
+            if pos is not None and pos in sys_pos:
+                continue
+
+            if pos is not None and pos in want:
+                setup_pos.add(pos)
+                if one not in setup:
+                    # pkg 记"这一下发生在谁的界面上"（点击前的 activity）。
+                    # 落库时用它区分"被测 App 自己的流程"和"外来干扰"。
+                    #
+                    # ⚠️ 账本里的 before 是**完整 activity 名**
+                    #    （com.zui.calendar.AllInOneActivity），不含 "/"，
+                    #    所以不能 split("/") 取包名 —— 会连类名一起留下。
+                    #    这里原样存 activity，读取侧用 startswith 比前缀。
+                    one["pkg"] = str(o.get("before") or "")
+                    # ★ 优先用组合 xpath（rid 全名 + text），比裸 rid 稳得多。
+                    #   查不到就退回 rid 末段 —— 有总比没有强，但会标出来。
+                    _sig = _sig_from_xml(str(o.get("xml_before") or ""), pos)
+                    if _sig:
+                        one["sig"] = _sig
+                    setup.append(one)
+                continue          # 归了 setup，不再算进任何步骤
+
+            sid = str(o.get("step") or "")
+            if not sid or sid.startswith("a"):
+                continue          # 验证动作用的 "aNN"，不算流程动作
+            if one not in per_step.setdefault(sid, []):
+                per_step[sid].append(one)
+    except OSError:
+        return
+
+    if not setup:
+        return
+
+    # 用账本的结论覆盖 steps 的 actions：
+    # 账本记的是"真点了什么、点在哪"，比 action_trace 压出来的 rid 序列
+    # 更能分辨"同 rid 不同位置"的动作。
+    for st in (learned.get("steps") or []):
+        sid = str(st.get("id") or "")
+        if sid in per_step:
+            st["actions"] = per_step[sid]
+    learned["setup"] = setup
+
+
+def _backfill_targets(learned: dict[str, Any], ledger: Path) -> None:
+    """把"这一步**能稳定定位**的那个控件"回灌成 target（原地改 learned）。
+
+    用户原话：
+      「我理解我们努力这么久。不就是想提供控件的稳定性。
+        下次同样的 case 跑的时候能少问 AI」
+      「这个回灌应该是每个 case 跑完后总结的时候自己就做了」
+
+    ## 为什么必须有这一步
+
+    跑完只在 case_learned.json 里记下"这次点了哪个 rid"，**下次跑读不到** ——
+    输入用例里没有 target，代码没依据可算，于是每一步照样问 AI。
+    实测就是代码点击率 0%：知识躺在上一轮的产物里，闭环没接上。
+
+    ## 什么样的控件才配当 target
+
+    不是所有点过的控件都能回灌，判据是**它下次还能不能被唯一定位**：
+
+      ✅ 写了：本屏 XML 里 rid 只出现 **1 次**，且 **clickable=true**
+      ❌ 不写：命中多个（168 的 item_title 就有 4 个同名：课程表/纵览/
+              年视图/设置）、或 clickable=false（文字挂在不可点的 TextView 上，
+              真正能点的是外层容器，而外层没有任何标识）
+
+    168 实测印证：iv_more / btnImportFromGallery / timetable_guide_button
+    都是"唯一 + 可点"，能直点；item_title 4 个同名且全不可点，
+    **换成 text=课程表 也找不到**（文字在不可点节点上），只能交给 AI。
+
+    ## 为什么还要排除坐标
+
+    没有 rid/text 的控件只剩坐标，而坐标**换设备/换分辨率必失效**。
+    写进用例等于埋雷 —— 所以这里宁可留空让 AI 判断，也不写坐标。
+
+    ## 选哪一个
+
+    一步可能有多个动作（先展开菜单、再选条目），只有**第一个**
+    可定位的适合当 target：它是这一步的入口。后面的动作属于
+    "展开之后才知道要选什么"，交给 AI 或 verify_actions 更合适。
+
+    ⚠️ 已经有 target 的不覆盖 —— 用例作者写的比我们推断的可信。
+    """
+    if not learned or not ledger.exists():
+        return
+    # 账本里按 (step, rid) 找到点它之前的 XML
+    xml_of: dict[tuple[str, str], str] = {}
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = str(o.get("step") or "")
+            if not sid or sid.startswith("a"):
+                continue
+            rid = str((o.get("target") or {}).get("rid") or "").strip()
+            xml = str(o.get("xml_before") or "")
+            if rid and xml:
+                xml_of.setdefault((sid, rid), xml)
+    except OSError:
+        return
+    if not xml_of:
+        return
+
+    def _unique_clickable(xml_path: str, rid: str) -> bool:
+        """这个 rid 在本屏是不是"唯一 + 可点"。读不懂就当不能。"""
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.parse(xml_path).getroot()
+        except Exception:  # noqa: BLE001
+            return False
+        total = clickable = 0
+        for el in root.iter():
+            full = str(el.get("resource-id") or "")
+            if full.split("/")[-1] != rid:
+                continue
+            total += 1
+            if str(el.get("clickable", "")).lower() == "true":
+                clickable += 1
+        return total == 1 and clickable == 1
+
+    def _combo_sig(xml_path: str, rid: str) -> str:
+        """给这个 rid 生成**组合 xpath**（rid 全名 + text），拿不到就退回 rid=。
+
+        用户：「能否用 xpath 那种方式。多个组合。rid 和 text 那种是不是更稳点」
+
+        稳在哪：`android:id/button1` 是 Android 公共按钮 id，
+        「同意」「知道了」都叫这个。只按末段 rid 点，换一屏就可能点到
+        完全不同的按钮；组合判据要求 rid 和 text **同时**满足，
+        点的就是"那个写着「知道了」的 button1"。
+
+        全名（android:id/button1）必须回 XML 查 —— 账本里只有末段。
+        """
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.parse(xml_path).getroot()
+        except Exception:  # noqa: BLE001
+            return f"rid={rid}"
+        for el in root.iter():
+            full = str(el.get("resource-id") or "")
+            if full.split("/")[-1] != rid:
+                continue
+            if str(el.get("clickable", "")).lower() != "true":
+                continue
+            txt = str(el.get("text") or "").strip()
+            if full and txt:
+                # 引号要转义：text 里可能有单引号
+                t = txt.replace("'", "&apos;")
+                return f"xpath=//*[@resource-id='{full}'][@text='{t}']"
+            if full:
+                return f"xpath=//*[@resource-id='{full}']"
+            break
+        return f"rid={rid}"
+
+    for st in (learned.get("steps") or []):
+        if st.get("target"):
+            continue                      # 作者写了就不动
+        sid = str(st.get("id") or "")
+        for act in (st.get("actions") or []):
+            rid = str(act.get("rid") or "").strip()
+            if not rid:
+                continue                  # 没有 rid 的（只有 text）回灌不了结构
+            xml = xml_of.get((sid, rid))
+            if not xml or not _unique_clickable(xml, rid):
+                continue                  # 定位不住：留给 AI，不写死
+            st["target"] = _combo_sig(xml, rid)
+            break                         # 只用第一个可定位的当入口
+
+
+def _base_finish_child_node(state: ChildState) -> dict[str, Any]:
     """子 Agent 收尾：写 finish 并生成回报给主 Agent 的汇总。
 
     ⚠️ 结论判定必须把**步骤落点未达成**算进去。
@@ -5284,330 +4400,26 @@ def finish_child_node(state: ChildState) -> dict[str, Any]:
 # 路由
 # --------------------------------------------------------------------------
 
-def route_after_observe(state: ChildState) -> Literal["strong_target", "decide",
-                                                      "assert", "finish"]:
-    """崩溃/硬终止 -> 直接收尾，不再问 AI、不再动作。
-
-    观察完先给代码一次机会：这一步的 target 在当前屏上能唯一确定就直点，
-    定不下来才叫模型（`fallback_reason` 非空表示本步已经交给模型了，别再问一遍）。
-
-    ★ 若当前是在为断言补证据（assert_fix_task 非空），**拿到新画面就直接回去重判**
-      —— 补证据不是执行用例的某一步，不该再走 strong_target/decide 去推进步骤。
-    """
-    if state.get("status") == "BLOCKED":
-        return "finish"
-    if state.get("assert_fix_task"):
-        return "assert"
-    if not state.get("fallback_reason"):
-        return "strong_target"
-    return "decide"
 
 
-def prep_apply_node(state: ChildState) -> dict[str, Any]:
-    """起点已确认到位后，把 prepare 前提要求的动作**真的做掉**。
-
-    ★ 为什么需要这个节点（实测 182，2026-10，连挂 4 次才定位）：
-      prepare 前提写的是「点 btnCreateManually → 填名字 → 点保存」，
-      而 prep_node 跑的时候 App 还停在权限说明框上，控件根本不在，
-      所以只能先记下来（prepare_wants）。
-      之后模型一路走到 TimetableActivity —— 界面**对了**，
-      但没人再回来执行 prepare：
-        · 只把清单写进提示词 -> 模型看了不照做，还是一直点空白格；
-        · 把清单塞 issues -> 模型压根看不到；
-      结果 `cv_empty_content` 永远不出现，模型点到判死循环。
-
-      结论：**"到了正确页面就执行预备动作"这件事必须由代码保证**，
-      不能指望模型自觉 —— 这正是用户定的那条线：
-      "能完全确定的可以让代码判断，不能完全确定的让 AI 判断"。
-      "控件在不在屏上"是完全确定的，交给代码。
-
-    只在**起点已达成**时才跑（mismatch 为空），否则界面根本不对。
-    """
-    wants = state.get("prepare_wants") or []
-    print(f"  [prep_apply] 进入 wants={len(wants)} applied={state.get('prep_applied')} "
-          f"mismatch={bool(state.get('start_mismatch'))} act={state.get('last_activity')}",
-          file=sys.stderr)
-    # ★ 带上下文的痕迹：这三个状态从外面看长一样（都表现为"模型自己在点"），
-    #   不打印就永远分不清是"没路由过来"还是"路由过来了但被这里挡回去"。
-    _dbg = (f"prep_apply 进入：wants={len(wants)} "
-            f"applied={state.get('prep_applied')} "
-            f"mismatch={bool(state.get('start_mismatch'))}")
-    if not wants or state.get("start_mismatch"):
-        return {"issues": list(state.get("issues") or []) + [_dbg + " -> 跳过（界面未到位）"]}
-    if state.get("prep_applied"):
-        return {"issues": list(state.get("issues") or []) + [_dbg + " -> 已执行过"]}
-
-    dev = _ctx().device
-    issues: list[str] = []
-    done: list[str] = []
-    remaining: list[dict[str, Any]] = []
-    for w in wants:
-        print(f"  [prep_apply] 执行 {w.get('desc','')[:24]} "
-              f"动作数={len(w.get('actions') or [])}", file=sys.stderr)
-        ok_n, fail_n, act_issues = _run_prepare_actions(
-            dev, w.get("actions") or [],
-            pkg_hint=(state.get("task") or {}).get("package") or "")
-        if ok_n:
-            done.append(f"[prepare] {w.get('desc') or ''}：{ok_n} 步完成")
-        if fail_n:
-            # ★ 做不成的留在清单里，让模型接手 —— 但这次它会看到失败原因
-            remaining.append(w)
-            issues += act_issues
-    return {
-        "prep_applied": True,
-        "prepare_wants": remaining,
-        "pc_done": list(state.get("pc_done") or []) + done,
-        "issues": list(state.get("issues") or []) + issues,
-    }
 
 
-def route_after_start_check(state: ChildState) -> Literal["prep_apply", "decide", "plan", "finish"]:
-    """起点检查后的去向。
-
-    - 起点不符 -> 先去 decide（不 BLOCKED！）：让 AI 查知识卡想办法走回起点。
-      这是"像人类测试员一样"的要求 —— 找不到不该直接放弃。
-      为了不无限循环，用 start_fix_rounds 限次，超了才记问题继续往下走。
-    - 起点符合 -> 正常进入 plan 开始执行步骤
-    - 硬终止（崩溃/锁死）-> finish
-    """
-    if state.get("status") == "BLOCKED":
-        return "finish"
-    if state.get("start_mismatch"):
-        rounds = state.get("start_fix_rounds", 0)
-        if rounds < 5:
-            return "decide"          # 先去纠正起点
-        return "plan"                # 纠正不了也继续（问题已记录）
-
-    # ★ 起点对了，但 prepare 前提还没执行过 -> 现在正是执行它的时候。
-    #   （prep 阶段界面不对执行不了，见 prep_apply_node 说明）
-    if state.get("prepare_wants") and not state.get("prep_applied"):
-        print(f"  [route] start_check -> prep_apply（wants={len(state.get('prepare_wants') or [])}）",
-              file=sys.stderr)
-        return "prep_apply"
-    return "plan"
 
 
-def route_after_decide(
-        state: ChildState) -> Literal["knowledge", "vision", "act", "check"]:
-    # ⚠️ 读 action，不是 pending —— 字段重命名后这里漏改过，
-    # 导致三个路由全部落到 check、act 永远不被调用（真机表现为"只观察不动作"）。
-    a = state.get("action") or {}
-    if a.get("need_knowledge"):
-        return "knowledge"
-    # ★ 模型要看图 -> 去 vision 节点，让它真的看到。
-    #
-    # 这个坑和 key / input_rid **是第三个同一个坑**：
-    # 模型给了一个"不需要坐标的合法动作"，而路由只认坐标，于是判成
-    # "没动作"，日志打 `-> 无动作：{'vision_question': '屏幕右侧弹出的菜单…'}`。
-    # 模型连着 4 轮都在请求看图（176 轮 05~08），一次都没看到，
-    # 只能反复猜菜单里有什么，白烧 20 秒。
-    #
-    # 教训已经写在这条路由里三次了，这次说清楚：
-    #   **action 里任何一个"能单独构成动作"的字段，都必须在这条路由里有分支。**
-    #   现在的全集：need_knowledge / vision_question / step_done /
-    #               key / input_rid / next_x
-    if a.get("vision_question"):
-        return "vision"
-    if a.get("step_done"):
-        return "check"
-    # ★ 系统键动作没有坐标，但**必须去 act 执行**。
-    # 只判 next_x 的话，模型说"按返回"会被当成"没动作"直接送 check，
-    # 于是动作静默丢失 —— 这正是 169 里"模型想退出相机却退不出去"的另一半原因。
-    if a.get("key") or a.get("_key"):
-        return "act"
-    # ★ 输入动作同理：type_text 没有坐标，但必须是 act 去执行。
-    #
-    # 这个坑和上面 169 那个**一模一样**，我又犯了一次：
-    # 176 跑下来模型正确调用了 type_text(rid=et_schedule_name)，
-    # 而路由只判 next_x -> 判成"没动作" -> 送 check -> 输入从未发生。
-    # 日志里表现为 `-> 无动作：{... 'input_rid': 'et_schedule_name' ...}`，
-    # 看起来像模型什么都没说，实际上它说得完全正确，是路由把话吞了。
-    #
-    # 教训：**每加一种新的动作类型，必须同时加它的路由判据。**
-    #       动作有字段、路由不认，等于这个能力不存在。
-    if str(a.get("input_rid") or "").strip():
-        return "act"
-    # ★ tap 的语义目标同理（2026-10-21 又踩一次）。
-    #   新契约下模型只给 tap_target，不给坐标；路由只判 next_x 的话，
-    #   每一轮都被吞成"无动作"，176 直接 0 动作跑空。
-    #   注释里那条"每加一种新的动作类型，必须同时加路由判据"是真话。
-    if str(a.get("tap_target") or "").strip():
-        return "act"
-    if a.get("next_x") is None:
-        return "check"
-    return "act"
 
 
-def route_after_knowledge(state: ChildState) -> Literal["decide", "vision", "act",
-                                                        "check"]:
-    """检索完回到 decide，让模型用上查到的内容再决定动作。
-
-    这是 need_knowledge 闭环的最后一环：decide 要知识 -> knowledge 查 ->
-    **decide 带着命中重新判断**。少了这一步，模型永远看不到自己要求的东西。
-    """
-    return "decide"
 
 
-def route_after_act(state: ChildState) -> Literal["vision", "strong_target", "decide",
-                                                  "observe", "start_check", "check"]:
-    """动作后直接用 act 返回的画面进入判断 —— 不再 observe。
-
-    ⚠️ SKILL 的节奏：act → 读 next → act。
-    每一步都 observe 会多一倍往返，正是"observe 次数应明显少于 act 次数"要避免的。
-
-    例外：
-      - act 没带回 next -> observe 补一次
-      - 起点纠正模式 -> 回 start_check 复核是否回到起点了
-
-    ★ 动作后**先回 strong_target**，别直接找模型 ——
-      这是"能直判的别问模型"的关键一步。act 返回的画面就是新鲜的，
-      代码能据此判断下一步：target 唯一命中就继续直点，
-      定不下来（或本步已交给模型）才去 decide。
-      ⚠️ 少了这条，每做完一个动作仍会白叫一次模型（实测 6 次）。
-
-    ★★ 本步轮次超限 -> 去 check 收口（不能只靠模型自觉）。
-    ---------------------------------------------------------------
-    176 实测（2026-10-21）空转了 **65 轮、11 分钟**，在
-    「填名称 -> 点完成 -> 回到列表页 -> 再进编辑页」里循环，
-    建出 6 张同名课程表。事后查下来是 YAML 落点写错了一屏。
-
-    但真正该拦住它的是**代码**，不是运气：
-      · check_node 里有 `round_in_step >= limit -> BLOCKED` 的收口，
-        而且 `round_in_step` 在 act 里每轮都正常 +1；
-      · 可 check_node **只有**在模型主动说 step_done 时才被路由到
-        （见 route_after_decide）。模型不说 done、一直在"努力"试，
-        就永远进不了 check —— 那道轮次上限**一次都没机会执行**。
-
-    教训：上限写在某个节点里，就必须保证那条路由**真的会到达**它。
-    否则等于没写。
-
-    这里在动作之后补一个判断：本步已经动了 limit 次还没结论，
-    直接送 check 让它收口。用的是**同一份** limit 语义
-    （state.max_rounds_per_step），不另起阈值。
-    """
-    a = state.get("action") or {}
-    # ★★ 补证据的那一次动作：做完就回 observe，然后重判原断言 ★★
-    #
-    # 必须放在所有既有判断之前 —— 这类 act 不属于任何一步的正常执行
-    # （round_in_step / fallback / strong_target 那一套都不适用），
-    # 走进去只会把它当成"这一步没走完"，然后又是一整轮 plan/decide。
-    #
-    # 失败也回 observe：observe 一定会刷新画面，随后 route_after_observe
-    # 会看到 assert_fix_task 把我们送回 assert 重判。不在这里搞两套去向。
-    if state.get("assert_fix_task"):
-        return "observe"
-    if a.get("vision_question"):
-        return "vision"
-    if state.get("start_mismatch"):
-        return "start_check"
-    if not state.get("obs_fresh"):
-        return "observe"
-    # ★ 本步动作次数到顶 -> 交 check 收口（它会判 BLOCKED 并停）。
-    #   放在 strong_target 之前：都到上限了就别再直点了。
-    try:
-        _limit = int(state.get("max_rounds_per_step") or 8)
-    except (TypeError, ValueError):
-        _limit = 8
-    if int(state.get("round_in_step") or 0) >= _limit:
-        return "check"
-    if not state.get("fallback_reason"):
-        return "strong_target"
-    return "decide"
 
 
-def route_after_vision(state: ChildState) -> Literal["observe", "start_check", "finish"]:
-    if state.get("status") == "BLOCKED":
-        return "finish"
-    return "start_check" if state.get("start_mismatch") else "observe"
 
 
-def _pending_asserts_for_step(state: ChildState, step_id: str) -> list[dict[str, Any]]:
-    """这一步**还没判**的断言。
-
-    用户的原话（这是整个改动的出发点）：
-      「判断应该是一个昨晚然后判断下一个。这是正常人类的思维。
-        我看完了是否又 10 个色块。当前这个弹窗挡住了。那我就回退到上一步继续判断。」
-      「正常的逻辑也是。一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
-
-    也就是说：**做完一步就把这一步的断言判掉**，趁界面还停在那一屏。
-    早先是全部步骤走完再统一判，那时弹窗早关了 ——
-    a13 要数的 10 个色块在编辑弹窗里，判的时候弹窗已经不在，
-    补动作也点不到（实测靠返回键硬退，最后把 App 退到桌面）。
-    """
-    if not step_id:
-        return []
-    done_ids = {str(f.get("id")) for f in (state.get("findings") or [])
-                if f.get("kind") == "assert"}
-    return [a for a in (state["task"].get("asserts") or [])
-            if str(a.get("step") or "") == step_id
-            and str(a.get("id") or "") not in done_ids]
 
 
-def route_after_check(state: ChildState) -> Literal["plan", "assert"]:
-    """一步做完之后：**先判这一步的断言**，再走下一步。
-
-    ★ 为什么不是直接 plan（早先的写法）：
-      断言全都攒到所有步骤走完才判，那时界面早就退回去了。
-      a13 要数色块，而色块在编辑弹窗里 —— 判的时候弹窗已经关了，
-      模型只能回 null，补动作也够不着那个控件。
-      人类测试员是"看完这一步就验，验完再走下一步"，代码照做就行。
-    """
-    if state.get("status") == "BLOCKED":
-        return "assert"      # 仍收已验的预期，最终 finish 会判 BLOCKED
-    if _pending_asserts_for_step(state, str(state.get("last_step_id") or "")):
-        return "assert"
-    return "plan"
 
 
-def route_after_assert(state: ChildState) -> Literal["verdict", "finish"]:
-    """assert 节点出来的三种 pending：
-
-      kind=finish   -> 收尾
-      kind=verdict  -> 代码已定论，直接落 finding
-      kind=assert   -> 问了模型，拿回来的还可以再回 assert 复核
-                       （assert_node 里 code_verdict=False 那条路）
-
-    ⚠️ 后两种都进 verdict 节点没错 —— verdict 节点既负责"落代码定论"，
-       也负责"接住模型回复"。区分靠 pending 里有没有 passed/by_code。
-    """
-    return "finish" if (state.get("pending") or {}).get("kind") == "finish" else "verdict"
 
 
-def route_after_verdict(state: ChildState) -> Literal["assert", "act", "plan", "finish"]:
-    """verdict 之后去哪。
-
-    三条路：
-      · act    —— 模型说"看不清、要补一步"（assert_fix_task 被填了）
-                  → 直接去 act 把那个元素点开，再回来重判
-      · assert —— 还有断言没收完，收下一条
-      · finish —— 全收完了
-
-    ⚠️ act 必须排在最前面：assert_fix_task 存在意味着**这条断言还没落 finding**，
-       此时 done 计数没变，若先判 assert 就会原地把同一条再问一遍，死循环。
-
-    ★ 为什么绕过 plan/decide：
-      补证据要点的元素，模型已经在 need_action.related_elements 里指明了，
-      再走一遍 plan→decide 只会让模型重新挑一次、还可能挑错。
-      这里是**一次确定的动作**，不是重新规划。
-    """
-    if state.get("assert_fix_task"):
-        return "act"
-    task = state["task"]
-    done = len([f for f in state.get("findings", []) if f.get("kind") == "assert"])
-    if done >= len(task["asserts"]):
-        return "finish"
-    # ★ 当前这一步的断言已经判完了 -> 回 plan 走下一步（用户要求的节奏）。
-    #
-    # 「一个点一个点的验证。验证完拿到确切的证据再验证下一个点。」
-    #
-    # 不这么写的话，assert 会顺着 asserts 顺序把**后面步骤**的断言也判掉 ——
-    # 而那些步骤还没执行，判它们等于拿错屏硬判。
-    _cur = str(state.get("assert_step") or state.get("last_step_id") or "")
-    if _cur and not _pending_asserts_for_step(state, _cur):
-        # 还有步骤没走 -> 回去继续执行；都走完了 -> 继续收剩下的断言
-        if int(state.get("step_index") or 0) < len(task.get("steps") or []):
-            return "plan"
-    return "assert"
 
 
 def _foreground_owner(state: ChildState) -> tuple[str, str]:
@@ -5643,190 +4455,6 @@ def _is_sut(state: ChildState, pkg: str) -> bool:
     return pkg.strip() == app_pkg
 
 
-def strong_target_node(state: ChildState) -> dict[str, Any]:
-    """强证据直点：这一步的 target 在**当前屏**能不能唯一确定？
-
-    ★ 设计依据（见 docs/执行机制.md 第 3、4 节）：
-      「YAML 里强有力的判断可以直接执行。不用通过 LLM。
-        比如点击某个按钮跳转到了一个具体的页面。或者点击后出现了某个特有的弹窗。
-        或者出现了独一一个 view。强力证据 rid desc text 这种。
-        最好用 xpath 这种组合的路径。防止出现两个相同的找错的问题。」
-
-    这个节点**不是回放**。它不认"上次点了哪"，只认"现在能不能唯一确定"：
-
-        xpath 命中 1 个  → 取它的坐标，直接点，全程 LLM 零介入
-        xpath 命中 0 个  → 目标不在当前屏 → 交模型
-        xpath 命中 >1 个 → 不唯一，可能点错 → 交模型
-
-    为什么"唯一"是硬门槛：实测设置页有 4 个节点 rid/desc/text 全空、只有 bounds
-    不同。只按单一属性找，根本分不出是哪个，点错了整条用例就废了。
-    所以宁可退回模型，也不赌。
-
-    这个节点**只决定点哪**，不执行 —— 真正的点击仍走 act 节点，
-    坐标校验、崩溃检测这些守卫一条都不少。
-    """
-    task = state.get("task") or {}
-    steps = task.get("steps") or []
-    idx = state.get("step_index", 0)
-    if idx >= len(steps):
-        return {"action": {"step_done": True, "why": "步骤已走完"}}
-
-    step = steps[idx]
-    sid = str(step.get("id") or "")
-
-    # ══════════════════════════════════════════════════════════════════
-    # ⓪ 强证据只对**被测 App 自己的界面**生效
-    # ══════════════════════════════════════════════════════════════════
-    #
-    # 用户原话：
-    #   「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。
-    #     虽然多一次访问。但更简单点。」
-    #
-    # 这条规则解决的是"外部界面不可控"的问题：
-    #   · 系统图库、权限框、分享面板 —— 它们不是我们的代码，
-    #     rid 叫什么、activity 叫什么、有几个都随时可能变
-    #   · 我们**改不了它们**，却要拿写死的规则去判，等于自己造误报
-    #
-    # 168 就是活证据：a3 钉死 PhotoPickerGetContentActivity，
-    # Android 17 换个分支就给了 PhotoPickerUserSelectActivity。
-    # 我当时的补法（给"相册"列一串关键词）方向是错的 ——
-    # 那仍然是拿规则去猜一个我们控制不了的界面，只是把关键词换宽了一点。
-    #
-    # 正确的分界是**归属**，不是**内容**：
-    #   前台是被测 App  → 界面结构稳定，强证据可靠，用代码判
-    #   前台是别人家的  → 结构不稳定，直接交给模型看一眼，别硬判
-    #
-    # 代价是外部界面每步多一次模型调用。用户明确接受了：
-    #   「虽然多一次访问，但更简单点」。
-    #
-    # ⚠️ 判不了归属（拿不到包名/activity）时也要交出去。
-    #    宁可按"外部"处理 —— 多花一次调用，好过拿不准还硬判。
-    from_pkg, from_act = _foreground_owner(state)
-    if not _is_sut(state, from_pkg):
-        return _ask_model(
-            state,
-            f"{sid} 当前前台不是被测 App"
-            f"（{from_pkg or '未知包名'}/{from_act or '未知界面'}）。"
-            f"强证据只在被测 App 自己的界面里用 —— 外部界面的结构不受我们控制，"
-            f"写死的 rid/activity 判不准。这一步由你看着屏幕判断该做什么。")
-
-    # ══════════════════════════════════════════════════════════════════
-    # ① 先问代码：这一步的**落点**是不是已经满足了？
-    # ══════════════════════════════════════════════════════════════════
-    #
-    # 用户原话：「根据YAML里步骤先试一下。下一步的判断点如果代码判断能过得话
-    #            就继续下一步。」
-    #
-    # 上一步点完可能顺带就到了这一步的界面。此时不该再找控件点，
-    # 直接判本步完成。判据只认代码能唯一确定的（activity / rid / xpath）。
-    #
-    # ⚠️ 只在**本步还没动过手**时才做这个预判（`round_in_step == 0`）。
-    #    否则会出现一个致命的假通过：用例"从 A 到 A"（起点就在 A），
-    #    每一轮都判"落点已满足"→ 立刻完成 → 一步没走却报 PASS。
-    #    实测就是 loopblock 用例这样过的：0 次点击、0 次决策，结论 PASS。
-    #    只判"刚进入这一步时"才符合原意 —— 那是"上一步顺带把我送到了"，
-    #    而不是"我一直在原地所以永远满足"。
-    untouched = state.get("round_in_step", 0) == 0
-    if untouched and step.get("landing"):
-        det, det_why = is_deterministic_landing(step["landing"])
-        if det:
-            hit, why = match_landing(
-                step["landing"],
-                activity=str(state.get("last_activity") or ""),
-                clickable=state.get("obs_clickable") or [],
-                nodes_text=state.get("obs_nodes_text") or "",
-                state_pkg=str(state.get("last_package") or ""))
-            if hit:
-                return {
-                    "action": {"step_done": True,
-                               "why": f"落点已满足，代码直接判定完成（{why}）"},
-                    "strong_hits": [{"step": sid, "by": "code",
-                                     "how": f"落点已满足({why})"}],
-                    "progress": [_tick("strong",
-                                       f"{sid} 落点已满足（{why}），跳过",
-                                       step=sid)],
-                }
-
-    # ══════════════════════════════════════════════════════════════════
-    # ② 再问代码：这一步要点的东西，在当前屏上有唯一的位置吗？
-    # ══════════════════════════════════════════════════════════════════
-    target = str(step.get("target") or step.get("locate") or "").strip()
-    if not target:
-        return _ask_model(state, f"{sid} 没有声明 target，代码不知道点什么")
-
-    x, y, how = _resolve_strong_target(target, state)
-
-    if x is None:
-        return _ask_model(state, f"{sid} {how}")
-
-    # ★★★ 强证据直点的**退出条件** ★★★
-    #
-    # 用户原话：「强证据是为了减少 LLM 的调用。第一次的时候 YAML 应该能明白
-    #            要写课程名才能保存。这应该是坑。那就需要增加个机制。
-    #            如果强证据不能到预计那就让大模型介入。而不是一直无用的点。」
-    #
-    # 这段话把机制的目的说透了，值得单独写清楚，因为它极易被写歪：
-    #
-    #   强证据 = **省一次模型调用**，不是"永远不叫模型"。
-    #   一旦代码发现自己到不了预期（点完还是原样），就必须让模型接手。
-    #
-    # 我第一版就写歪了：加了"命中唯一就点"却没有任何退出条件，
-    # 结果 176 死点「完成」37 次、白跑 70 秒。点完页面纹丝不动，
-    # 代码仍然认为"这次命中的是唯一的，那就再点一次"—— 它不知道
-    # **"点得中"和"点了有用"是两件事**。
-    #
-    # ## 退出判据：连续 N 次**没有进展**
-    #
-    # "进展"不只指跳页。以下任一都算进展，计数归零：
-    #   · activity 变了
-    #   · 可点控件清单变了（弹了个对话框、键盘收起也算）
-    #   · 落点判据更接近满足（这里简化为上面两条）
-    #
-    # 什么都不变 = 这个动作在**当前这个界面状态下**无效。
-    # 无效只有两种原因：① 有前置条件没满足（必填项、开关没开、要先选类型）
-    # ② 控件被挡住/不可点。
-    # **两种都不是"再点一次就好"** —— 继续点等于拿设备陪跑。
-    #
-    # 所以第三次之前必须交出去。阈值取 2：
-    # 一次往返约 1 秒，两次（2 秒）都没变化，已经足够排除"页面还没加载完"。
-    _tries = _strong_tries(state, sid, target)
-    if _tries >= STRONG_MAX_SAME_TARGET:
-        _now = state.get("last_activity") or "(未知)"
-        # ★ 输入框要单独说清楚（176 实测踩到）。
-        #
-        # 给模型的话原来是「点了 N 次毫无变化，缺前置条件」——
-        # 模型看到"缺前置条件"，于是**又去输入一次**，形成死循环：
-        # 名字其实第一次就填进去了（账本 chg=1），后面 N 次 chg=0，
-        # 它却以为"没填上"，不停重填，永远轮不到点「完成」。
-        _val = _current_input_value(state, target)
-        if _val is not None:
-            return _ask_model(
-                state,
-                f"{sid} 的输入框 {target} **已经有值了**：{_val!r}。"
-                f"代码已经把同一个值又写了 {_tries + 1} 次，界面毫无变化 ——"
-                f"说明内容是对的、不需要再输入。"
-                f"**下一步不要再输入**，去做这一步真正剩下的事"
-                f"（例如点「完成」/「保存」，或本来就该判定完成了）。")
-        return _ask_model(
-            state,
-            f"{sid} 代码已经把这个目标点了 {_tries + 1} 次，"
-            f"**每次点完界面都毫无变化**（一直停在 {_now}）。"
-            f"说明「点它」这个动作在当前状态下根本不起作用 —— "
-            f"不是坐标错了，也不是没点中，而是缺了前置条件。"
-            f"代码不知道缺什么，这一步交给你判断。")
-
-    return {
-        "action": {
-            "step_done": False, "next_x": x, "next_y": y,
-            "why": f"强证据直点：{sid} → {target}（{how}）",
-            "_strong": True,
-        },
-        "strong_hits": [{"step": sid, "by": "code", "target": target,
-                         "how": how}],
-        "progress": [_tick("strong",
-                           f"{sid} 强证据命中唯一，直接点 ({x},{y}) [{how}]",
-                           step=sid)],
-    }
 
 
 def _resolve_strong_target(target: str, state: ChildState) -> tuple[int | None, int | None, str]:
@@ -6314,84 +4942,1355 @@ def _screen_fingerprint(state: ChildState) -> str:
     rids = ",".join(sorted(str(n.get("r") or "") for n in
                            (state.get("obs_clickable") or [])))
     return f"{act}|{pkg}|{rids}"
+# ========================================================================
+# 新图的 8 个节点（边走边验）
+# ========================================================================
 
 
-def route_after_strong(state: ChildState) -> Literal["act", "decide", "check", "finish"]:
-    """强证据直点的结果去哪。
 
-    - 已经 BLOCKED -> finish（不再动设备）
-    - 拿到动作 -> act（坐标校验等守卫照走）
-    - 落回模型 -> decide
-    - 本步已完成 -> check
+# --------------------------------------------------------------------------
+# 小工具
+# --------------------------------------------------------------------------
 
-    ⚠️ 不能只看 next_x：`key=` 这类按键动作没有坐标。
+def _pending_for(state: ChildState, sid: str) -> list[dict[str, Any]]:
+    """这一步名下**还没验**的预期。
+
+    保护 11：证据按步骤取。这里就是"按步骤"的定义 ——
+    一步走完只验它名下的，不碰别的步骤的断言。
     """
-    # ★ 已 BLOCKED 就收尾。这里挡的是"状态说停、手上还在点"——
-    #   设备动作一旦多发一次，报告和现场就对不上了。
-    if state.get("status") == "BLOCKED":
+    if not sid:
+        return []
+    done = {str(f.get("id")) for f in (state.get("findings") or [])
+            if f.get("kind") == "assert"}
+    return [a for a in ((state.get("task") or {}).get("asserts") or [])
+            if str(a.get("step") or "") == sid
+            and str(a.get("id") or "") not in done]
+
+
+def _asserts_done(state: ChildState) -> int:
+    return len([f for f in (state.get("findings") or [])
+                if f.get("kind") == "assert"])
+
+
+def _step_desc(task: dict[str, Any], sid: str) -> str:
+    for s in (task.get("steps") or []):
+        if str(s.get("id") or "") == sid:
+            return str(s.get("desc") or "")
+    return ""
+
+
+def _acts_seen(state: ChildState) -> list[str]:
+    """一路走过哪些 activity。
+
+    ⚠️ visited 里存的是 "A -> B" 形式的转移记录（保护 12），
+       这里拆成单个 activity 名，因为断言问的是"到达过 X 没有"。
+    """
+    out: set[str] = set()
+    for v in (state.get("visited") or []):
+        s = str(v)
+        if "->" in s:
+            left, right = s.split("->", 1)
+            out.add(left.strip())
+            out.add(right.strip())
+        elif s.strip():
+            out.add(s.strip())
+    if state.get("last_activity"):
+        out.add(str(state["last_activity"]))
+    return sorted(x for x in out if x)
+
+
+def _advance_from_verify(state: ChildState, vs: str) -> dict[str, Any]:
+    """本步验完 -> 推进到下一步，并把本步的各种计数清零。"""
+    nxt = int(state.get("step_index") or 0) + 1
+    print(f"  [verify] {vs} 的预期全部验完 -> 进入下一步"
+          f"（step_index {nxt}）", file=sys.stderr)
+    return {"step_index": nxt, "verify_step": "", "verify_assert": "",
+            "round_in_step": 0, "check_rounds": 0, "retry_landing": 0,
+            "locate_attempts": 0, "fallback_reason": "",
+            "assert_fix_rounds": 0}
+
+
+def _reset_per_assert() -> dict[str, Any]:
+    """一条断言判完了就清它的补点计数。
+
+    清在这里而不是"整步结束"，因为补点次数是**针对某一条预期**的：
+    上一条点了 2 次，不该让下一条只剩 1 次机会。
+    """
+    return {"assert_fix_rounds": 0}
+
+
+# 判定 schema 直接复用 nodes.py 的 AssertVerdict，**不自己定义一份**。
+#
+# 踩过的坑（保护 9）：这个 schema 是 LangGraph 校验模型回复用的，
+# **没声明的字段会被静默丢掉**。178 实测：runner 在解析失败时返回
+# {"passed": None, "unknown": True, "error": "..."}，但 schema 里没有
+# 这两个键 -> 直接丢 -> "判不出来"这件事根本传不上来，
+# issues 里印出空括号「判定缺失：模型回复无法解析（）」，排查时完全无从下手。
+# 所以这份 schema 只能有一份，改动必须落在 nodes.py 那个类上（已在上面导入）。
+
+
+# --------------------------------------------------------------------------
+# 节点 6/8：verify —— 验这一步名下的预期
+#
+# 合并了旧版的 assert + verdict。
+#
+# ⚠️ 为什么内部还是**两段式**（保护 25/26）：
+#    LangGraph 的 interrupt 恢复时，整个节点**从头重跑**。
+#    形态：
+#      第一次进 verify  -> interrupt(问题) -> 挂起
+#      恢复后重跑 verify -> interrupt 直接返回答案 -> 落 finding
+#    这是机制，对外就是一个节点。
+# --------------------------------------------------------------------------
+
+def verify_node(state: ChildState) -> dict[str, Any]:
+    """验本步名下的预期；全部验完后推进 step_index。
+
+    ## 为什么必须紧跟 check
+
+    用户：「AI走的时候第一轮就边走边验证了。能拿到所有的记录。
+           然后最后根据记录写json。而不是回过头就复验证。」
+
+    旧链路走完所有步骤再回头验，那时人早不在那一屏：
+      a2     要验"进编辑页"，判的时候在引导页  -> FAIL（判错）
+      a4/5/6 要验"空课表"，判的时候在显示页    -> FAIL（判错）
+      a14    要验"弹窗关了"，判的时候在编辑页   -> FAIL（判错）
+    这些不是产品坏了，是验错了地方。
+    """
+    from langgraph.types import interrupt
+
+    task = state.get("task") or {}
+    asserts = task.get("asserts") or []
+    vs = str(state.get("verify_step") or "")
+
+    if not vs:
+        return {"pending": None, "verify_assert": ""}
+
+    mine = _pending_for(state, vs)
+    if not mine:
+        # 进了 verify 却没活干 -> 也要推进，否则路由原地空转。
+        return _advance_from_verify(state, vs)
+
+    a = mine[0]
+    # 证据必须是**这一步**那一屏（保护 11）
+    ev = _evidence_for_assert(state, a)
+    evd = ev.get("data") or {}
+    # 颜色/形状/数量这类 XML 判不了的，先问视觉
+    vis = _vision_for_assert(state, a, evd)
+
+    # ⚠️ interrupt 恢复时这里会重跑，所以上面必须全是**纯读**：
+    #    不写盘、不改 state，否则恢复时重复执行。
+    payload = {
+        "kind": "assert",
+        "index": _asserts_done(state) + 1,
+        "total": len(asserts),
+        "assert_id": a.get("id"),
+        "desc": a.get("desc") or "",
+        "case_title": task.get("title"),
+        "step_id": vs,
+        "step_desc": _step_desc(task, vs),
+        "evidence_source": ev.get("source") or "",
+        "evidence_bound": ev.get("bound"),
+        "screen_activity": evd.get("activity") or "",
+        "screen_nodes_text": evd.get("nodes_text") or "",
+        "screen_nodes": evd.get("nodes") or [],
+        "screen_clickable": evd.get("clickable") or [],
+        # 图片只走 vision 通道（保护 15：run 68 每条提示词图片占 99.3%）
+        "image": "",
+        "vision_result": vis,
+        # 一路见过什么（保护 12：判"过程中出现过"要用）
+        "activity_seen": _acts_seen(state),
+        "seen_rids": sorted({str(r) for r in (state.get("seen_rids") or [])}),
+        "visited": (state.get("visited") or [])[-8:],
+        "evidence_event_ids": state.get("last_event_ids") or [],
+        "knowledge": (state.get("action") or {}).get("knowledge") or "",
+        "knowledge_files": task.get("knowledge_files") or [],
+        "question": _verify_question(ev, vis),
+    }
+
+    answer = interrupt(payload, response_schema=AssertVerdict)
+    if isinstance(answer, AssertVerdict):
+        answer = answer.model_dump()
+
+    # ── 信息不足，AI 要求再点一下才能判 ──
+    #
+    # 用户定的：「因为是这样。当前信息不足。我需要进一步点击或者其他动作
+    #             才能判定。」
+    #
+    # 这不是"补证据"那种独立机制，就是**验证时自己动手看一眼** ——
+    # 人类测试员点开色板数颜色，看完点「取消」退回，天经地义。
+    #
+    # 所以放在 verify 内部处理，不加节点：
+    #   点一下 -> 重新观察 -> 回来再判（同一条断言）
+    # 轮次上限用 assert_fix_rounds（ASSERT_AI_RECHECK_MAX），防无限点。
+    na = answer.get("need_action") if isinstance(answer, dict) else None
+    if na and _need_action_valid(na):
+        return _do_need_action(state, a, vs, answer, na)
+
+    return _land_verdict(state, a, vs, answer, vis)
+
+
+def _need_action_valid(na: Any) -> bool:
+    """是不是一个真的"要动手"请求（而不是空对象）。"""
+    if not isinstance(na, dict):
+        return False
+    # 有明确要点的东西才算 —— 只给个说明没有落点，执行器没法动
+    els = na.get("related_elements") or []
+    for e in els:
+        if isinstance(e, dict) and (e.get("rid") or e.get("text")):
+            return True
+    return False
+
+
+def _do_need_action(state: ChildState, a: dict[str, Any], vs: str,
+                    answer: dict[str, Any], na: dict[str, Any]) -> dict[str, Any]:
+    """按 AI 的要求点一下，然后让它重新判同一条。
+
+    ## 为什么要点"看完怎么关回去"的那个键
+
+    用户：「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。
+           不然继续不下去了。我说了要像个人类测试员一样」
+
+    点开色板看完，得点「取消」退回编辑弹窗，否则下一条断言
+    （a14 要验弹窗关了）拿到的是色板，验的根本不是一回事。
+
+    ## ⚠️ 绝不按 back
+
+    run 79 的教训（保护 16）：补证据补完按了 back，退到桌面，
+    后面 11 条断言全对着 launcher 判，整轮报废。
+    所以只按 need_action 里明确给的**按钮文字**去点，
+    点不到就什么都不做（宁可留着不关，也不乱按）。
+    """
+    dev = _ctx().device
+    rounds = int(state.get("assert_fix_rounds") or 0)
+    limit = ASSERT_AI_RECHECK_MAX
+
+    # 先把"看完要关回去"的按钮记下来 —— 等重判完再点它
+    close_with = str(na.get("close_with") or "").strip()
+
+    if rounds >= limit:
+        # 点过这么多次还判不了，就此打住，如实记 BLOCKED
+        return _blocked_verdict(
+            state, a, vs,
+            f"已经为这条预期补点过 {rounds} 次仍然判不了："
+            f"{na.get('why_insufficient') or ''}",
+            f"（多次尝试后仍无法判定：{na.get('verify_target') or ''}）")
+
+    # 挑一个要点的元素：优先 rid，没有 rid 用文字
+    target = None
+    for e in (na.get("related_elements") or []):
+        if not isinstance(e, dict):
+            continue
+        rid = str(e.get("rid") or "").strip()
+        txt = str(e.get("text") or "").strip()
+        if rid or txt:
+            target = {"rid": rid, "text": txt}
+            break
+    if not target:
+        return _blocked_verdict(state, a, vs,
+                               "AI 说要动手，但没给出具体要点的东西",
+                               str(answer.get("actual") or ""))
+
+    why = f"为验 {a['id']} 点开「{target['text'] or target['rid']}」看实际内容"
+    shot_before = state.get("last_shot") or ""
+    xml_before = state.get("obs_xml_path") or ""
+    # ⚠️ 这里**不能用 click_rid / click_xpath**：
+    #    它们内部调 act() 时没传 step，clicks.jsonl 里这条记录就丢了 step ——
+    #    回写 JSON 时"这次是为验哪条断言点的"就断了。
+    #    所以自己取坐标、再调 act(step=..., why=...)，账本才完整。
+    try:
+        scr = dev.observe()
+        node = scr.find_rid(target["rid"]) if target["rid"] else None
+        if node is None and target["text"]:
+            # 没 rid（或找不到）就按文字精确找：命中必须唯一，不赌（保护 18）
+            t = target["text"]
+            cands = [n for n in scr.clickable
+                     if n.get("t") == t or n.get("d") == t]
+            if len(cands) == 1:
+                node = cands[0]
+            elif len(cands) > 1:
+                return _blocked_verdict(
+                    state, a, vs,
+                    f"「{t}」在当前屏有 {len(cands)} 个同名控件，不敢赌点哪个",
+                    str(answer.get("actual") or ""))
+        if node is None:
+            return _blocked_verdict(
+                state, a, vs,
+                f"按 AI 要求点「{target['text'] or target['rid']}」，"
+                f"但当前屏上找不到它",
+                str(answer.get("actual") or ""))
+        cx, cy = int(node["c"][0]), int(node["c"][1])
+        res = dev.act(cx, cy, why=why, step=f"a{vs}")
+    except Exception as exc:  # noqa: BLE001
+        return _blocked_verdict(
+            state, a, vs,
+            f"按 AI 要求点「{target['text'] or target['rid']}」失败：{exc}",
+            str(answer.get("actual") or ""))
+
+    # 点完重新观察，新的证据就来自这一屏
+    obs = {}
+    try:
+        obs = dev.observe_raw() or {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [verify] {a['id']} 点开后观察失败：{exc}", file=sys.stderr)
+
+    new_shot = (obs.get("evidence") or {}).get("png") or ""
+    # ⚠️ 键名必须是 assert_id：build_learned_case 按 assert_id 归集，
+    #    写成 "assert" 的话回写的 JSON 里"为验这条点了什么"就丢了 ——
+    #    而那正是用户要的「为了验证个点我执行了多少步」。
+    act_note = {
+        "assert_id": a["id"],
+        "step": vs,
+        "why_insufficient": str(na.get("why_insufficient") or ""),
+        "open": target["text"] or target["rid"],
+        "close": close_with,
+        "action": f"点开 {target['text'] or target['rid']}",
+        "why": why,
+        "changed": (obs.get("activity") or "") != (state.get("last_activity") or ""),
+        "shot": new_shot or shot_before,
+        "xml": _screen_xml_path(obs) if obs else xml_before,
+    }
+    print(f"  [verify] {a['id']} 信息不足 -> 点开 "
+          f"「{target['text'] or target['rid']}」重判"
+          f"（第 {rounds + 1}/{limit} 次）", file=sys.stderr)
+
+    return {
+        "assert_fix_rounds": rounds + 1,
+        "last_activity": obs.get("activity") or state.get("last_activity") or "",
+        "last_shot": new_shot or shot_before,
+        "last_event_ids": [str(e) for e in (obs.get("event_ids") or [])],
+        "last_package": obs.get("package") or state.get("last_package") or "",
+        "obs_clickable": obs.get("next") or [],
+        "obs_nodes_text": _screen_text(obs) if obs else "",
+        "obs_nodes": _brief_nodes(obs.get("nodes")) if obs else [],
+        "obs_xml_path": _screen_xml_path(obs) if obs else "",
+        # ★ 证据换成"点开之后"这一屏，并且**仍然记在这一步名下**
+        "step_evidence": _step_evidence_of(state, obs) if obs else [],
+        "seen_rids": _seen_rids(obs.get("next"), obs.get("nodes")) if obs else [],
+        "seen_texts": _seen_texts(obs.get("next"), obs.get("nodes")) if obs else [],
+        "verify_actions": [act_note],
+        # ★ 这个要跨轮次留着：重判时还得知道"看完怎么关回去"。
+        #   必须声明在 ChildState 里，否则下一轮就被丢掉了。
+        "_close_with": close_with,
+        # 保持 verify_step 不变 -> 路由会回到 verify 重判同一条
+        "verify_step": vs,
+    }
+
+
+def _verify_question(ev: dict[str, Any], vis: dict[str, Any]) -> str:
+    """给判定模型的问题。
+
+    只说"要判什么、证据从哪来、判不了怎么办"；
+    「可以XX」这类不可观察写法的判定规则在 decide.py 的 _SYSTEM_VERDICT 里，
+    那是全局约定，不在这里重复。
+    """
+    parts = [
+        f"证据来自{ev.get('source') or '本次执行'}，只有 XML 文字（**没有图片**）。",
+    ]
+    if not ev.get("bound"):
+        parts.append(
+            "⚠️ 这条预期没绑定到某一步，只能拿整轮最后一屏当证据 —— "
+            "如果这一屏明显不是该看的地方，请判 null 并说明。")
+    if vis.get("ok"):
+        parts.append(f"视觉模型已经看过图，回答是：{vis.get('answer') or ''}")
+    elif vis.get("tried") and not vis.get("ok"):
+        parts.append(
+            f"⚠️ 这条预期需要看图（{vis.get('why') or ''}），"
+            f"但视觉模型没给答案（{vis.get('detail') or '未知原因'}）。"
+            "纯 XML 判不了就判 null，**不要猜**。")
+    parts.append(
+        "这条预期达成了吗？actual 写具体现象；"
+        "event_id 必须取自 evidence_event_ids。"
+        "XML 里确实找不到依据、且必须看图才能判 -> passed=null，"
+        "并在 actual 里写清要看的到底是什么。")
+    return "\n".join(parts)
+
+
+def _blocked_verdict(state: ChildState, a: dict[str, Any], vs: str,
+                     why: str, actual: str) -> dict[str, Any]:
+    """记成"没验成"——既不是 PASS 也不是 FAIL。
+
+    保护 7：这是最容易被写错的地方。"模型没答上来"和"产品坏了"
+    是两件事，混成一件就会把自己的执行问题算到产品头上。
+    """
+    dev = _ctx().device
+    note = f"（{why}）"
+    try:
+        dev.finding_no_evidence("BLOCKED", a.get("desc") or "",
+                                (actual + note).strip() or note)
+    except Exception:  # noqa: BLE001
+        pass
+    out: dict[str, Any] = {
+        "findings": [{"kind": "assert", "id": a["id"],
+                      "desc": a.get("desc") or "", "step": vs,
+                      "status": "BLOCKED", "actual": actual or why,
+                      "event_id": "", "issues": [why]}],
+        "pending": None,
+        "verify_assert": "",
+    }
+    return {**out, **_after_asserts_exhausted(state, out, vs)}
+
+
+def _after_asserts_exhausted(state: ChildState, out: dict[str, Any],
+                             vs: str) -> dict[str, Any]:
+    """这条验完后：先把"点开的东西关回去"，再决定继续验还是进下一步。
+
+    ## 为什么必须关回去
+
+    用户：「因为背景色也是个弹窗呀。你验证完要继续推倒上一步啊。
+           不然继续不下去了。我说了要像个人类测试员一样」
+
+    点开色板数完颜色，界面停在色板上。不关的话，下一条断言
+    （比如 a14「弹框关闭」）拿到的是色板 —— 验的根本不是一回事。
+
+    ## ⚠️ 绝不按 back（保护 16）
+
+    run 79 的教训：补完证据按了 back，退到桌面，后面 11 条断言
+    全对着 launcher 判，整轮报废。所以只点 need_action 里明确给了的
+    **按钮文字**，点不到就什么都不做。
+
+    ## ⚠️ 必须用**加过本条之后**的 findings 判断
+
+    本条 finding 刚产生、state 里还没有，用 state 判会误以为"还有剩的"，
+    于是永远不推进 —— 旧版踩过。
+    """
+    _all = list(state.get("findings") or []) + out.get("findings", [])
+    _left = [x for x in ((state.get("task") or {}).get("asserts") or [])
+             if str(x.get("step") or "") == vs
+             and not any(f.get("kind") == "assert"
+                         and str(f.get("id")) == str(x.get("id"))
+                         for f in _all)]
+    extra = _close_after_look(state)
+    if not _left:
+        return {**_advance_from_verify(state, vs), **extra,
+                "assert_fix_rounds": 0}
+    print(f"  [verify] {vs} 还有 {len(_left)} 条："
+          f"{','.join(str(x.get('id')) for x in _left)}", file=sys.stderr)
+    return {**extra, **_reset_per_assert()}
+
+
+def _close_after_look(state: ChildState) -> dict[str, Any]:
+    """把为了看清而点开的东西关回去。
+
+    只认 AI 在 need_action.close_with 里**明确给过的按钮文字**，
+    且必须唯一命中。点不到就什么都不做 —— 宁可界面留着，
+    也不乱点（保护 16：乱按 back 毁过一整轮）。
+    """
+    want = str(state.get("_close_with") or "").strip()
+    if not want:
+        return {}
+    dev = _ctx().device
+    try:
+        scr = dev.observe()
+        cands = [n for n in scr.clickable
+                 if n.get("t") == want or n.get("d") == want]
+        if len(cands) != 1:
+            print(f"  [verify] 「{want}」命中 {len(cands)} 个，不关（不乱点）",
+                  file=sys.stderr)
+            return {"_close_with": ""}
+        c = cands[0]["c"]
+        dev.act(int(c[0]), int(c[1]), why=f"看完关回去：{want}", step="close")
+        print(f"  [verify] 已点「{want}」关回去", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [verify] 关回去失败：{exc}", file=sys.stderr)
+    return {"_close_with": ""}
+
+
+def _land_verdict(state: ChildState, a: dict[str, Any], vs: str,
+                  v: dict[str, Any], vis: dict[str, Any]) -> dict[str, Any]:
+    """把结论落成一条 finding。
+
+    ⚠️ 三态（保护 7/8/9）：
+        passed=True  -> PASS
+        passed=False -> FAIL
+        passed=None  -> BLOCKED（"没验成"，**不是**"功能坏了"）
+
+    `bool(None)` 是 False —— 那正是"把没验成当成验失败"，
+    是这份代码里最容易犯也最伤人的错，所以必须显式判 None。
+    """
+    dev = _ctx().device
+    issues: list[str] = []
+    actual = str(v.get("actual") or "")
+    p = v.get("passed")
+
+    # 保护 9：模型回复解析失败 -> "判不了"，不是"功能坏了"。
+    # 178 实测：这里当初没判断，于是解析失败的回复被当成 passed=False 记成 FAIL。
+    if v.get("unknown") or str(v.get("error") or "").strip():
+        err = str(v.get("error") or "").strip() or "未给出原因"
+        return _blocked_verdict(state, a, vs,
+                                f"模型回复无法解析（{err}）", actual)
+
+    if p is None:
+        unreviewed = True
+        passed = False
+        if not actual.strip():
+            actual = "（模型没给出结论）"
+    else:
+        unreviewed = False
+        passed = bool(p)
+
+    # 证据 id 校验（保护 13）
+    # 176 实测：last_event_ids 为空时 a7/a8/a9 全被判 PASS，其实没证据。
+    got = str(v.get("event_id") or "").strip()
+    valid = set(state.get("last_event_ids") or [])
+    if passed and valid and got and got not in valid:
+        issues.append(f"{a['id']} 引用的 event_id {got} 不在本次证据里，忽略")
+        got = ""
+
+    status = "BLOCKED" if unreviewed else ("PASS" if passed else "FAIL")
+    if unreviewed and vis.get("tried") and not vis.get("ok"):
+        actual = (actual + f"｜视觉通道失败：{vis.get('detail') or ''}").strip("｜")
+
+    try:
+        if got and got.isdigit():
+            dev.finding(status, got, a.get("desc") or "", actual)
+        else:
+            dev.finding_no_evidence(status, a.get("desc") or "", actual)
+    except Exception as exc:  # noqa: BLE001
+        issues.append(f"{a['id']} finding 写入失败：{exc}")
+
+    out: dict[str, Any] = {
+        "findings": [{"kind": "assert", "id": a["id"],
+                      "desc": a.get("desc") or "", "step": vs,
+                      "status": status, "actual": actual,
+                      "event_id": got, "issues": issues}],
+        "issues": issues,
+        "pending": None,
+        "verify_assert": "",
+    }
+    return {**out, **_after_asserts_exhausted(state, out, vs)}
+
+# --------------------------------------------------------------------------
+# 节点 5/8：check —— 这一步走完了吗
+#
+# 这是「边走边验」的枢纽：判断完成时**不推进** step_index，
+# 而是设 verify_step，把控制权交给 verify（保护 31）。
+# --------------------------------------------------------------------------
+
+def check_node(state: ChildState) -> dict[str, Any]:
+    """判本步是否达成目的，决定：去验、重试、还是进下一步。
+
+    双重保险：AI 说 done 之后，**代码再用 landing 复核一次**。
+    AI 可能乐观（"看起来到了"），代码可不信。
+    """
+    from ..device.bridge import is_system_permission_pkg
+
+    action = state.get("action") or {}
+    task = state["task"]
+    idx = state.get("step_index", 0)
+    step = task["steps"][idx]
+    sid = str(step.get("id") or "")
+    done = bool(action.get("step_done"))
+    give_up = bool(action.get("give_up"))
+    rounds = state.get("round_in_step", 0)
+    limit = state.get("max_rounds_per_step", MAX_ROUNDS_PER_STEP)
+    issues: list[str] = []
+    landing = (step.get("landing") or "").strip()
+    act_now = state.get("last_activity") or ""
+    front_pkg = state.get("last_package") or ""
+
+    # 系统权限框不是"完成了本步"（保护 21）
+    if done and is_system_permission_pkg(front_pkg):
+        issues.append(
+            f"{sid} 声明完成，但屏幕上仍是**系统权限框**（包名 {front_pkg}）"
+            f"—— 权限框不是本步目标，等它被处理完再判")
+        done = False
+
+    # 落点复核：AI 说到了，代码再验一遍（保护 28：相等不子串）
+    if done and landing:
+        hit, why = match_landing(landing, activity=act_now,
+                                 clickable=state.get("obs_clickable"),
+                                 state_pkg=front_pkg)
+        if not hit:
+            issues.append(
+                f"{sid} 声明完成但落点不符：期望 {landing}，"
+                f"实际 activity={act_now}（{why}）")
+
+    # ── 放弃 ──
+    if give_up and not done:
+        reason = action.get("give_up_reason") or "未给出原因"
+        # ⚠️ 这里曾经靠关键字猜：`any(k in reason for k in ("卡死","still_stuck","放弃"))`。
+        #    结果交替死循环给的原因写的是「代码判定死循环」，一个词都没命中 ——
+        #    于是被当成"只是这一步放弃"，跳一步继续跑，后面 53 轮反复
+        #    报同一个已被判死的决定（test_cycle 抓到）。
+        #    改成显式字段：是不是真卡死，由**判定的那一段代码**说了算，
+        #    不靠事后解析文案。模型给的 give_up 一律不带 stuck，
+        #    等价于旧行为（只放弃本步），所以迁移是安全的。
+        stuck = bool(action.get("stuck"))
+        if stuck:
+            # 真卡死才终止整条用例（保护 30 的反面：卡死=页面不变，
+            # 后面每步只会重演同一循环，169 因此白烧 4 分钟）
+            return {
+                "status": "BLOCKED",
+                "summary": f"{sid} 判定卡死（{reason}），整条用例终止"
+                           f"（当前 activity={act_now}）",
+                "issues": issues + [f"{sid} 卡死终止：{reason}"],
+                "abort": f"{sid} 卡死：{reason}",
+                "findings": [{"kind": "step", "step": sid,
+                              "desc": step["desc"], "landing": act_now,
+                              "status": "give_up"}],
+            }
+        # 只是这一步放弃 -> 记下来，继续下一步（保护 30：不传染）
+        return {
+            **_after_step(state, sid, step, act_now, "give_up"),
+            "issues": [f"{sid} 放弃：{reason}"],
+            "progress": [_tick("fallback", f"{sid} 放弃，进入下一步", step=sid)],
+        }
+
+    # ── 声明完成但落点不对 -> 重试 ──
+    if done and issues:
+        tried = state.get("retry_landing", 0)
+        if tried + 1 < LANDING_MAX_TRIES:
+            return {
+                "retry_landing": tried + 1,
+                "issues": issues,
+                "progress": [_tick(
+                    "retry",
+                    f"{sid} 落点未到，第 {tried + 2}/{LANDING_MAX_TRIES} 次尝试"
+                    f"（当前 {act_now}）", step=sid)],
+            }
+        return {
+            "status": "BLOCKED",
+            "retry_landing": tried + 1,
+            "issues": issues + [
+                f"🚫 {sid} 落点不符：试了 {LANDING_MAX_TRIES} 次都没到目标页"
+                f"（期望 {landing}，实际停在 {act_now}）。关键路径没找到"],
+            "findings": [{"kind": "step", "step": sid,
+                          "desc": step["desc"], "landing": act_now,
+                          "status": "blocked"}],
+            "action": None,
+            "summary": f"{sid} 落点不符（{LANDING_MAX_TRIES} 次），用例未执行完",
+            "action_trace": [],
+        }
+
+    # ── 完成 ──
+    if done:
+        # 优先级：本步有断言 -> 就地验（保护 32）
+        _mine = _pending_for(state, sid)
+        if _mine:
+            return {
+                **_after_step(state, sid, step, act_now, "ok"),
+                "issues": issues,
+                # ★ 不推进 step_index，交给 verify
+                "verify_step": sid,
+            }
+        # 本步没有断言 -> 直接推进（否则没人来清 verify_step，流程卡死）
+        return {
+            **_after_step(state, sid, step, act_now, "ok"),
+            "issues": issues,
+            "step_index": idx + 1,
+            "verify_step": "",
+            "round_in_step": 0,
+            "check_rounds": 0,
+            "retry_landing": 0,
+            "locate_attempts": 0,
+        }
+
+    # ── 没完成：先查死循环闸门 ──
+    crounds = state.get("check_rounds", 0)
+    if rounds >= limit or crounds >= limit:
+        why2 = "本步一直没动手" if crounds >= limit else f"重试 {rounds} 次"
+        # 保护 30：这一步没收敛，记下来、进下一步，**不终止整条用例**
+        return {
+            **_after_step(state, sid, step, act_now, "not_converged"),
+            "status": "BLOCKED",
+            "summary": f"{sid} {why2}仍未收敛，停止",
+            "issues": issues + [
+                f"{sid} 未收敛（act {rounds} 轮 / check {crounds} 轮，"
+                f"上限 {limit}）"],
+            "step_index": idx + 1,
+        }
+
+    # ── 目标查找有界重试（保护：rid 太严） ──
+    locate = (step.get("locate") or "").strip()
+    attempts = state.get("locate_attempts", 0)
+    max_attempts = state.get("max_locate_attempts", MAX_LOCATE_ATTEMPTS)
+    extra: dict[str, Any] = {}
+    if locate:
+        here = target_present(locate, clickable=state.get("obs_clickable"),
+                              nodes_text=state.get("obs_nodes_text", ""))
+        if here is False:
+            attempts += 1
+            extra["locate_attempts"] = attempts
+            why = (action.get("why") or "").strip()
+            extra["locate_tried"] = [{
+                "step": sid, "attempt": attempts, "of": max_attempts,
+                "locate": locate, "activity": act_now, "why": why,
+            }]
+            issues.append(
+                f"{sid} 第 {attempts}/{max_attempts} 次换目标找："
+                f"目标 {locate} 不在当前屏（activity={act_now}）"
+                + (f"，理由：{why}" if why else ""))
+            if attempts > max_attempts:
+                return {
+                    **_after_step(state, sid, step, act_now, "locate_exhausted"),
+                    "status": "BLOCKED",
+                    "summary": f"{sid} 换目标找了 {max_attempts} 次仍找不到 "
+                               f"{locate}，停止",
+                    "issues": issues + [
+                        f"{sid} 查找次数用尽（上限 {max_attempts}）"],
+                    "step_index": idx + 1,
+                    **extra,
+                }
+    return {
+        "issues": issues,
+        "check_rounds": crounds + 1,
+        "progress": [_tick("retry",
+                           f"{sid} 第 {rounds + 1} 轮：{act_now}"
+                           + (f"｜{issues[-1]}" if issues else ""), step=sid)],
+        **extra,
+    }
+
+
+def _after_step(state: ChildState, sid: str, step: dict[str, Any],
+                act_now: str, status: str) -> dict[str, Any]:
+    """记录本步的 finding 和进度 —— 各出口共用，避免遗漏。"""
+    return {
+        "findings": [{"kind": "step", "step": sid,
+                      "desc": step.get("desc") or "",
+                      "landing": act_now, "status": status}],
+        "progress": [_tick("step", f"{sid} {status}（{act_now}）", step=sid)],
+    }
+
+
+# --------------------------------------------------------------------------
+# 路由
+# --------------------------------------------------------------------------
+
+def route_after_plan(state: ChildState) -> Literal["strong_target", "decide", "learn", "finish"]:
+    """plan 之后：还有步骤就先让代码试一次，没了就收尾。
+
+    ★ 为什么先去 strong_target 而不是直接 decide
+      "能直判的别问模型"是这个项目最基本的目标，而 168 两次实测
+      "代码直点 0 / 交模型 0"—— target 字段从声明到执行没人读。
+      先过一道代码判定，命中就不花 token。
+
+    ⚠️ 必须先看 status —— plan 是**唯一**能直接判 BLOCKED 的节点
+    （崩溃 / observe 失败），但它只是把 status 写进 state，路由不认这个
+    字段的话会继续走到 decide 去问 AI、去 act。
+    实测：被测 App 启动即崩，plan 已抓到终止信号，图却又发了一轮
+    interrupt 问模型「这一步该怎么办」—— 设备都死了，问了也没法执行。
+    """
+    if state.get("abort") or state.get("status") == "BLOCKED":
         return "finish"
-    act = state.get("action") or {}
-    if act.get("step_done"):
+    steps = (state.get("task") or {}).get("steps") or []
+    if int(state.get("step_index") or 0) >= len(steps):
+        return "learn"
+    return "strong_target"
+
+
+def route_after_decide(state: ChildState) -> Literal["act", "check", "learn", "finish"]:
+    """decide 之后：分派到执行 / 判定 / 收尾。
+
+    ⚠️⚠️ 这个函数是**踩过三次同一个坑**的地方，改的时候要格外小心：
+
+        176 轮 05~08：模型请求看图 -> 路由只认坐标 -> 判成"无动作" -> 白烧 20 秒
+        169：模型要按返回键 -> key 没坐标 -> 动作静默丢失 -> 退不出相机
+        176：模型正确调用 type_text(rid=...) -> 路由只判 next_x -> 输入从未发生
+
+    教训：**action 里任何一个"能单独构成动作"的字段，都必须在这里有分支。**
+    现在的全集：need_knowledge / vision_question / step_done / give_up /
+                key / input_rid / tap_target / next_x
+
+    视觉与知识的处理方式变了（不再拆成独立节点，见 decide_node 的说明），
+    但它们**仍然是一种"这一轮没动作"**，所以这里要回到 check 让它重来，
+    而不是让它掉到 else 被当成"有坐标"。
+    """
+    if state.get("abort"):
+        return "finish"
+    a = state.get("action") or {}
+    # ── 明确"这一步完了 / 要放弃" -> 交给 check 判定 ──
+    if a.get("step_done") or a.get("give_up"):
         return "check"
-    if act.get("next_x") is not None or act.get("_key"):
+    # ── 这一轮是"要查知识 / 要看图"，没有实际动作 ──
+    # decide_node 已经处理过它（查完/看完会把结果写回 action），
+    # 所以这里回 check 让它再决策一轮 —— 撞轮次闸门也不会空转。
+    if a.get("need_knowledge") or a.get("vision_question"):
+        return "check"
+    # ── 真正有动作的四种形态 ──
+    if a.get("key") or a.get("_key"):
+        return "act"
+    if str(a.get("input_rid") or "").strip():
+        return "act"
+    if str(a.get("tap_target") or "").strip():
+        return "act"
+    if a.get("next_x") is not None:
+        return "act"
+    # 什么都没给 -> 也去 check（它会撞轮次闸门，而不是死循环）
+    return "check"
+
+
+def route_after_check(state: ChildState) -> Literal["plan", "verify", "learn", "finish"]:
+    """check 之后：要走下一步就 plan，要验就 verify，走完了就 learn。
+
+    ⚠️ 保护 31：verify_step 只在"本步有断言"时才被设上，
+    所以这里看到它非空就知道该验，不会空转。
+
+    ⚠️ 全部步骤走完必须去 **learn**（回写 JSON），不是直接 finish。
+       漏这一步的后果：case_learned.json 根本不生成，跑完什么也没留下。
+       （run 84 就漏了 —— 日志里节点执行没有 learn，只剩 finish。）
+    """
+    if state.get("abort"):
+        return "finish"
+    if state.get("verify_step"):
+        return "verify"
+    steps = (state.get("task") or {}).get("steps") or []
+    if int(state.get("step_index") or 0) >= len(steps):
+        return "learn"
+    return "plan"
+
+
+def route_after_verify(state: ChildState) -> Literal["verify", "plan", "learn", "finish"]:
+    """verify 之后：本步还有预期没验完就继续验，否则走下一步。
+
+    ⚠️ 必须能回到 verify 自己：verify 一次只处理一条断言，
+       一步有 7 条断言（s4 就是）时，回 plan 会去重新 decide，
+       等于每验一条就打断一次流程 —— 那不是"这一步验完再走"。
+
+    ⚠️ 全部步骤走完必须去 **learn**（回写 JSON），不是直接 finish。
+    """
+    if state.get("abort"):
+        return "finish"
+    # 本步还有没验的 -> 接着验（一条一条来，像人一样）
+    if _pending_for(state, str(state.get("verify_step") or "")):
+        return "verify"
+    steps = (state.get("task") or {}).get("steps") or []
+    if int(state.get("step_index") or 0) >= len(steps):
+        return "learn"
+    return "plan"
+
+# --------------------------------------------------------------------------
+# 节点 4/8：act —— 执行动作
+#
+# ★ 直接复用旧实现。
+#
+# 为什么复用而不重写：act 里没有任何流程问题，全是**设备交互的坑**
+# （输入框已有相同内容就别再填、坐标合法性、key 的返回、动作后画面归哪个步骤）。
+# 这些坑都是真机一条条试出来的，重写一遍等于把 400 行踩过的雷再踩一遍。
+#
+# 这次改的是"什么时候验"，不是"怎么点"。
+# --------------------------------------------------------------------------
+
+
+
+# --------------------------------------------------------------------------
+# 节点 3/9：strong_target —— 这一步要点的东西，代码能不能唯一确定？
+#
+# ★ 为什么它必须是一个**独立节点**，不能塞进 decide ★
+#
+# 重写成 8 个节点时我把它删了，以为 decide 内部会走这条路径 ——
+# 但 _base_decide_node 第一行就是 interrupt 问模型，根本不看 target。
+# 结果 target 字段**从声明到执行没有任何人读**：
+# 两次跑 168 都是"代码直点 0 次 / 交给模型 0 次"（0/0 不是"都交给模型"，
+# 是整个统计压根没被填充）。用例里写的 rid=iv_more 一次都没生效。
+#
+# 为什么不塞进 decide：
+#   decide 在图和 runner 里有一条硬约束 —— 它是**唯一会 interrupt 的地方**
+#   （runner 靠 answer_fn 喂它）。往里塞一段"可能不 interrupt 就直接返回"
+#   的逻辑，会让"什么时候会停"变得不可预测，排查时也看不出这一步
+#   到底是代码点的还是模型点的。
+#
+#   而它的开销只是多一次图调度（内存操作，微秒级），
+#   相比一次模型调用（168 实测 3 次断言判定约占 20s）可以忽略。
+#
+# 判"能不能唯一确定"完全靠 state 里已有的 obs_clickable / obs_xml_path，
+# **不碰设备、不发请求**，所以放在问模型之前是纯赚的。
+# --------------------------------------------------------------------------
+
+def strong_target_node(state: ChildState) -> dict[str, Any]:
+    """强证据直点：这一步的 target 在**当前屏**能不能唯一确定？
+
+    这个节点**不是回放**。它不认"上次点了哪"，只认"现在能不能唯一确定"：
+
+        命中恰好 1 个  → 取它的坐标，直接点，全程 LLM 零介入
+        命中 0 个      → 目标不在当前屏 → 交模型
+        命中 >1 个     → 不唯一，可能点错 → 交模型
+
+    为什么"唯一"是硬门槛：实测设置页有 4 个节点 rid/desc/text 全空、
+    只有 bounds 不同。只按单一属性找根本分不出是哪个，点错了整条用例就废。
+    所以宁可退回模型，也不赌。
+
+    这个节点**只决定点哪**，不执行 —— 真正的点击仍走 act 节点，
+    坐标校验、崩溃检测这些守卫一条都不少。
+    """
+    task = state.get("task") or {}
+    steps = task.get("steps") or []
+    idx = state.get("step_index", 0)
+    if idx >= len(steps):
+        return {"action": {"step_done": True, "why": "步骤已走完"}}
+
+    step = steps[idx]
+    sid = str(step.get("id") or "")
+
+    # ══════════════════════════════════════════════════════════════════
+    # ① 落点是不是已经满足了？（**必须排在 ⓪ 前面**）
+    # ══════════════════════════════════════════════════════════════════
+    # 上一步点完可能顺带就到了这一步的界面，此时不该再找控件点。
+    #
+    # ⚠️ 只在**本步还没动过手**时才预判（round_in_step == 0）。
+    #    否则会出现致命的假通过：用例"从 A 到 A"（起点就在 A），
+    #    每轮都判"落点已满足"→ 立刻完成 → 一步没走却报 PASS。
+    #
+    # ⚠️⚠️ 顺序不能反（168 实测踩到）：
+    #
+    #   原来是"先判前台是不是被测 App，再判落点"，于是出现一堆假告警：
+    #     s3 当前前台不是被测 App（PhotoPickerGetContentActivity）…交给 AI
+    #
+    #   而 s3 是**验证步骤**（「验证可进入图片选择入口」），
+    #   它落在系统图库里正是**预期结果**——已经到位了，根本不需要点任何东西。
+    #   先判前台的话，永远走不到"落点已满足"，白白记一条"交给 AI"。
+    #
+    #   先判落点的道理很简单：**已经到目的地了，就不该再问"该往哪走"**，
+    #   更不该因为"这块地不是我家的"而拒绝承认自己已经到了。
+    untouched = state.get("round_in_step", 0) == 0
+    if untouched and step.get("landing"):
+        det, _det_why = is_deterministic_landing(step["landing"])
+        if det:
+            hit, why = match_landing(
+                step["landing"],
+                activity=str(state.get("last_activity") or ""),
+                clickable=state.get("obs_clickable") or [],
+                nodes_text=state.get("obs_nodes_text") or "",
+                state_pkg=str(state.get("last_package") or ""))
+            if hit:
+                return {
+                    "action": {"step_done": True,
+                               "why": f"落点已满足，代码直接判定完成（{why}）"},
+                    "strong_hits": [{"step": sid, "by": "code",
+                                     "how": f"落点已满足({why})"}],
+                    "progress": [_tick("strong",
+                                       f"{sid} 落点已满足（{why}），跳过",
+                                       step=sid)],
+                }
+
+    # ══════════════════════════════════════════════════════════════════
+    # ⓪ 强证据只对**被测 App 自己的界面**生效
+    # ══════════════════════════════════════════════════════════════════
+    # 用户原话：「只有本 APP 的才用强证据。跳出去都是让 AI 判断吧。」
+    #
+    # 外部界面（系统图库、权限框、分享面板）不是我们的代码，
+    # rid / activity 随时可能变，我们改不了却要拿写死的规则去判 ——
+    # 168 就是活证据：a3 钉死 PhotoPickerGetContentActivity，
+    # Android 17 换个分支给了 PhotoPickerUserSelectActivity 就误报。
+    #
+    # 分界是**归属**，不是**内容**：
+    #   前台是被测 App → 结构稳定，强证据可靠，用代码判
+    #   前台是别人家的 → 结构不稳定，交给模型看一眼，别硬判
+    from_pkg, from_act = _foreground_owner(state)
+    if not _is_sut(state, from_pkg):
+        return _ask_model(
+            state,
+            f"{sid} 当前前台不是被测 App"
+            f"（{from_pkg or '未知包名'}/{from_act or '未知界面'}）。"
+            f"强证据只在被测 App 自己的界面里用 —— 外部界面的结构不受我们控制，"
+            f"写死的 rid/activity 判不准。这一步由你看着屏幕判断该做什么。")
+
+    # ══════════════════════════════════════════════════════════════════
+    # ② 要点的东西在当前屏上有唯一位置吗？
+    # ══════════════════════════════════════════════════════════════════
+    target = str(step.get("target") or step.get("locate") or "").strip()
+    if not target:
+        return _ask_model(state, f"{sid} 没有声明 target，代码不知道点什么")
+
+    x, y, how = _resolve_strong_target(target, state)
+
+    if x is None:
+        return _ask_model(state, f"{sid} {how}")
+
+    # ★★★ 强证据直点的**退出条件** ★★★
+    #
+    # 用户原话：「如果强证据不能到预计那就让大模型介入。而不是一直无用的点。」
+    #
+    #   强证据 = **省一次模型调用**，不是"永远不叫模型"。
+    #   一旦代码发现自己到不了预期（点完还是原样），就必须让模型接手。
+    #
+    # 第一版写歪过：加了"命中唯一就点"却没有任何退出条件，
+    # 结果 176 死点「完成」37 次、白跑 70 秒。代码不知道
+    # **"点得中"和"点了有用"是两件事**。
+    #
+    # 退出判据：连续 N 次**没有进展**（activity 变 / 可点清单变都算进展）。
+    # 什么都不变 = 这个动作在当前界面状态下无效，继续点等于拿设备陪跑。
+    _tries = _strong_tries(state, sid, target)
+    if _tries >= STRONG_MAX_SAME_TARGET:
+        _now = state.get("last_activity") or "(未知)"
+        # ★ 输入框要单独说清楚（176 实测）：给模型的话若是「点了 N 次
+        #   毫无变化，缺前置条件」，它看到"缺前置条件"就**又去输入一次**，
+        #   形成死循环 —— 名字其实第一次就填进去了，它却以为没填上。
+        _val = _current_input_value(state, target)
+        if _val is not None:
+            return _ask_model(
+                state,
+                f"{sid} 的输入框 {target} **已经有值了**：{_val!r}。"
+                f"代码已经把同一个值又写了 {_tries + 1} 次，界面毫无变化 ——"
+                f"说明内容是对的、不需要再输入。"
+                f"**下一步不要再输入**，去做这一步真正剩下的事"
+                f"（例如点「完成」/「保存」，或本来就该判定完成了）。")
+        return _ask_model(
+            state,
+            f"{sid} 代码已经把这个目标点了 {_tries + 1} 次，"
+            f"**每次点完界面都毫无变化**（一直停在 {_now}）。"
+            f"说明「点它」这个动作在当前状态下根本不起作用 —— "
+            f"不是坐标错了，也不是没点中，而是缺了前置条件。"
+            f"代码不知道缺什么，这一步交给你判断。")
+
+    return {
+        "action": {
+            "step_done": False, "next_x": x, "next_y": y,
+            "why": f"强证据直点：{sid} → {target}（{how}）",
+            "_strong": True,
+        },
+        "strong_hits": [{"step": sid, "by": "code", "target": target,
+                         "how": how}],
+        "progress": [_tick("strong",
+                           f"{sid} 强证据命中唯一，直接点 ({x},{y}) [{how}]",
+                           step=sid)],
+    }
+
+
+def route_after_strong(state: ChildState) -> Literal["act", "decide", "finish"]:
+    """strong_target 之后：代码定了坐标就 act，没定就交模型。
+
+    ⚠️ `_strong` 是这里的**唯一依据** —— 看 action 里有没有带坐标，
+    而不是看 strong_hits。strong_hits 在"落点已满足"时也会写，
+    那种情况下 action 里是 step_done，该走 check 不该走 act。
+    """
+    if state.get("abort") or state.get("status") == "BLOCKED":
+        return "finish"
+    a = state.get("action") or {}
+    if a.get("_strong") and a.get("next_x") is not None:
         return "act"
     return "decide"
 
 
-def route_after_plan(state: ChildState) -> Literal["prep_apply", "strong_target",
-                                                   "observe", "decide", "assert",
-                                                   "finish"]:
-    task = state["task"]
-    # ★ 已经判定 BLOCKED 就直接收尾，**不再执行后面的步骤**。
-    #
-    # 用户定的语义：BLOCKED = 用例没执行完（崩溃 / 关键路径没找到）。
-    # 既然没执行完，就不能接着往下跑别的步骤 —— 那会让报告里的
-    # steps_done 和 findings 混进"本来就不该执行"的结果。
-    #
-    # ⚠️ 这条必须放在最前面。之前 plan 里判了落点不符 BLOCKED，
-    #    但路由照样往下走 —— 状态是 BLOCKED，动作却还在继续，
-    #    等于"说了停却没停"。
-    if state.get("status") == "BLOCKED":
-        return "finish"
-    if state.get("step_index", 0) >= len(task["steps"]):
-        return "assert"
-    # ★ 前置数据没准备好 -> 先做掉，再谈步骤。
-    #
-    # 为什么挂在这里而不是只在 start_check 后面：
-    #   起点纠正期间（start_mismatch 非空）会跳过 prep_apply，
-    #   而模型一旦走到起点就直接进 step 模式，**再也回不到 start_check** ——
-    #   prep_apply 于是永远不会触发（实测 182：日志里一次都没有）。
-    #   plan 是"每步开始前"的必经点，放这里才真正保证"先准备、后执行"。
-    #
-    # ⚠️ 还必须排除 start_mismatch：界面没走到位时进 prep_apply 只会空转，
-    #    而且 prep_apply 会立刻 return，路由又把它送回来 -> 死循环。
-    if (state.get("prepare_wants") and not state.get("prep_applied")
-            and not state.get("start_mismatch")):
-        print(f"  [route] plan -> prep_apply（wants={len(state.get('prepare_wants') or [])}）",
-              file=sys.stderr)
-        return "prep_apply"
-    # ★ 进入一步后：画面新鲜就先给代码一次机会（落点是否已满足 / target 能否唯一命中），
-    # 不新鲜就先 observe —— 不 observe 根本不知道屏上有啥。
-    # 本步已经交给模型了就直接走模型，免得代码和模型来回拉锯。
-    if state.get("fallback_reason"):
-        return "decide"
-    return "strong_target" if state.get("obs_fresh") else "observe"
+# --------------------------------------------------------------------------
+# 节点 4/9：decide —— AI 决定下一步
+#
+# knowledge / vision 收在这里（模型说要查知识、要看图，都在本轮内做完）。
+#
+# 这次的关键改动：**把本步的预期也交给 AI**。
+#
+# 用户：「AI走的时候第一轮就边走边验证了。能拿到所有的记录。」
+#       「AI第一次应该会根据要验证的东西点击看看吧」
+#
+# 也就是说——AI 在走这一步时就知道这一步要验什么，会顺手点开色板看颜色、
+# 数一下色块。这不是"补证据"，这是人类测试员的正常动作。
+
+#       「AI第一次应该会根据要验证的东西点击看看吧」
+#
+# 也就是说——AI 在走这一步时就知道这一步要验什么，会顺手点开色板看颜色、
+# 数一下色块。这不是"补证据"，这是人类测试员的正常动作。
+# --------------------------------------------------------------------------
+
+def decide_node(state: ChildState) -> dict[str, Any]:
+    """让 AI 决定这一步的下一步动作。
+
+    ## 这一版真正变了什么
+
+    旧图把模型的三种"额外请求"拆成了三个节点：
+        need_knowledge -> knowledge 节点 -> 再回 decide
+        vision_question -> vision 节点   -> 再回 observe
+    于是图上有 15 个节点，而其中三个只是 decide 的分支产物。
+
+    现在它们被收进 decide 内部：模型说要查知识，**就在这一轮里查完**；
+    说要看图，**就在这一轮里看完**，然后立刻再问一次模型。
+    对外还是一个节点，但少了两轮图调度。
+
+    ## 视觉那条为什么必须带失败上限
+
+    保护 5/6：167 实测模型连问 21 次图、白烧 100 多秒，
+    因为它**不知道"这次没看成"** —— 它手上一直有个合法动作，
+    于是下一轮又问同一个问题。
+
+    所以：失败计数进 state，连续失败 VISION_MAX_FAILURES 次后
+    **把 vision_question 从 action 里摘掉**，并明确告诉它别再问了。
+    只报错不摘动作没有用 —— 这是 167 连挂两次的教训。
+
+    ## 其它部分
+
+    7 类输出契约、强证据直点、起点纠正、知识卡目录这些调好的东西
+    仍然走旧实现（_base_decide_node），因为这次改的是"什么时候验"，
+    不是"怎么决策"。
+    """
+
+    # ── 第一步：让旧 decide 拿到模型的动作 ──
+    out = _base_decide_node(state)
+
+    action = out.get("action") or {}
+    if not isinstance(action, dict):
+        return out
+
+    # ── 处理 need_knowledge：在这一轮里查完 ──
+    if action.get("need_knowledge"):
+        return _handle_knowledge(state, out, action)
+
+    # ── 处理 vision_question：在这一轮里看完 ──
+    if action.get("vision_question"):
+        return _handle_vision(state, out, action)
+
+    return out
+
+
+def _handle_knowledge(state: ChildState, out: dict[str, Any],
+                      action: dict[str, Any]) -> dict[str, Any]:
+    """模型要查知识卡 -> 就地查，结果写回 action，让它下一轮用得上。
+
+    保护 4：查询次数有上限。168 实测模型会无限换词检索却不推进。
+    """
+    asked = list(state.get("knowledge_asked") or [])
+    kw = str(action.get("need_knowledge") or "").strip()
+    if len(asked) >= MAX_KNOWLEDGE_LOOKUPS:
+        clean = {k: v for k, v in action.items() if k != "need_knowledge"}
+        return {**out, "action": clean,
+                "issues": [f"知识检索已达上限 {MAX_KNOWLEDGE_LOOKUPS} 次，"
+                           f"要求模型用现有信息决定（最后一次查的是「{kw}」）"]}
+    if kw and kw in asked:
+        return {**out, "action": {**action, "need_knowledge": ""},
+                "issues": [f"「{kw}」已经查过了，换一种说法或直接决策"]}
+    files = (state.get("task") or {}).get("knowledge_files") or []
+    text = search_knowledge(_ctx().skill_root, files, kw, limit=12) if kw else ""
+    return {
+        **out,
+        "action": {**action, "need_knowledge": "", "knowledge": text},
+        "knowledge_asked": asked + [kw],
+        "knowledge_used": [{"keyword": kw, "hit": text[:400]}] if text else [],
+    }
+
+
+def _handle_vision(state: ChildState, out: dict[str, Any],
+                   action: dict[str, Any]) -> dict[str, Any]:
+    """模型要看图 -> 就地看完，答案写回 action。
+
+    保护 5/6：连续失败到上限就**摘掉 vision_question**，
+    否则它会一直问（167 连问 21 次）。
+    """
+    from .vision import VisionError, ask_image
+
+    q = str(action.get("vision_question") or "").strip()
+    fails = int(state.get("vision_failures") or 0)
+    # 超上限 -> 摘动作，明确告诉模型别再问
+    if fails >= VISION_MAX_FAILURES:
+        clean = {k: v for k, v in action.items()
+                 if k not in ("vision_question", "vision", "vision_error")}
+        return {**out, "action": clean,
+                "issues": [f"视觉通道连续失败 {fails} 次，已强制停止看图，"
+                           f"要求用现有信息判断（最后原因："
+                           f"{state.get('vision_error') or '未知'}）"]}
+    shot = state.get("last_shot") or ""
+    if not shot:
+        return {**out, "action": {**action, "vision_question": ""},
+                "vision_failures": fails + 1,
+                "vision_error": "拿不到截图（last_shot 为空）",
+                "issues": ["这次没看成：拿不到截图"]}
+    try:
+        answer = ask_image(_ctx().python, _ctx().skill_root, shot, q)
+    except VisionError as exc:
+        return {**out, "action": {**action, "vision_question": ""},
+                "vision_failures": fails + 1, "vision_error": str(exc),
+                "issues": [f"这次没看成：{exc}"]}
+    return {**out,
+            "action": {**action, "vision_question": "", "vision": answer},
+            "last_vision": answer,
+            "vision_failures": 0, "vision_error": ""}
+
+
+# --------------------------------------------------------------------------
+# 节点 2/8：plan —— 进入一步（含观察）
+#
+# 合并了旧版的 plan + observe。
+# --------------------------------------------------------------------------
+
+def plan_node(state: ChildState) -> dict[str, Any]:
+    """进入当前步骤 + 看一眼屏幕（旧图的 plan + observe）。
+
+    ## 为什么合并
+
+    旧图是 plan -> observe 两个节点，但 observe 只做一件事：看一眼屏幕。
+    拆成两个节点意味着每次都要多一轮图调度，没有收益。
+
+    ## ⚠️ 这个节点**必须真的观察**，不能只调旧 plan
+
+    我第一版就是只转调旧 plan_node（它只准备上下文、不取画面），
+    结果 `last_shot` 永远是空的 —— 模型要看图时拿不到截图，
+    `ask_vision` 永远失败，于是 80 轮全在原地空转。
+    真机日志：`plan×81 / decide×80 / act×0`。
+
+    ## 保护 19：崩溃检测就在这里
+
+    工具层检测到被测包崩溃时会 terminate_session，
+    之后 observe/act 全被拒。图若不认这个信号，会疯狂重试到轮次上限，
+    报出误导性的"未收敛"。所以这里直接转 BLOCKED。
+    """
+    from ..device.bridge import ToolError
+
+    # ① 旧的 plan 逻辑：切步、清计数、准备上下文
+    base = _base_plan_node(state)
+    # 步骤走完了就没有"当前屏"要看了
+    if not base.get("last_step_desc"):
+        return base
+
+    # ② 观察当前屏
+    dev = _ctx().device
+    try:
+        obs = dev.observe_raw()
+    except ToolError as exc:
+        msg = str(exc)
+        if "terminated" in msg.lower() or "incomplete recording" in msg.lower():
+            return {**base, "status": "BLOCKED",
+                    "summary": f"会话被硬终止：{msg}",
+                    "issues": [f"observe 被拒（硬终止）：{msg}"]}
+        return {**base, "status": "BLOCKED",
+                "summary": f"observe 失败（拿不到屏幕，没执行完）：{exc}",
+                "issues": [f"observe 失败：{exc}"]}
+
+    shot = (obs.get("evidence") or {}).get("png") or ""
+    common = {
+        "last_activity": obs.get("activity") or "",
+        "last_shot": shot,
+        "last_event_ids": [str(e) for e in (obs.get("event_ids") or [])],
+        "obs_clickable": obs.get("next") or [],
+    }
+    # 崩溃 -> 硬终止（保护 19）
+    if obs.get("terminate") or obs.get("blocked"):
+        reason = (obs.get("terminate_reason")
+                  or (obs.get("crash") or {}).get("type") or "被测包崩溃")
+        return {**base, **common, "status": "BLOCKED",
+                "summary": f"检测到崩溃，硬终止：{reason}",
+                "issues": [f"crash terminate：{reason}"],
+                "crash": obs.get("crash")}
+
+    return {
+        **base, **common,
+        "obs_nodes_text": _screen_text(obs),
+        "obs_nodes": _brief_nodes(obs.get("nodes")),
+        "obs_xml_path": _screen_xml_path(obs),
+        "step_evidence": _step_evidence_of(state, obs),
+        "seen_rids": _seen_rids(obs.get("next"), obs.get("nodes")),
+        "seen_texts": _seen_texts(obs.get("next"), obs.get("nodes")),
+        "seen_screens": [_screen_text(obs)],
+    }
+
+
+# --------------------------------------------------------------------------
+# 节点 1/8：prep —— 准备
+#
+# 合并了旧版的 prep + start_check + prep_apply。
+# 复用旧实现：里面全是前提解析的边界情况（散文式 do、skip_if、
+# 起点不在被测 App 时自动拉起），重写风险高、收益低。
+# --------------------------------------------------------------------------
+
+
+
+# --------------------------------------------------------------------------
+# 节点 7/8：learn —— 回写 JSON
+# --------------------------------------------------------------------------
+
+def learn_node(state: ChildState) -> dict[str, Any]:
+    """根据**这一轮的记录**生成 case JSON。
+
+    用户：「第一轮就边走边验证了。能拿到所有的记录。
+           然后最后根据记录写json。而不是回过头就复验证。」
+
+    记录有两个来源：
+      · findings       每条预期怎么判的（含 actual）
+      · clicks.jsonl   每一击的原始记录（含为什么点、点完变没变）
+    两者拼起来就是"这个用例到底是怎么走的"，回写 JSON 就是从里面提炼。
+
+    ## ⚠️ 必须补 status
+
+    `build_learned_case` 读的是 `state["status"]`，可 status 是 **finish**
+    节点才算出来的，而 learn 跑在 finish **之前** —— 直接读会拿到空字符串，
+    JSON 里 status 就是空的（run 85 就是这样）。
+
+    所以这里按和 finish 一样的口径先算一遍。
+    口径：有一条 FAIL 就是 FAIL；没验完/被阻断是 BLOCKED；否则 PASS。
+    """
+
+    # 先补 status，再回写
+    st = str(state.get("status") or "")
+    if not st:
+        fs = [f for f in (state.get("findings") or [])
+              if f.get("kind") == "assert"]
+        total = len((state.get("task") or {}).get("asserts") or [])
+        if any(f.get("status") == "FAIL" for f in fs):
+            st = "FAIL"
+        elif len(fs) < total or any(f.get("status") == "BLOCKED" for f in fs):
+            st = "BLOCKED"
+        else:
+            st = "PASS"
+    # ⚠️ usable 必须在**写盘之前**就放进 state 里带上，
+    #    因为 _base_learn_node 是先写文件再返回的 —— 事后再改 dict，
+    #    文件里已经是旧内容了。
+    out = _base_learn_node({**state, "status": st})
+    return out
+
+
+# --------------------------------------------------------------------------
+# 节点 8/8：finish —— 出结论
+# --------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+# --------------------------------------------------------------------------
+# 节点对外名（复用的旧实现）
+#
+# 这三个节点这次**没有新逻辑**，直接复用旧实现：
+#   act    —— 400 行设备交互的坑（输入框已有内容别再填、坐标合法性、key 回退）
+#   prep   —— 前提解析的边界情况（pm clear / goto / prepare 的 skip_if）
+#   finish —— 出结论、写报告
+# 合并进同一个文件后，旧实现改名为 _base_*，这里把对外名接回去。
+# --------------------------------------------------------------------------
+
+act_node = _base_act_node
+prep_node = _base_prep_node
+finish_child_node = _base_finish_child_node
 
 
 # --------------------------------------------------------------------------
 # 建图
 # --------------------------------------------------------------------------
 
-def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
-    """子 Agent 的图。
+def build_child_graph(ctx, checkpointer=None):
+    """子 Agent 的图 —— 8 个节点。
 
-    流程：
-      plan(进入一步) → observe → decide(AI) ─┬─ knowledge ─→ act
-                                            ├─ act
-                                            └─ check(本步完成?)
-                                                  ├─ 未完 → plan(重试)
-                                                  └─ 完成 → plan(下一步)
-      plan(全部走完) → assert(逐条) → verdict → … → finish(回报主 Agent)
+    ## 流程
+
+        prep        准备（前提 + 起点）
+          |
+        plan        进入一步 + 观察
+          |
+        decide      AI 决定动作（<-- 含知识/视觉/强证据直点）
+          |
+        act         执行
+          |
+        check       这一步走完了吗
+          |
+          +-- 没走完 --> plan（重试，撞轮次闸门）
+          +-- 走完了，但有预期 --> verify（就地验！）
+          +-- 走完了，没预期   --> plan（下一步）
+                  |
+                verify  一条一条验本步的预期
+                  |
+                  +-- 还有 --> verify
+                  +-- 没了 --> plan（下一步） / finish（没了）
+
+    ## 和旧图的区别
+
+    旧图 15 个节点，其中 strong_target / observe / knowledge / vision
+    四个全是 decide 的**分支产物**（模型说"我要查知识"/"我要看图"，
+    就被拆成了独立节点）。现在收进 decide 内部，对外还是一个节点。
+
+    真正重要的是这一步：**check → verify → plan**。
+    旧图是 check → plan → ... → 全部走完 → assert → verdict（回头验），
+    新图是 check 判定完成时**不推进**，先验完这一步的预期再推进。
+
+    ⚠️ 为什么 verify 要能在原地自环（保护：一步可能有 7 条预期）：
+       s4 有 a7~a13 七条。如果每条都回 plan/decide 一次，
+       等于每验一条就打断流程重新决策 —— 那不是"这一步验完再走"。
     """
     from langgraph.graph import END, START, StateGraph
 
@@ -6399,68 +6298,48 @@ def build_child_graph(ctx: ChildContext, checkpointer: Any = None):
 
     b = StateGraph(ChildState)
     b.add_node("prep", prep_node)
-    b.add_node("start_check", start_check_node)
-    b.add_node("prep_apply", prep_apply_node)
     b.add_node("plan", plan_node)
     b.add_node("strong_target", strong_target_node)
-    b.add_node("observe", observe_node)
     b.add_node("decide", decide_node)
-    b.add_node("knowledge", knowledge_node)
-    b.add_node("vision", vision_node)
     b.add_node("act", act_node)
-    b.add_node("check", step_check_node)
-    b.add_node("assert", assert_node)
-    b.add_node("verdict", assert_verdict_node)
+    b.add_node("check", check_node)
+    b.add_node("verify", verify_node)
     b.add_node("learn", learn_node)
     b.add_node("finish", finish_child_node)
 
     b.add_edge(START, "prep")
-    b.add_edge("prep", "start_check")
-    b.add_conditional_edges("start_check", route_after_start_check,
-                            {"decide": "decide", "plan": "plan",
-                             "prep_apply": "prep_apply",
-                             "finish": "learn"})
-    # prep_apply 的两种来路：
-    #   · 从 start_check 来（起点刚达成）-> 还要复核起点
-    #   · 从 plan 来（每步开始前）      -> 回到 plan 继续这一步
-    # 统一回 plan 更简单，且 prep 可能改变界面，plan 会让 observe 重新取画面。
-    b.add_edge("prep_apply", "plan")
+    b.add_edge("prep", "plan")
+
+    # plan 之后先让**代码**试一次（不花 token），定不下来才问模型。
     b.add_conditional_edges("plan", route_after_plan,
-                            {"prep_apply": "prep_apply",
-                             "strong_target": "strong_target", "observe": "observe",
-                             "decide": "decide", "assert": "assert"})
+                            {"strong_target": "strong_target",
+                             "decide": "decide",
+                             "learn": "learn",
+                             "finish": "finish"})
     b.add_conditional_edges("strong_target", route_after_strong,
-                            {"act": "act", "decide": "decide",
-                             "check": "check"})
-    b.add_conditional_edges("observe", route_after_observe,
-                            {"strong_target": "strong_target", "decide": "decide",
-                             "assert": "assert", "finish": "learn"})
+                            {"act": "act",
+                             "decide": "decide",
+                             "finish": "finish"})
     b.add_conditional_edges("decide", route_after_decide,
-                            {"knowledge": "knowledge", "vision": "vision",
-                             "act": "act", "check": "check"})
-    b.add_conditional_edges("knowledge", route_after_knowledge,
-                            {"decide": "decide", "vision": "vision",
-                             "act": "act", "check": "check"})
-    b.add_conditional_edges("act", route_after_act,
-                            {"vision": "vision", "strong_target": "strong_target",
-                             "decide": "decide", "observe": "observe",
-                             # ★ 本步轮次超限时回 check 收口（见 route_after_act 说明）。
-                             #   少这一项，route_after_act 返回 "check" 会直接抛
-                             #   "Invalid route to node"。
+                            {"act": "act",
                              "check": "check",
-                             "start_check": "start_check"})
-    b.add_conditional_edges("vision", route_after_vision,
-                            {"observe": "observe", "start_check": "start_check",
-                             "finish": "learn"})
+                             "plan": "plan",
+                             "finish": "finish"})
+    # act 之后一律去 check：动作执行完就该判"这一步完了没有"。
+    # 旧图这里还有 strong_target / observe / start_check 三条分支，
+    # 那是因为它把"纠正起点"也放进了主循环；新图起点在 prep 一次做完
+    # （prep 复用旧实现，含 start_check 的纠正逻辑）。
+    b.add_edge("act", "check")
     b.add_conditional_edges("check", route_after_check,
-                            {"plan": "plan", "assert": "assert"})
-    b.add_conditional_edges("assert", route_after_assert,
-                            {"verdict": "verdict", "finish": "learn"})
-    b.add_conditional_edges("verdict", route_after_verdict,
-                            {"assert": "assert", "act": "act",
-                             "plan": "plan", "finish": "learn"})
-    # ★ 所有"该收尾了"的路都先去 learn：回写一份更好的用例，再 finish 出结论。
-    #   用户：「要回写 JSON。高质量的 JSON 对重新跑有意义」
+                            {"plan": "plan",
+                             "verify": "verify",
+                             "learn": "learn",
+                             "finish": "finish"})
+    b.add_conditional_edges("verify", route_after_verify,
+                            {"verify": "verify",
+                             "plan": "plan",
+                             "learn": "learn",
+                             "finish": "finish"})
     b.add_edge("learn", "finish")
     b.add_edge("finish", END)
 

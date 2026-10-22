@@ -46,7 +46,7 @@ from . import decide as dc
 from .decide import DecisionError
 from .nodes import (
     AssertSpec, AssertVerdict, ChildContext, StepAction, StepSpec,
-    SubagentReport, SubagentTask, build_child_graph, match_landing,
+    SubagentReport, SubagentTask, match_landing,
     search_knowledge,
     _MODEL_NODES,   # 算模型耗时的节点全集，只在 nodes 里定义一份
 )
@@ -460,10 +460,6 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
              max_loops: int = 80,
              workdir: str | Path | None = None,
              device: Any = None,
-             case_yaml_path: str | Path | None = None,
-             writeback: bool = True,
-             yaml_out_dir: str | Path | None = None,
-             yaml_warnings: list[str] | None = None,
              verbose: bool = True) -> SubagentReport:
     """跑一个 case，返回结构化报告。
 
@@ -475,24 +471,15 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         workdir: 存放 checkpoint db 与 report.json 的目录
         device: 注入的设备实现（默认 RealDevice）。传了就不查 adb，
                 供单测验证图逻辑与记账，无需插真机。
-        case_yaml_path: 这条用例的 YAML 文件。给了才**回写**实际路径
-                （用户要求：「用我们的工具完成后要生成或者把旧的 YAML
-                不合理的修改」）。不给就只报告、不动文件。
-        writeback: 是否回写。用例 PASS/FAIL 都会写 —— 因为"实际怎么走到的"
-                对两种结论都有价值；但 BLOCKED 不写（路径本身没走完，
-                写进去会把半截路径固化成"经验"）。
-        yaml_out_dir: 首次生成时 YAML 落哪个目录。默认 None = 用例库。
-                单测要传临时目录 —— 否则测试夹具会被当成真用例写进
-                用例库（实测污染过 3 份：A_三步链路 / branch_权限分支 /
-                permrec_授权留痕）。
-        yaml_warnings: 加载用例 YAML 时**写了但没被采纳**的判据字段。
-                必须进报告 —— 只 print 到 stdout 等于没人知道。
-                扫描存量 8 个用例发现 14 种字段被丢弃（text_present /
-                dialog_closed / package ...），这些判据从来没生效过。
         verbose: 是否打日志
 
     Returns:
         SubagentReport —— 主 Agent 只需要读这个（上下文隔离点）
+
+    ## YAML 相关参数已全部移除
+
+    用户：「删除所有的YAML文件」「数据库可以全部清理掉」。
+    用例现在只走 JSON 一条路（cases/loader.py）。
     """
     if isinstance(spec, dict):
         spec = CaseSpec(**spec)
@@ -632,6 +619,9 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     conn = sqlite3.connect(db, check_same_thread=False)
     from langgraph.checkpoint.sqlite import SqliteSaver
 
+    # ★ 走"边走边验"图：8 个节点，一步走完就地验。
+    #   旧图（15 节点、走完再回头验）已在收尾时删除 —— 见 docs/重写-结果.md。
+    from .nodes import build_child_graph
     app = build_child_graph(ctx, SqliteSaver(conn))
     cfg = {"configurable": {"thread_id": f"child-{spec.case_id}-{sid}"}}
 
@@ -896,7 +886,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                     log(f"           🚫 检测到**交替死循环**：{shown}")
                     log(f"              只在这几个目标间来回点，"
                         f"说明这条路径走不通，终止本用例")
-                    ans = {"step_done": False, "give_up": True,
+                    ans = {"step_done": False, "give_up": True, "stuck": True,
                            "give_up_reason":
                                f"在 {sorted(cycle)} 之间交替点击无进展"
                                "（代码判定死循环）"}
@@ -906,7 +896,7 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
                     if loop_blocks[key] >= 2:
                         log(f"           🚫 已连续点 {key} 且拒绝后仍不改，"
                             f"判定卡死，终止本用例")
-                        ans = {"step_done": False, "give_up": True,
+                        ans = {"step_done": False, "give_up": True, "stuck": True,
                                "give_up_reason":
                                    f"模型连续点 {key} 无效且拒绝换目标，"
                                    "判定为卡死（代码强制终止）"}
@@ -1040,73 +1030,14 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
     # 加载器一直在 stdout 打 `expect.xxx 未实现（未参与判定）`，
     # 但主 Agent 读的是报告 —— 只 print 等于没有。
     # 这些是"用例写了判据、实际没验"的**静默缺口**，必须让它看见。
-    if yaml_warnings:
-        _unused = [w for w in yaml_warnings if "expect." in w or "未实现" in w]
-        report.yaml_unused_fields = list(yaml_warnings)
-        if _unused:
-            report.issues = list(report.issues) + [
-                f"⚠️ 判据未生效：{w}" for w in _unused]
-            if verbose:
-                log("")
-                log(f"⚠️ 有 {len(_unused)} 条判据写了但没生效"
-                    f"（这些预期实际上没验）：")
-                for w in _unused[:8]:
-                    log(f"     · {w}")
-                if len(_unused) > 8:
-                    log(f"     … 另有 {len(_unused) - 8} 条，见报告")
-
-    # ── 回写 YAML ──────────────────────────────────────────────────
+    # ── YAML 已彻底移除 ──────────────────────────────────────────
     #
-    # ★★ 已停用（用户要求做减法）★★
+    # 用户：「删除所有的YAML文件。我感觉YAML现在反而给AI造成了困扰」
+    #       「数据库可以全部清理掉」
     #
-    # 用户原话：
-    #   「删除所有的YAML文件。我感觉YAML现在反而给AI造成了困扰」
-    #
-    # 为什么停：
-    #   · 生成出来的 YAML 判据经常是空的/错的（断言只剩 desc、
-    #     凭空多出 targets_tried、落点写错），下一次跑反而被它带偏；
-    #   · 用例的**唯一事实来源是库里的原始文本**（cases.raw_text），
-    #     每次现场拆步骤更准，也不会出现"文件里的和经验里的不一致"；
-    #   · 少一层同步，就少一层"删了又长回来"的困惑。
-    #
-    # 现在只保留回写能力给"显式给了 case_yaml_path"的调用（兼容旧入口），
-    # 不再**自动生成**新文件。
-    if writeback and not case_yaml_path:
-        report.yaml_writeback = {
-            "generated": "",
-            "note": "已停用 YAML 自动生成（按用户要求做减法），本次不产出 YAML",
-        }
-    elif writeback and case_yaml_path:
-        try:
-            from ..report import writeback as ywb
-            _trace = report.action_trace or []
-            _chg = ywb.diff_steps(spec, _trace)
-            if report.status not in ("PASS", "FAIL"):
-                res = {"changed": [], "skipped": [],
-                       "path": str(case_yaml_path),
-                       "note": f"结论 {report.status}，路径没走完，未回写"}
-            else:
-                res = ywb.writeback(case_yaml_path, _chg)
-            report.yaml_writeback = res
-            if verbose and res.get("changed"):
-                log("")
-                log(f"📝 已按本次实际路径回写 YAML：{Path(str(case_yaml_path)).name}")
-                for c in res["changed"]:
-                    for ln in ywb.render_change_lines(c):
-                        log(f"     {ln}")
-            # ⚠️ 没有差异时**什么都不打**。
-            #
-            # 早先这里有个 elif 打「YAML 未回写：无可写入的差异」。用户明确说不要：
-            # 没差异是**最正常的结果**（用例 YAML 本来就写对了），
-            # 给正常结果配一条提示，只会让人以为出了问题、
-            # 还得反过来确认"是不是没写成功"。
-            # 真正需要知道的是"有差异但没写成"—— 那种走下面的 except。
-        except Exception as exc:  # noqa: BLE001
-            report.yaml_writeback = {"changed": [], "skipped": [],
-                                     "path": str(case_yaml_path),
-                                     "error": str(exc)}
-            if verbose:
-                log(f"⚠️ YAML 回写失败（不影响本次结论）：{exc}")
+    # 用例的**唯一事实来源**是 JSON（见 cases/loader.py）。
+    # 生成侧（report/generate.py）和回写侧（report/writeback.py）都已删除，
+    # 这里自然什么都不用做了。
 
     if verbose:
         log("")
@@ -1144,11 +1075,38 @@ def run_case(spec: CaseSpec | dict[str, Any], *,
         _ss = report.strong_stats or {}
         _bc = _ss.get("by_code", 0)
         _bm = _ss.get("by_model", 0)
+        _bs = _ss.get("by_code_strong", 0)
+        _bt = _ss.get("by_code_setup", 0)
+        _bp = _ss.get("by_code_permission", 0)
         log("")
-        log(f"🎯 强证据：代码直点 {_bc} 次 / 交给模型 {_bm} 次"
-            + (f"（自动化率 {_ss.get('auto_rate', 0.0):.0%}）" if (_bc or _bm) else ""))
+        # ★ 代码点击率 = 这次所有点击里，代码自己决定的有多少。
+        #
+        # 用户定的口径：「代码点击率应该是所有的步骤里有代码自动点击的有多少。
+        #                问 AI 的有多少。」
+        # 所以按**点击次数**算，不按步数、也不按决策轮次。
+        #
+        # 三类代码点击都算进来（以前只算第一类，导致数字虚低）：
+        #   strong —— 强证据直点（target 唯一命中）
+        #   setup  —— 记住的固定前置（清空数据后那几下弹窗）
+        #   perm   —— 工具层自动点「允许」
+        log(f"🎯 代码点击率 {_ss.get('auto_rate', 0.0):.0%}"
+            f"：代码点击 {_bc} 次 / 问 AI {_bm} 次"
+            + (f"（其中 强证据 {_bs}、固定前置 {_bt}、自动授权 {_bp}）"
+               if (_bs or _bt or _bp) else ""))
         for _r in (_ss.get("fallback_reasons") or [])[:4]:
             log(f"   · 交给模型原因：{str(_r)[:110]}")
+        # ★ 代码点击率 0 的时候，说清是"哪种 0"。
+        #
+        # 实测困惑：连跑几次都是「代码直点 0 次」，看着像机制坏了。
+        # 看原因才知道是「s1 没有声明 target」—— 用例里根本没写要点哪个控件，
+        # 代码没依据可算，只能问模型。这是**用例的形态**导致的，不是缺陷。
+        # 不说清楚的话，下次还会有人以为是回归。
+        if _bm and not _bc:
+            _no_t = sum(1 for _r in (_ss.get("fallback_reasons") or [])
+                        if "没有声明 target" in str(_r))
+            if _no_t:
+                log(f"   ℹ️ 代码点击率 0 的原因：{_no_t} 次是**用例没写 target**，"
+                    "代码没有可算的目标 —— 补上 target 才会直点")
 
         # ★ 用例可信度（用例 YAML 的 confidence）—— **只提示，不参与判定**。
         # 为什么值得提示：level=single-run/flaky 的用例，这次 PASS
