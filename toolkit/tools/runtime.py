@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import uuid
 from functools import wraps
@@ -197,6 +198,30 @@ def writability_report() -> dict[str, str]:
     return out
 
 
+def _suggest_storage() -> str:
+    """给一条**实测过**能写出来的 storage 路径；没有就给占位符。
+
+    原来这里无条件印 `export ANDROID_TEST_STORAGE="<cwd>/storage"`。当 cwd
+    就在工具层子目录里（人常停在 assets/cases/<包名>/ 下翻用例）、而工具层
+    整棵又被沙箱挡住时，它建议的目标 == 刚刚实测失败的那个目录 —— 照着敲
+    一遍，报错原样复现，比不提示更坏（看着像已经按提示做过功课了）。
+    所以这里先实测父目录能不能建，再拿出来建议。
+    """
+    for cand in (Path.cwd() / "storage", Path(tempfile.gettempdir()) / "android-test-storage"):
+        try:
+            if cand.resolve() == STORAGE_DIR.resolve():
+                continue
+        except OSError:
+            continue
+        base = cand.parent if cand.parent.exists() else cand.parent.parent
+        if probe_writable(base if base.exists() else Path(tempfile.gettempdir())):
+            continue
+        if probe_writable(cand):          # 自己建不出来就别推荐它
+            continue
+        return str(cand)
+    return "<一个可写目录>/storage"
+
+
 def storage_fix_hint(suggest=None) -> str:
     """按当前平台给出「把 storage 指到别处」的那一行命令。
 
@@ -226,6 +251,7 @@ def require_writable_storage(what: str) -> None:
                   "steps.yaml / 知识卡会静默丢失", file=sys.stderr)
         return
     why = report.get("storage") or report.get("run_history") or report.get("tmp") or "?"
+    hint = storage_fix_hint(suggest=_suggest_storage())
     stuck = STORAGE_DIR if "storage" in hard else (
         RECORD_DIR if "run_history" in hard else TMP_DIR)
     print("\n".join([
@@ -239,9 +265,11 @@ def require_writable_storage(what: str) -> None:
         f"  当前 cwd    : {Path.cwd()}",
         "",
         "  照下面任一条改完，重跑同一条命令即可：",
-        "    ① 推荐：把工具层装进 harness 会话的工作区内，产物天然都在沙箱里",
+        f"    ① 推荐：把工具层装进 harness 会话的**可写工作区**内"
+        f"（当前工具层 {ROOT} 整棵都不在可写范围内，只挪 storage 治不了本："
+        "steps.yaml / 知识卡照样写不回）",
         f"    ② cwd 别停在工具层的子目录里（用例目录等）：cd {ROOT}",
-        f"    ③ 显式指到可写位置：{storage_fix_hint()}",
+        f"    ③ 显式指到可写位置：{hint}",
         f"    ④ 若是 DSH 会话沙箱拦的：会话文件策略放宽到 workspace-write 及以上，"
         f"且工作区要覆盖 {stuck.parent}",
         "",
