@@ -511,8 +511,20 @@ android_act …
 |---|---|
 | 定位按钮、判页面切换 | **nodes + activity 就够** |
 | 确认提示语文字 | `full=true` 的 nodes，或 `android_read` OCR |
-| 判置灰/颜色/图标点亮 | 才需要看图 |
-| UI 树里完全找不到（自绘控件） | 才需要看图/OCR |
+| 判置灰/颜色/图标点亮/有无某图标 | `android_vision` |
+| UI 树里完全找不到（自绘控件） | `android_vision`，或 `android_read` OCR |
+
+**看图的唯一工具是 `android_vision`**：
+
+```
+android_vision(image="<上一次 act/observe 返回的 evidence.png>",
+               prompt="这个按钮是不是灰色不可点？答是/否")
+```
+
+- `image` 直接抄 `android_act` / `android_observe` 返回里的 `evidence.png`，**不要自己找路径、也不要问主 Agent 要**。
+- `prompt` 必须**具体、可判**（「有没有加号图标」→ 答有/没有），不要开放描述（「描述这个界面」）—— 开放题会让模型回长文，实测一次吃掉 80 秒。
+- 它返回 `{text, usage, hint}`。**空回答 ≠ 画面里没有**：工具会自己报失败并提示加大 `max_tokens`（默认 2000）或把问题问短，别把空白当成否定证据。
+- 它只是辅助判据，PASS/FAIL 结论仍要结合 nodes / OCR 证据。
 
 ## 权限：弹窗不用管
 
