@@ -33,3 +33,6 @@ desktop.ini
 *.log
 *.bak
 *.bak_before_fix
+
+# ── 只属于某台机器的 skill（里面有 jira_config.json：内网地址/凭据）──
+skills/lenovo-tbjira-skills/

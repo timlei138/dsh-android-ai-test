@@ -46,7 +46,9 @@ except AttributeError:
     pass
 
 HARD, SOFT, INFO = "FAIL", "WARN", "OK"
-DEPS = ("uiautomator2", "adbutils", "yaml", "PIL")
+DEPS = ("uiautomator2", "adbutils", "yaml", "PIL", "rapidocr")
+# rapidocr 必须在列：read.py 的 OCR 靠它，缺了不会让工具起不来，
+# 但每条「按屏幕文字断言」都会静默读成空 —— 比装不上更糟。
 MIN_PY = (3, 10)
 
 _rows: list[dict] = []

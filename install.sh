@@ -94,7 +94,7 @@ else
     for d in plugins skills scripts; do [ -d "$From/$d" ] && cp -a "$From/$d" "$To/$d"; done
     find "$To" \( -name __pycache__ -o -name '*.pyc' \) -prune -exec rm -rf {} + 2>/dev/null
 fi
-for f in 安装说明.md README.md; do [ -f "$From/$f" ] && cp -a "$From/$f" "$To/$f"; done
+for f in 安装说明.md README.md 分享介绍.html; do [ -f "$From/$f" ] && cp -a "$From/$f" "$To/$f"; done
 mkdir -p "$To/toolkit/storage/run_history" "$To/toolkit/storage/tmp" 2>/dev/null
 [ -d "$To/toolkit/assets/cases" ] || warn "源里没有 toolkit/assets/cases（用例库）—— 新机器上是空的，跑用例前先把 assets/cases/<包名>/ 放进来"
 ok "代码就位 $(du -sh "$To/toolkit" 2>/dev/null | cut -f1) → $To/toolkit"
@@ -142,10 +142,15 @@ if [ "$Wire" = 1 ]; then
     else
         warn "找不到 profile 的 package.json：$Pj（DSH_PROFILE 指一下）"
     fi
-    warn "插件每次调用都重读 config.target，但改完要重启 harness 才生效。要改的行："
+    warn "config.target 是 per-machine 的（仓库里默认写 Windows 路径）。--wire 会就地改成新层，改前备份 *.bak-*："
     for f in "$To/plugins/android-tools-plugin/cordis.patch.yml" "$To/plugins/android-auto-test-preset/preset/cordis.patch.yml"; do
-        [ -f "$f" ] && grep -n "target:" "$f" | sed "s|^|    $f:|"
+        [ -f "$f" ] || continue
+        grep -q "target:" "$f" || continue
+        cp -a "$f" "$f.bak-$(date +%Y%m%d-%H%M%S)"
+        sed -i "s|target: .*|target: '$To/toolkit'|g" "$f"
+        grep -n "target:" "$f" | sed "s|^|    $f:|"
     done
+    warn "profile 的 package.json 里那两个 link: 也要指到 $To/plugins/，然后 pnpm install；这两步在工作区外，本脚本不碰"
     warn "别忘了：cd $To/plugins/android-tools-plugin && node link-dsh-deps.mjs（漏了插件根本起不来）"
 else
     say "4/4 未挂接 DSH（没给 --wire）—— 插件/skills 仍指你原来那份工具层"
@@ -155,4 +160,6 @@ echo
 ok "装完了。落点 $To"
 echo "   开会话：cd $To/toolkit && ./.venv/bin/python tools/session.py start --package <包名> ..."
 echo "   产物：$To/toolkit/storage（在工作区内，沙箱写得住；用例历史与证据都在这里）"
-echo "   换掉正在用的那套插件 target：bash install.sh --wire 只看清单，或照 4/4 手工改 3 行 + 重启"
+echo "   换掉正在用的那套插件 target：bash install.sh --wire（会改 3 行 + 备份），再重启 harness"
+echo "   从旧层整套搬家：venv 搬完要修 bin/ 里的 shebang，插件 node_modules 里的 link 要重跑 link-dsh-deps.mjs"
+echo "   会话文件策略是 workspace-write 时，bash 侧删/搬不了工作区外的旧层 —— 那种搬家请在真终端里跑"
