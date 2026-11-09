@@ -21,7 +21,7 @@ from common import (case_spec_hint, emit, knowledge_hint, resolve_case_stem,
                     steps_hint)
 import sqlite3
 from db import (  # noqa: I001
-    STATUSES, SessionDB, clear_current, current_session, get_db,
+    INTERIM, STATUSES, SessionDB, clear_current, current_session, get_db,
     set_current,
 )
 from runtime import (
@@ -1133,7 +1133,20 @@ def main() -> None:
 
     sub.add_parser("list")
     sub.add_parser("current")
-    sub.add_parser("abandon", help="放弃当前会话（不写结论，仅解绑）")
+    # abandon 以前只解绑指针，**不动 sessions.status** —— 于是被放弃的会话
+    # 永远停在 'running'：列表里看着还在跑、仪表盘 running_n 一直不归零
+    # （2026-11-09 本机踩过：自测误开的 #51 就是这么变成僵尸的）。
+    # 现在它写一条终态收尾。为什么用 ERROR 不用 BLOCKED：BLOCKED 在产品口径里
+    # 是「用例的前置不成立、没机会验证」，算缺陷线索；而作废会话是「这条根本没跑」，
+    # 进 ERROR 桶（db.session_stats 单列 error_n，日报趋势里落 other），
+    # 不会污染 PASS/FAIL/BLOCKED 三条统计。summary 前缀「作废：」让记录自解释。
+    a = sub.add_parser("abandon",
+                       help="作废一个会话：写终态收尾 + 解绑指针（不产出用例结论）")
+    a.add_argument("--id", type=int, default=None,
+                   help="会话 id；缺省 = 当前指针指向的会话")
+    a.add_argument("--reason", default="",
+                   help='作废原因（必填，写进 summary，如 --reason "title 写错重开"）')
+    a.add_argument("--device", default=None, help="（兼容用，收下忽略）")
 
     args = p.parse_args()
 
@@ -1222,10 +1235,11 @@ def main() -> None:
                         f"\n"
                         f"  继续跑 → 直接用现有会话，不要再 start\n"
                         f"\n"
-                        f"  确实要重来（title 写错等），先收尾：\n"
-                        f"    session.py finish --status BLOCKED --summary \"重开\"\n"
-                        f"  或者放弃：\n"
+                        f"  确实要重来（title 写错等），挑一条收尾再 start：\n"
                         f"    session.py abandon --id {_cur} --reason \"重开\"\n"
+                        f"        （作废：进 ERROR 桶，不算用例结论 —— 跑错了用这条）\n"
+                        f"    session.py finish --status BLOCKED --summary \"重开\"\n"
+                        f"        （算一条「没机会验证」的结论 —— 用例真跑不动用这条）\n"
                         f"\n"
                         f"  （确定不要这条检查时加 --force）")
 
@@ -1591,9 +1605,43 @@ def main() -> None:
     elif args.cmd == "case":
         run_case_cmd(db, args)
     elif args.cmd == "abandon":
-        clear_current()
+        sid = args.id if getattr(args, "id", None) else current_session()
+        if not sid:
+            raise SystemExit(
+                "没有进行中的会话可放弃。\n"
+                "  想作废历史记录里某条：session.py abandon --id <会话id> --reason \"...\"\n"
+                "  看有哪些：session.py list")
+        cur = current_session()
+        row = db.get_session(sid) or {}
+        if not row:
+            raise SystemExit(f"会话 #{sid} 不存在")
+        status = str(row.get("status"))
+        if status not in INTERIM:
+            # 已经有结论了：绝不覆盖人写过的判定，只把指针解绑。
+            if cur == sid:
+                clear_current(sid)
+            unpin_record()
+            emit(True, {"session_id": sid, "status": status,
+                        "note": f"会话 #{sid} 已是结论态（{status}），"
+                                f"abandon 不覆盖已写的结论；本次只解绑了指针"})
+            raise SystemExit(0)
+        reason = (maybe_file(args.reason) or "").strip()
+        if not reason:
+            raise SystemExit(
+                f'abandon 需要原因：session.py abandon --id {sid} --reason "为什么作废"\n'
+                "  原因会写进 summary —— 不然半年后没人知道这条为什么没结论。")
+        # 崩溃终止过的会话只能落 BLOCKED（db.finish_session 里写死的规矩），
+        # 这里跟着让步，别让人卡在一个想不通的 ValueError 上。
+        final = "BLOCKED" if row.get("terminated") else "ERROR"
+        db.finish_session(sid, final, f"作废：{reason}")
+        if cur == sid:
+            clear_current(sid)
         unpin_record()
-        print(json.dumps({"ok": True}, ensure_ascii=False))
+        emit(True, {"session_id": sid, "status": final, "reason": reason,
+                    "note": ("已作废收尾，不计入用例通过率；"
+                             + ("该会话曾被崩溃终止，按规矩落 BLOCKED；"
+                                if final == "BLOCKED" else "进 ERROR 桶；")
+                             + "证据目录保留不动")})
     elif args.cmd == "perm-intent":
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:
