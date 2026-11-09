@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Android 真机 GUI 测试机制 · 架构与流程</title>
+<style>
+:root{
+  --ink:#080B10;
+  --paper:#0D1219;
+  --panel:#111823;
+  --line:#1C2532;
+  --line2:#27323F;
+  --fg:#E7EDF5;
+  --dim:#7C8B9E;
+  --dim2:#54616F;
+  --amber:#F0A63C;
+  --amber-d:#8A5A18;
+  --cyan:#38C3B8;
+  --cyan-d:#17635E;
+  --red:#E2585C;
+  --green:#5CBB80;
+  --mono:'Cascadia Code','JetBrains Mono','SF Mono',Consolas,'Liberation Mono',monospace;
+  --sans:'Noto Sans SC','PingFang SC','Microsoft YaHei','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--fg);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+
+/* ── 全局背景 ───────────────────────────── */
+#bg{position:fixed;inset:0;pointer-events:none;
+  background:
+    radial-gradient(1200px 700px at 78% -10%, rgba(240,166,60,.055), transparent 60%),
+    radial-gradient(900px 600px at 8% 108%, rgba(56,195,184,.05), transparent 62%),
+    linear-gradient(180deg,#080B10,#0A0E14 60%,#080B10);
+}
+#grid{position:fixed;inset:0;pointer-events:none;opacity:.5;
+  background-image:
+    linear-gradient(rgba(28,37,50,.55) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(28,37,50,.55) 1px,transparent 1px);
+  background-size:64px 64px;
+  mask-image:radial-gradient(ellipse 90% 80% at 50% 45%,#000 30%,transparent 100%);
+}
+
+/* ── 进度条 ─────────────────────────────── */
+#bar{position:fixed;top:0;left:0;height:2px;background:var(--amber);z-index:60;
+  box-shadow:0 0 14px rgba(240,166,60,.7);transition:width .38s cubic-bezier(.3,.9,.3,1)}
+
+/* ── 舞台 ───────────────────────────────── */
+#stage{position:fixed;left:50%;top:50%;width:1600px;height:900px;transform-origin:center center}
+.slide{position:absolute;inset:0;padding:74px 92px 70px;opacity:0;visibility:hidden;
+  display:flex;flex-direction:column;justify-content:center;
+  transform:translateY(14px);transition:opacity .4s ease,transform .4s ease,visibility .4s}
+.slide.is-active{opacity:1;visibility:visible;transform:translateY(0)}
+.slide>h2{margin-bottom:2px}
+
+/* 进入动画元素 */
+.slide.is-active .rv{animation:rise .62s cubic-bezier(.19,.8,.3,1) both;animation-delay:calc(var(--i,0) * 58ms)}
+@keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── 页眉 ───────────────────────────────── */
+.chap{position:absolute;top:44px;left:92px;display:flex;align-items:center;gap:14px;
+  font-family:var(--mono);font-size:12.5px;letter-spacing:.22em;color:var(--amber);text-transform:uppercase}
+.chap::before{content:"";width:34px;height:2px;background:var(--amber);box-shadow:0 0 10px rgba(240,166,60,.6)}
+.chap b{color:var(--dim);font-weight:400;letter-spacing:.16em}
+.pnum{position:absolute;top:44px;right:92px;font-family:var(--mono);font-size:12.5px;letter-spacing:.18em;color:var(--dim2)}
+
+h1{font-size:54px;line-height:1.12;font-weight:800;letter-spacing:-.015em}
+h2{font-size:38px;line-height:1.2;font-weight:760;letter-spacing:-.012em}
+.lede{color:var(--dim);font-size:20px;line-height:1.7;font-weight:400}
+.mono{font-family:var(--mono)}
+
+/* ── 封面 ───────────────────────────────── */
+#cover{padding:0}
+#cover .wrap{display:grid;grid-template-columns:1fr 620px;height:100%}
+#cover .left{padding:96px 0 0 92px;display:flex;flex-direction:column;justify-content:center}
+#cover .kicker{font-family:var(--mono);font-size:13px;letter-spacing:.3em;color:var(--amber);margin-bottom:26px}
+#cover h1{font-size:76px;line-height:1.05;letter-spacing:-.028em}
+#cover h1 em{font-style:normal;color:var(--amber);position:relative}
+#cover h1 em::after{content:"";position:absolute;left:0;right:0;bottom:6px;height:10px;background:rgba(240,166,60,.16);z-index:-1}
+#cover .sub{margin-top:26px;font-size:21px;color:var(--dim);line-height:1.65;max-width:640px}
+#cover .meta{margin-top:52px;display:flex;gap:52px}
+#cover .meta div{display:flex;flex-direction:column;gap:6px}
+#cover .meta b{font-family:var(--mono);font-size:30px;font-weight:600;color:var(--fg)}
+#cover .meta span{font-size:13px;color:var(--dim2);letter-spacing:.05em}
+
+/* 终端面板 */
+.term{border:1px solid var(--line2);background:linear-gradient(180deg,#0C121A,#0A0F16);
+  border-radius:10px;overflow:hidden;box-shadow:0 30px 80px -30px #000,0 0 0 1px rgba(255,255,255,.02) inset}
+.term .bar{height:34px;display:flex;align-items:center;gap:7px;padding:0 14px;border-bottom:1px solid var(--line);
+  background:#0C1118;position:static;width:auto;box-shadow:none}
+.term .bar i{width:9px;height:9px;border-radius:50%;background:#2A3542;display:block}
+.term .bar i:first-child{background:#4A2A2C}
+.term .bar span{margin-left:10px;font-family:var(--mono);font-size:11.5px;color:var(--dim2);letter-spacing:.08em}
+.term pre{padding:18px 20px;font-family:var(--mono);font-size:13.2px;line-height:1.92;color:#9FB0C2;overflow:hidden}
+.term .t{color:var(--dim2)}
+.term .k-ob{color:var(--cyan)}
+.term .k-act{color:var(--amber)}
+.term .k-perm{color:#C08BD8}
+.term .k-find{color:var(--green)}
+.term .ok{color:var(--green)}
+.term .ar{color:var(--dim2)}
+.term .hot{color:var(--fg)}
+
+/* ── 通用卡片 ──────────────────────────── */
+.card{border:1px solid var(--line);background:linear-gradient(180deg,rgba(17,24,35,.9),rgba(13,18,25,.9));
+  border-radius:10px;padding:26px 28px;position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--line2)}
+.card.acc-amber::before{background:var(--amber)}
+.card.acc-cyan::before{background:var(--cyan)}
+.card.acc-red::before{background:var(--red)}
+.card.acc-green::before{background:var(--green)}
+.card h3{font-size:19px;font-weight:700;margin-bottom:10px;letter-spacing:-.005em}
+.card p{font-size:15.5px;line-height:1.72;color:var(--dim)}
+.tag{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.1em;padding:3px 8px;border-radius:4px;
+  border:1px solid var(--line2);color:var(--dim);vertical-align:middle}
+.tag.amber{color:var(--amber);border-color:var(--amber-d);background:rgba(240,166,60,.07)}
+.tag.cyan{color:var(--cyan);border-color:var(--cyan-d);background:rgba(56,195,184,.07)}
+.tag.red{color:var(--red);border-color:#5A2A2C;background:rgba(226,88,92,.07)}
+.tag.green{color:var(--green);border-color:#26553A;background:rgba(92,187,128,.07)}
+
+/* 引文 */
+.quote{font-size:34px;line-height:1.55;font-weight:600;letter-spacing:-.01em;
+  border-left:3px solid var(--amber);padding-left:34px;position:relative}
+.quote .who{display:block;margin-top:22px;font-family:var(--mono);font-size:13px;letter-spacing:.14em;color:var(--dim2);font-weight:400}
+
+/* ── 架构图 ─────────────────────────────── */
+.arch{display:flex;flex-direction:column;gap:14px;margin-top:34px}
+.layer{border:1px solid var(--line2);border-radius:9px;padding:20px 26px;display:grid;
+  grid-template-columns:150px 1fr;gap:26px;align-items:center;position:relative;
+  background:linear-gradient(90deg,rgba(17,24,35,.95),rgba(13,18,25,.55))}
+.layer .lname{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--amber)}
+.layer .lname b{display:block;font-family:var(--sans);font-size:17px;font-weight:700;color:var(--fg);letter-spacing:0;margin-top:5px}
+.layer .body{display:flex;gap:10px;flex-wrap:wrap}
+.chip{border:1px solid var(--line2);border-radius:6px;padding:8px 14px;font-size:14.5px;
+  background:#0C1219;white-space:nowrap}
+.chip b{color:var(--cyan);font-family:var(--mono);font-size:13.5px;font-weight:500}
+.chip.amber b{color:var(--amber)}
+.chip.dim{color:var(--dim);border-style:dashed}
+.side{position:absolute;right:92px;top:196px;width:300px;border-left:1px dashed var(--line2);padding-left:26px}
+.side h4{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--dim2);margin-bottom:16px}
+.side .row{display:flex;flex-direction:column;gap:3px;margin-bottom:16px}
+.side .row code{font-family:var(--mono);font-size:14px;color:var(--amber)}
+.side .row span{font-size:13.5px;color:var(--dim);line-height:1.55}
+
+/* ── 对比双栏 ───────────────────────────── */
+.vs{display:grid;grid-template-columns:1fr 1fr;gap:0;margin-top:30px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.vs>div{padding:30px 34px}
+.vs>div:first-child{background:rgba(226,88,92,.045);border-right:1px solid var(--line)}
+.vs>div:last-child{background:rgba(92,187,128,.045)}
+.vs h3{font-size:20px;margin-bottom:6px;display:flex;align-items:center;gap:10px}
+.vs .lead{font-family:var(--mono);font-size:13px;color:var(--dim2);margin-bottom:20px}
+.vs ul{list-style:none;display:flex;flex-direction:column;gap:13px}
+.vs li{font-size:15px;line-height:1.6;color:var(--dim);padding-left:22px;position:relative}
+.vs li::before{position:absolute;left:0;top:0;font-family:var(--mono);font-size:14px}
+.vs .bad li::before{content:"×";color:var(--red)}
+.vs .good li::before{content:"✓";color:var(--green)}
+.vs li b{color:var(--fg);font-weight:600}
+
+/* ── 工具网格 ───────────────────────────── */
+.tools{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:30px}
+.tool{border:1px solid var(--line);border-radius:9px;padding:20px 20px 18px;background:rgba(17,24,35,.6);
+  display:flex;flex-direction:column;gap:9px;position:relative;transition:border-color .2s}
+.tool .n{font-family:var(--mono);font-size:14.5px;color:var(--amber);letter-spacing:-.01em}
+.tool .d{font-size:14px;color:var(--fg);font-weight:600}
+.tool .p{font-family:var(--mono);font-size:11.5px;color:var(--dim2);line-height:1.65;margin-top:auto}
+.tool .ico{position:absolute;right:16px;top:16px;font-family:var(--mono);font-size:11px;color:var(--dim2);letter-spacing:.08em}
+
+/* ── 流程 ───────────────────────────────── */
+.flow{position:relative;margin-top:56px;padding-top:6px}
+.flow .rail{position:absolute;left:0;right:0;top:26px;height:1px;background:linear-gradient(90deg,transparent,var(--amber-d) 8%,var(--amber-d) 92%,transparent)}
+.flow .steps{display:grid;grid-template-columns:repeat(6,1fr);gap:16px;position:relative}
+.fs{display:flex;flex-direction:column;gap:14px}
+.fs .dot{width:13px;height:13px;border-radius:50%;background:var(--ink);border:2px solid var(--amber);
+  box-shadow:0 0 0 5px var(--ink),0 0 14px rgba(240,166,60,.45);position:relative;z-index:2}
+.fs:nth-child(2n) .dot{border-color:var(--cyan);box-shadow:0 0 0 5px var(--ink),0 0 14px rgba(56,195,184,.4)}
+.fs .no{font-family:var(--mono);font-size:11.5px;color:var(--dim2);letter-spacing:.14em}
+.fs h4{font-size:16.5px;font-weight:700;line-height:1.35}
+.fs p{font-size:13.5px;color:var(--dim);line-height:1.6}
+.fs code{font-family:var(--mono);font-size:12.2px;color:var(--cyan);word-break:break-all}
+
+/* ── 代码块 ─────────────────────────────── */
+pre.code{border:1px solid var(--line);border-radius:9px;background:#0A0F16;padding:20px 24px;
+  font-family:var(--mono);font-size:13.6px;line-height:1.85;color:#9FB0C2;overflow:auto}
+pre.code .c{color:var(--dim2)}
+pre.code .s{color:var(--green)}
+pre.code .n{color:var(--amber)}
+pre.code .f{color:var(--cyan)}
+pre.code .r{color:var(--red)}
+
+/* ── 大数字 ─────────────────────────────── */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:36px}
+.stat{border-top:1px solid var(--line2);padding-top:20px}
+.stat b{display:block;font-family:var(--mono);font-size:46px;font-weight:600;letter-spacing:-.03em;line-height:1.1}
+.stat b.amber{color:var(--amber)} .stat b.cyan{color:var(--cyan)}
+.stat span{display:block;margin-top:8px;font-size:14px;color:var(--dim);line-height:1.5}
+.stat i{display:block;margin-top:10px;font-family:var(--mono);font-size:11.5px;color:var(--dim2);font-style:normal;letter-spacing:.06em}
+
+/* ── 目录树 ─────────────────────────────── */
+.tree{font-family:var(--mono);font-size:14.2px;line-height:2.05;color:#94A5B8}
+.tree .d{color:var(--amber)}
+.tree .c{color:var(--dim2)}
+.tree .m{color:var(--cyan)}
+.tree .hl{color:var(--fg);font-weight:600}
+
+/* ── 原则 ───────────────────────────────── */
+.rules{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:32px}
+.rule{border:1px solid var(--line);border-radius:9px;padding:24px 26px;background:rgba(17,24,35,.55);position:relative}
+.rule .no{font-family:var(--mono);font-size:12px;color:var(--amber);letter-spacing:.16em;margin-bottom:12px}
+.rule h4{font-size:18px;font-weight:750;margin-bottom:9px;line-height:1.35}
+.rule p{font-size:14.5px;color:var(--dim);line-height:1.7}
+.rule p b{color:var(--fg)}
+
+/* ── 收尾 ───────────────────────────────── */
+#end .wrap{display:flex;flex-direction:column;justify-content:center;align-items:center;height:100%;text-align:center}
+#end h1{font-size:60px;max-width:1080px}
+#end .quote{margin-top:56px;border-left:0;padding-left:0;border-top:1px solid var(--line2);padding-top:40px;
+  font-size:26px;color:var(--dim);font-weight:500;max-width:1000px}
+
+/* ── HUD ────────────────────────────────── */
+#hud{position:fixed;right:26px;bottom:22px;display:flex;align-items:center;gap:14px;z-index:50;
+  font-family:var(--mono);font-size:11.5px;color:var(--dim2);letter-spacing:.1em}
+#hud .keys{display:flex;gap:6px;opacity:.6}
+#hud .keys kbd{border:1px solid var(--line2);border-radius:4px;padding:2px 7px;font-family:var(--mono);font-size:10.5px}
+#hud .cur{color:var(--amber)}
+</style>
+</head>
+<body>
+<div id="bg"></div><div id="grid"></div><div id="bar"></div>
+
+<div id="stage">
+
+<!-- ① 封面 -->
+<section class="slide" id="cover">
+  <div class="wrap">
+    <div class="left">
+      <div class="kicker rv" style="--i:0">DEEPSEEK HARNESS · ANDROID 真机 GUI 测试机制</div>
+      <h1 class="rv" style="--i:1">让 AI 在<em>真机</em>上<br>跑完一整批测试</h1>
+      <p class="sub rv" style="--i:2">自然语言说用例，AI 自己看屏幕、自己点、自己判，<br>每步自动留证据，跑完给你一张能追溯的结论表。</p>
+      <div class="meta">
+        <div class="rv" style="--i:3"><b>384</b><span>次会话已跑</span></div>
+        <div class="rv" style="--i:4"><b>8</b><span>个原生工具</span></div>
+        <div class="rv" style="--i:5"><b>70</b><span>条用例</span></div>
+        <div class="rv" style="--i:6"><b>4</b><span>种判定</span></div>
+      </div>
+    </div>
+    <div style="padding:64px 92px 64px 0;display:flex;align-items:center">
+      <div class="term rv" style="--i:3;width:100%">
+        <div class="bar"><i></i><i></i><i></i><span>session #1000182 · 重要日倒数_03</span></div>
+<pre><span class="t">18:57:49</span>  <span class="k-ob">observe</span>   <span class="hot">TimetableGuideActivity</span>  <span class="ar">nodes=41</span>
+<span class="t">18:57:52</span>  <span class="k-perm">perm</span>      <span class="hot">日历正在尝试显示通知</span> · 已点「允许」
+<span class="t">18:57:56</span>  <span class="k-act">act</span>       tap  <span class="hot">rid=iv_more</span>        <span class="ok">checkpoint ✓</span>
+<span class="t">18:58:01</span>  <span class="k-act">act</span>       tap  <span class="hot">rid=item_title</span>    <span class="ok">checkpoint ✓</span>
+<span class="t">18:58:04</span>  <span class="k-ob">observe</span>   <span class="hot">月视图 · 倒数模块已显示</span>
+<span class="t">18:58:07</span>  <span class="k-find">finding</span>   <span class="ok">PASS</span>  预期1「月视图显示倒数模块」
+<span class="t">18:58:09</span>  <span class="k-find">finding</span>   <span class="ok">PASS</span>  预期2「倒数天数随日期变化」
+<span class="t">18:58:11</span>  <span class="k-find">finding</span>   <span class="ok">PASS</span>  预期3「点击进入详情页」
+<span class="t">—</span>        <span class="ar">62 个事件 · 60 份证据 · 12.9 分钟</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ② 起点 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">起点 <b>WHY</b></div>
+  <div class="pnum">02</div>
+  <div style="margin-top:110px;max-width:1180px">
+    <div class="quote rv" style="--i:1">「我们努力这么久，不就是想提供控件的稳定性。<br>下次同样的 case 跑的时候，能少问 AI。」
+      <span class="who">—— 这个机制的第一性目标</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:56px;margin-top:74px">
+      <div class="rv" style="--i:3">
+        <div class="tag amber" style="margin-bottom:16px">问题</div>
+        <p class="lede">纯 AI 跑测试：每次从零理解界面，同一件事反复问、反复猜。<br><br>
+        纯脚本跑测试：界面一变就全挂，维护成本比手动测还高。</p>
+      </div>
+      <div class="rv" style="--i:4">
+        <div class="tag cyan" style="margin-bottom:16px">答案</div>
+        <p class="lede" style="color:var(--fg);font-size:22px;line-height:1.75">
+          <b style="color:var(--amber)">代码管纪律</b> —— 格式、顺序、证据、判定一致性<br><br>
+          <b style="color:var(--cyan)">AI 管语义</b> —— 点哪个、符不符合预期
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ③ 架构 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">架构 <b>ARCHITECTURE</b></div>
+  <div class="pnum">03</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">三层：平台给壳、插件给手、工具层给脑</h2>
+  <div style="display:grid;grid-template-columns:1fr 300px;gap:56px">
+    <div class="arch">
+      <div class="layer rv" style="--i:2">
+        <div class="lname">① 平台层<b>DSH · Cordis</b></div>
+        <div class="body">
+          <span class="chip">Agent 编排</span>
+          <span class="chip">插件热加载</span>
+          <span class="chip">上下文压缩</span>
+          <span class="chip">Web UI</span>
+          <span class="chip dim">不改它</span>
+        </div>
+      </div>
+      <div class="layer rv" style="--i:3">
+        <div class="lname">② 插件层<b>两个 local 包</b></div>
+        <div class="body">
+          <span class="chip amber"><b>android-tools-plugin</b> 把脚本封成 8 个原生工具</span>
+          <span class="chip amber"><b>android-auto-test-preset</b> 两个 Agent 角色的 persona</span>
+        </div>
+      </div>
+      <div class="layer rv" style="--i:4">
+        <div class="lname">③ 工具层<b>toolkit / Python</b></div>
+        <div class="body">
+          <span class="chip">act</span><span class="chip">observe</span><span class="chip">read</span>
+          <span class="chip">vision</span><span class="chip">session</span><span class="chip">db</span>
+          <span class="chip">perm</span><span class="chip">state</span><span class="chip">checkpoint</span>
+          <span class="chip dim">20 个脚本</span>
+        </div>
+      </div>
+      <div class="layer rv" style="--i:5">
+        <div class="lname">④ 数据层<b>assets / storage</b></div>
+        <div class="body">
+          <span class="chip">用例 md</span><span class="chip">steps 路径</span>
+          <span class="chip">知识卡</span><span class="chip">路径图</span>
+          <span class="chip">test.db</span><span class="chip">逐证据落盘</span>
+        </div>
+      </div>
+    </div>
+    <div style="border-left:1px dashed var(--line2);padding-left:30px;margin-top:34px" class="rv">
+      <h4 style="font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--dim2);margin-bottom:20px">为什么这么切</h4>
+      <div style="display:flex;flex-direction:column;gap:20px">
+        <div><code class="mono" style="color:var(--amber);font-size:13.5px">平台</code>
+          <p style="font-size:13.5px;color:var(--dim);line-height:1.6;margin-top:4px">换平台只换壳，机制不变</p></div>
+        <div><code class="mono" style="color:var(--amber);font-size:13.5px">插件</code>
+          <p style="font-size:13.5px;color:var(--dim);line-height:1.6;margin-top:4px">只做「翻译」，不含业务逻辑</p></div>
+        <div><code class="mono" style="color:var(--amber);font-size:13.5px">工具层</code>
+          <p style="font-size:13.5px;color:var(--dim);line-height:1.6;margin-top:4px">纪律全在这一层，可单测</p></div>
+        <div><code class="mono" style="color:var(--amber);font-size:13.5px">数据</code>
+          <p style="font-size:13.5px;color:var(--dim);line-height:1.6;margin-top:4px">用例与知识跟代码分离，可增可删</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ④ 为什么不用 bash -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">关键决定 <b>DESIGN CHOICE</b></div>
+  <div class="pnum">04</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">为什么 AI 不直接 bash 跑 python</h2>
+  <p class="rv lede" style="--i:2;margin-top:14px">这是整套机制里最重要的一次转向 —— 早期就在 bash 里跑，天天翻车。</p>
+  <div class="vs rv" style="--i:3">
+    <div class="bad">
+      <h3><span class="tag red">旧</span> bash 拼命令行</h3>
+      <div class="lead">python tools/act.py tap --x 1782 --y 210 --via "rid=iv_more"</div>
+      <ul>
+        <li>PowerShell 的引号、<b>&amp;</b> 前缀、<b>%</b> 转义，每个会话都要白跑一轮</li>
+        <li>中文路径与参数经 shell 编码，变成乱码再报「文件不存在」</li>
+        <li><b>空字符串被吞掉</b> —— 想清空输入框，参数直接消失</li>
+        <li>cwd 不对就找不到脚本，还会在错的地方造出一个假库</li>
+        <li>顺序全靠 AI 记；漏一步就证据不齐</li>
+      </ul>
+    </div>
+    <div class="good">
+      <h3><span class="tag green">今</span> 原生工具 + stdin JSON</h3>
+      <div class="lead">android_act(action="tap", x=1782, y=210, via="rid=iv_more")</div>
+      <ul>
+        <li>参数走 <b>stdin 的 JSON</b>，不经 shell 解析 → 引号、中文、空串原样到达</li>
+        <li>工作目录固定指向工具层，产物落点<b>不会漂</b></li>
+        <li>每次调用就是一次取证：截图 + dump + meta <b>自动落盘</b></li>
+        <li>参数有 schema 校验，传错名字立刻报错，不会静默走偏</li>
+        <li>顺序由工具保证，AI 只需要决定「点哪」</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ⑤ 8 个工具 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">工具箱 <b>TOOLS</b></div>
+  <div class="pnum">05</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">8 个原语：看、动、读、问</h2>
+  <div class="tools">
+    <div class="tool rv" style="--i:2"><span class="ico">ENV</span><div class="n">android_env</div><div class="d">环境体检</div><div class="p">platform · storage_dir · deps_ok · device{serial, ime_ok}</div></div>
+    <div class="tool rv" style="--i:3"><span class="ico">ACT</span><div class="n">android_act</div><div class="d">动手</div><div class="p">tap · longclick · input · swipe · back · home · key</div></div>
+    <div class="tool rv" style="--i:4"><span class="ico">OBS</span><div class="n">android_observe</div><div class="d">看当前屏</div><div class="p">可点清单 next[] + nodes + 截图，自动等稳定</div></div>
+    <div class="tool rv" style="--i:5"><span class="ico">OCR</span><div class="n">android_read</div><div class="d">读文字</div><div class="p">OCR 出文字 + center 坐标，可直接拿去点</div></div>
+    <div class="tool rv" style="--i:6"><span class="ico">VIS</span><div class="n">android_vision</div><div class="d">看图</div><div class="p">置灰 · 颜色 · 图标 · 布局 —— OCR 认不出的</div></div>
+    <div class="tool rv" style="--i:7"><span class="ico">DOC</span><div class="n">android_read_file</div><div class="d">读文档</div><div class="p">知识卡 · 路径图 · 用例，按节读，section 是数组</div></div>
+    <div class="tool rv" style="--i:8"><span class="ico">PRM</span><div class="n">android_perm</div><div class="d">权限</div><div class="p">查 / 授 / 撤运行时权限，一次问清 13 项</div></div>
+    <div class="tool rv" style="--i:9"><span class="ico">STA</span><div class="n">android_state</div><div class="d">造与复位</div><div class="p">clear 清数据 · start / stop App</div></div>
+  </div>
+  <p class="rv" style="--i:11;margin-top:26px;font-family:var(--mono);font-size:13px;color:var(--dim2);letter-spacing:.03em">
+    只有 <span style="color:var(--amber)">session.py</span>（开会话 / 记断言 / 收尾）必须用 bash —— 它是记录账本，不是动设备。
+  </p>
+</section>
+
+<!-- ⑥ 两个角色 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">角色 <b>AGENTS</b></div>
+  <div class="pnum">06</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">两个 Agent，一个管调度，一个管执行</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:38px">
+    <div class="card acc-amber rv" style="--i:2">
+      <div class="tag amber" style="margin-bottom:16px">主 Agent · android-tester</div>
+      <h3>判断 → 派发 → 汇总</h3>
+      <p style="margin-bottom:20px">用户用自然语言说用例，它先判断这条能不能跑，再交给执行 Agent，最后汇总成一张表。</p>
+      <div style="border-top:1px solid var(--line);padding-top:18px;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--amber);font-family:var(--mono)">·</span> 一次只派一个执行 Agent（串行，避免抢设备）</div>
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--amber);font-family:var(--mono)">·</span> 派完就结束回合，等系统通知，不 sleep 轮询</div>
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--amber);font-family:var(--mono)">·</span> 派发前先列目录核对文件名，不凭编号猜</div>
+      </div>
+    </div>
+    <div class="card acc-cyan rv" style="--i:3">
+      <div class="tag cyan" style="margin-bottom:16px">执行子 Agent · android-executor</div>
+      <h3>看 → 动 → 判 → 记</h3>
+      <p style="margin-bottom:20px">拿着一条用例上台，逐步操作并判定；卡住就记 BLOCKED 往下走，不阻塞整批。</p>
+      <div style="border-top:1px solid var(--line);padding-top:18px;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--cyan);font-family:var(--mono)">·</span> 只做用例要求的事，没写的一律不动</div>
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--cyan);font-family:var(--mono)">·</span> 一次看全就判，判完不回头复查</div>
+        <div style="font-size:14.5px;color:var(--fg)"><span style="color:var(--cyan);font-family:var(--mono)">·</span> 同一目标最多试 2 次，不通就 BLOCKED</div>
+      </div>
+    </div>
+  </div>
+  <p class="rv" style="--i:5;margin-top:28px;font-size:15px;color:var(--dim);line-height:1.7">
+    两段 persona 加上两份 <code class="mono" style="color:var(--amber)">SKILL.md</code> 就是全部「作业指导书」——
+    一个告诉 AI 怎么用工具，一个告诉 AI 什么算通过。
+  </p>
+</section>
+
+<!-- ⑦ 流程 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">流程 <b>PIPELINE</b></div>
+  <div class="pnum">07</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">一条用例的完整生命周期</h2>
+  <div class="flow rv" style="--i:2">
+    <div class="rail"></div>
+    <div class="steps">
+      <div class="fs"><div class="dot"></div><div class="no">01</div><h4>说用例</h4><p>自然语言，「进去 → 新建 → 看月视图」</p></div>
+      <div class="fs"><div class="dot"></div><div class="no">02</div><h4>够格判断</h4><p>有步骤？有能判的预期？<br>不合格当场退回</p></div>
+      <div class="fs"><div class="dot"></div><div class="no">03</div><h4>开会话</h4><p><code>session.py start</code><br>冷启动 + 常亮 + 输入法</p></div>
+      <div class="fs"><div class="dot"></div><div class="no">04</div><h4>读地图</h4><p>知识卡 + 上次路径<br><code>android_read_file</code></p></div>
+      <div class="fs"><div class="dot"></div><div class="no">05</div><h4>执行循环</h4><p>act 带 via / why / expect<br>自动截图 + 落库</p></div>
+      <div class="fs"><div class="dot"></div><div class="no">06</div><h4>判定收尾</h4><p>逐条 finding<br><code>session.py finish</code></p></div>
+    </div>
+  </div>
+  <div style="margin-top:56px;display:grid;grid-template-columns:1fr 1fr;gap:22px">
+    <div class="card acc-amber rv" style="--i:8">
+      <h3 style="font-family:var(--mono);font-size:15px;color:var(--amber)">android_act(action="tap", x=…, y=…, via="rid=iv_more", why="用例步骤3：打开菜单", expect="rid=item_title")</h3>
+      <p style="margin-top:12px">三个字段是硬要求：<b style="color:var(--fg)">via</b> 你是凭什么点这儿，<b style="color:var(--fg)">why</b> 对应用例哪一步，<b style="color:var(--fg)">expect</b> 期望落到哪 —— 工具自己拿这三样去核对落点，对不上当场告诉你。</p>
+    </div>
+    <div class="card acc-cyan rv" style="--i:9">
+      <h3 style="font-family:var(--mono);font-size:15px;color:var(--cyan)">session.py finding --status FAIL --expect "显示倒数模块" --actual "月视图空白" --event-id 10234</h3>
+      <p style="margin-top:12px">每条断言必须挂一个<b style="color:var(--fg)">真实存在的事件 id</b>，工具会回到库里核对这条事件属于本会话、证据文件真的在盘上。编不出来就写不进去。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ⑧ 代码怎么管纪律 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">纪律 <b>ENFORCEMENT</b></div>
+  <div class="pnum">08</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">纪律不写在提示词里，写在代码里</h2>
+  <p class="rv lede" style="--i:2;margin-top:12px">提示词会被遗忘、被折叠、被绕开。硬约束只有写在数据库那一层才算数。</p>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:30px">
+    <div class="card acc-red rv" style="--i:3">
+      <h3>① 断言必须挂真证据</h3>
+      <p><code class="mono" style="color:var(--amber);font-size:13px">db.py · add_finding</code><br>
+      <span style="color:var(--fg)">actual 不能为空；PASS / FAIL 必须有 expect 且至少挂一个事件；事件要属于本会话，证据文件要真的在盘上。</span></p>
+    </div>
+    <div class="card acc-red rv" style="--i:4">
+      <h3>② 汇总必须和明细对得上</h3>
+      <p><code class="mono" style="color:var(--amber);font-size:13px">db.py · _check_summary_counts</code><br>
+      <span style="color:var(--fg)">summary 里写「8 PASS / 4 FAIL」，库里是 9 / 3 —— 直接拒绝收尾。</span></p>
+    </div>
+    <div class="card acc-red rv" style="--i:5">
+      <h3>③ 知识卡不许写死东西</h3>
+      <p><code class="mono" style="color:var(--amber);font-size:13px">session.py · _KB_VIOLATIONS</code><br>
+      <span style="color:var(--fg)">8 条正则拦截：坐标、像素值、会话号、「应判 PASS/FAIL」这类判定权 —— 一律写不进去。</span></p>
+    </div>
+    <div class="card acc-red rv" style="--i:6">
+      <h3>④ 判定口径只有四档</h3>
+      <p><code class="mono" style="color:var(--amber);font-size:13px">db.py · STATUSES</code><br>
+      <span style="color:var(--fg)">PASS / FAIL / BLOCKED / ERROR。没有 WARN，没有「待确认」—— 不符合就是 FAIL。</span></p>
+    </div>
+  </div>
+  <div style="margin-top:24px;display:flex;gap:14px;align-items:center" class="rv">
+    <span class="tag green">PASS</span><span style="font-size:14.5px;color:var(--dim)">验过且符合</span>
+    <span class="tag red">FAIL</span><span style="font-size:14.5px;color:var(--dim)">验过但不符合</span>
+    <span class="tag amber">BLOCKED</span><span style="font-size:14.5px;color:var(--dim)">连验证的机会都没有（最多试 2 次）</span>
+    <span class="tag">ERROR</span><span style="font-size:14.5px;color:var(--dim)">工具层异常</span>
+  </div>
+</section>
+
+<!-- ⑨ 取证 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">证据 <b>EVIDENCE</b></div>
+  <div class="pnum">09</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">每一步都留得下证据，事后能回放</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:44px;margin-top:34px">
+    <div class="rv" style="--i:2">
+      <div class="tree">
+<span class="d">storage/</span>
+├── <span class="hl">test.db</span>            <span class="c">会话 / 事件 / 断言 / 判定</span>
+└── <span class="d">run_history/</span>
+    └── <span class="m">3f9c…/</span>
+        ├── <span class="d">evidence/</span>
+        │   ├── <span class="d">step01/</span>
+        │   │   ├── shot.png    <span class="c">截图</span>
+        │   │   ├── dump.xml    <span class="c">控件树</span>
+        │   │   └── meta.json   <span class="c">activity / 动作 / 耗时</span>
+        │   ├── <span class="d">step02/</span> …
+        │   └── <span class="d">step57_perm/</span> …
+        ├── <span class="d">calls/</span>        <span class="c">每次工具调用的入参出参</span>
+        └── <span class="d">timing/</span>       <span class="c">分阶段耗时</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card acc-cyan rv" style="--i:3">
+        <h3>一次动作 = 一个证据目录</h3>
+        <p>点完之后工具自己等画面稳定、截图、存控件树；AI 不需要记得「去存证据」，也就不会漏。</p>
+      </div>
+      <div class="card acc-cyan rv" style="--i:4">
+        <h3>落点自动核对</h3>
+        <p>传了 <code class="mono" style="color:var(--amber);font-size:13px">expect</code>，工具就跑一遍断言，把 <b style="color:var(--fg)">matched / missed</b> 一起返回，点错了当场知道。</p>
+      </div>
+      <div class="card acc-cyan rv" style="--i:5">
+        <h3>权限弹窗单独成步</h3>
+        <p>点掉的每个系统权限框都记一步、留一张图，但截图不多拍一次 —— 复用本轮已有的那份。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ⑩ 越跑越好 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">沉淀 <b>COMPOUNDING</b></div>
+  <div class="pnum">10</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">跑得越多，下次问 AI 越少</h2>
+  <p class="rv lede" style="--i:2;margin-top:12px">两条沉淀线，都不靠人手工维护。</p>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:34px">
+    <div class="card acc-amber rv" style="--i:3">
+      <div class="tag amber" style="margin-bottom:16px">沉淀线 A</div>
+      <h3>知识卡 · 人确认过的经验</h3>
+      <p style="margin-bottom:16px">「提醒触发时间 = 开始时间 − 提醒偏移」「进空课表只有空占位、没有加号图标」—— 只记确认过的事实和操作经验，<b style="color:var(--fg)">不记坐标、不记会话号、不记结论</b>。</p>
+      <p style="font-family:var(--mono);font-size:12.5px;color:var(--cyan);line-height:1.9">
+        assets/knowledge/&lt;包名&gt;.md<br>
+        assets/knowledge/paths/&lt;包名&gt;.md
+      </p>
+    </div>
+    <div class="card acc-cyan rv" style="--i:4">
+      <div class="tag cyan" style="margin-bottom:16px">沉淀线 B</div>
+      <h3>steps 路径 · 机器自己导出的路线</h3>
+      <p style="margin-bottom:16px">收尾时自动把「从哪来 → 点了什么 → 到哪去」导出成一条步骤路径，下次同一个 case 直接接着走，不必重新摸索入口。</p>
+      <p style="font-family:var(--mono);font-size:12.5px;color:var(--cyan);line-height:1.9">
+        assets/cases/&lt;包名&gt;/&lt;用例名&gt;_steps.yaml<br>
+        start_from · step_count · 每步 via + expect
+      </p>
+    </div>
+  </div>
+  <div class="rv" style="--i:6;margin-top:26px;border:1px dashed var(--line2);border-radius:9px;padding:20px 26px">
+    <p style="font-size:15px;color:var(--dim);line-height:1.7">
+      还有一条被动沉淀：<b style="color:var(--fg)">每个会话的耗时、事件数、工具占比都进库</b>，
+      哪类用例慢、哪一步耗时长，事后可直接查 —— 优化有依据，不靠感觉。
+    </p>
+  </div>
+</section>
+
+<!-- ⑪ 数据 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">实测 <b>MEASURED</b></div>
+  <div class="pnum">11</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">真实跑出来的数</h2>
+  <div class="stats">
+    <div class="stat rv" style="--i:2"><b>384</b><span>累计会话</span><i>单库统计 · 383 条用例</i></div>
+    <div class="stat rv" style="--i:3"><b class="amber">70.8%</b><span>PASS 占比<br>（271 / 383）</span><i>另有 FAIL 78 · BLOCKED 33 · ERROR 1</i></div>
+    <div class="stat rv" style="--i:4"><b class="cyan">11.7</b><span>分钟 / 条用例</span><i>最近一批 51 条：8.9 分钟/条</i></div>
+    <div class="stat rv" style="--i:5"><b>27</b><span>秒 / 单个事件</span><i>平均 26 个事件 / 会话 · 共 10,024 个</i></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:44px">
+    <div class="card acc-green rv" style="--i:6">
+      <h3>工具这一侧已经很快了</h3>
+      <p>一次点击动作平均 3.2 秒（真正点击只占 0.45 秒，其余是等稳定 + 截图 + 存盘），跨全部历史批次基本不变 —— 优化空间已经不在工具。</p>
+    </div>
+    <div class="card acc-amber rv" style="--i:7">
+      <h3>慢的地方是「看一眼」</h3>
+      <p>事件数的 75% 是 act，但真正耗时的是一次次「看屏幕 + 判读」。所以这几轮优化都对着提示词与纪律做：一次看全、判完就走、不用反复回头。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ⑫ 分享包 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">交付 <b>PACKAGE</b></div>
+  <div class="pnum">12</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">照这个包，别人也能在自己机器上跑起来</h2>
+  <div style="display:grid;grid-template-columns:1.15fr 1fr;gap:44px;margin-top:30px">
+    <div class="rv" style="--i:2">
+      <div class="tree" style="font-size:14.6px">
+<span class="hl">Share/</span>
+├── <span class="hl">安装说明.md</span>          <span class="c">入口文档，按步照做</span>
+├── README.md
+├── <span class="d">scripts/</span>
+│   └── <span class="m">link-dsh-deps.ps1</span>   <span class="c">给插件补 DSH 依赖链接</span>
+├── <span class="d">toolkit/</span>              <span class="c">唯一一份代码</span>
+│   ├── <span class="d">tools/</span>            <span class="c">20 个 Python 脚本</span>
+│   ├── <span class="d">assets/</span>           <span class="c">用例 · 知识卡 · 路径图</span>
+│   ├── <span class="d">docs/</span>             <span class="c">环境与工具 · 执行参考</span>
+│   ├── <span class="m">webui.py</span>          <span class="c">测试台，看历史与回放</span>
+│   └── <span class="d">scripts/</span>          <span class="c">setup.ps1 一键装环境</span>
+├── <span class="d">plugins/</span>              <span class="c">两个 DSH 包</span>
+│   ├── android-tools-plugin
+│   └── android-auto-test-preset
+└── <span class="d">skills/</span>               <span class="c">每个目录只有一份 SKILL.md</span>
+    ├── android-gui-test/SKILL.md    <span class="c">执行纪律</span>
+    └── android-case-check/SKILL.md  <span class="c">用例够不够格</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card rv" style="--i:3">
+        <h3>装一次，五步</h3>
+        <p>装 Python 环境 → 装两个 skill → 装两个插件 → 补依赖链接 → 改 target 并重启。全程手动，文档里每步都有能复制的命令。</p>
+      </div>
+      <div class="card rv" style="--i:4">
+        <h3>代码只有一份</h3>
+        <p>改知识卡、改用例、改脚本，都只改 <code class="mono" style="color:var(--amber);font-size:13px">toolkit/</code> 一处 —— 不存在「两份副本要同步」这种坑。</p>
+      </div>
+      <div class="card rv" style="--i:5">
+        <h3>已经在 GitHub 上</h3>
+        <p style="font-family:var(--mono);font-size:13px;color:var(--cyan)">github.com/timlei138/dsh-android-ai-test</p>
+        <p style="margin-top:8px">分支 <code class="mono" style="color:var(--fg);font-size:13px">share</code>，包含整套分享包。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ⑬ 原则 -->
+<section class="slide">
+  <div class="chap rv" style="--i:0">原则 <b>PRINCIPLES</b></div>
+  <div class="pnum">13</div>
+  <h2 class="rv" style="--i:1;margin-top:26px">这几条是用删除换来的</h2>
+  <div class="rules">
+    <div class="rule rv" style="--i:2">
+      <div class="no">01</div>
+      <h4>不是共性问题，不改代码</h4>
+      <p>为一条用例的怪现象给工具层打补丁，会让框架长满只服务一个 App 的临时代码。<b>是 Case 的问题就改 Case。</b></p>
+    </div>
+    <div class="rule rv" style="--i:3">
+      <div class="no">02</div>
+      <h4>判据必须是用户能感知的</h4>
+      <p>判「是不是弹窗」看截图一眼，不靠 activity 名字；判「提醒生没生效」拉通知栏看，不靠读系统 alarm 列表。<b>内部状态不等于用户看到的东西。</b></p>
+    </div>
+    <div class="rule rv" style="--i:4">
+      <div class="no">03</div>
+      <h4>卡住就记 BLOCKED 往下走</h4>
+      <p>同一个目标最多试 2 次，不通就记录原因并继续。<b>不暂停等人工</b> —— 一停就卡死整批。</p>
+    </div>
+    <div class="rule rv" style="--i:5">
+      <div class="no">04</div>
+      <h4>改流程前，先列出「记录必须仍然显示什么」</h4>
+      <p>曾经为了少拍一张图，把「每个点掉的弹窗算一步」也一起删了，还报了「测试通过」。<b>验证断言必须覆盖旧约束，不能只测新行为。</b></p>
+    </div>
+  </div>
+</section>
+
+<!-- ⑭ 收尾 -->
+<section class="slide" id="end">
+  <div class="wrap">
+    <div class="kicker rv" style="--i:0">ANDROID GUI TESTING · ON A REAL DEVICE</div>
+    <h1 class="rv" style="--i:1">代码管纪律，AI 管语义</h1>
+    <div class="quote rv" style="--i:2">写死的部分交给代码，判断的部分交给 AI ——<br>两边都不越界，这套东西才稳得住。</div>
+  </div>
+</section>
+
+</div>
+
+<div id="hud">
+  <span class="cur"><span id="curNo">01</span> / <span id="totNo">14</span></span>
+  <span class="keys"><kbd>←</kbd><kbd>→</kbd></span>
+</div>
+
+<script>
+(function(){
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var total = slides.length;
+  var i = 0;
+  var bar = document.getElementById('bar');
+  var stage = document.getElementById('stage');
+  document.getElementById('totNo').textContent = String(total).padStart(2,'0');
+
+  function fit(){
+    var s = Math.min(window.innerWidth/1600, window.innerHeight/900);
+    stage.style.transform = 'translate(-50%,-50%) scale(' + s + ')';
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  function go(n){
+    if (n < 0) n = 0;
+    if (n > total-1) n = total-1;
+    if (n === i && slides[i].classList.contains('is-active')) return;
+    slides[i].classList.remove('is-active');
+    i = n;
+    // 强制重排，让进入动画重新触发
+    void slides[i].offsetWidth;
+    slides[i].classList.add('is-active');
+    document.getElementById('curNo').textContent = String(i+1).padStart(2,'0');
+    bar.style.width = ((i+1)/total*100) + '%';
+  }
+
+  slides[0].classList.add('is-active');
+  bar.style.width = (1/total*100) + '%';
+
+  // 支持 #3 直接跳到第 3 页（分享链接 / 截图验证用）
+  function fromHash(){
+    var m = /^#(\d+)$/.exec(location.hash || '');
+    if (m) {
+      var n = parseInt(m[1], 10) - 1;
+      if (n >= 0 && n < total) { go(n); }
+    }
+  }
+  window.addEventListener('hashchange', fromHash);
+  fromHash();
+
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ' || e.key === 'PageDown'){
+      e.preventDefault(); go(i+1);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'PageUp'){
+      e.preventDefault(); go(i-1);
+    } else if (e.key === 'Home'){ e.preventDefault(); go(0); }
+    else if (e.key === 'End'){ e.preventDefault(); go(total-1); }
+  });
+
+  // 滚轮翻页（节流）
+  var lock = false;
+  window.addEventListener('wheel', function(e){
+    if (lock) return;
+    if (Math.abs(e.deltaY) < 24) return;
+    lock = true;
+    go(e.deltaY > 0 ? i+1 : i-1);
+    setTimeout(function(){ lock = false; }, 520);
+  }, {passive:true});
+
+  // 触屏
+  var tx = 0, ty = 0;
+  window.addEventListener('touchstart', function(e){
+    tx = e.touches[0].clientX; ty = e.touches[0].clientY;
+  }, {passive:true});
+  window.addEventListener('touchend', function(e){
+    var dx = e.changedTouches[0].clientX - tx;
+    var dy = e.changedTouches[0].clientY - ty;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) go(dx < 0 ? i+1 : i-1);
+  }, {passive:true});
+})();
+</script>
+</body>
+</html>
