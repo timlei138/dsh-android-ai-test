@@ -1,0 +1,18 @@
+# 自动导出：com.zui.calendar_新建备注_35 的可复用跳转步骤
+#
+# 只含「锚点明确 + 落点可验 + 非前置」的 tap。
+# 前置条件、造数据、判定都不在这里 —— 那些每次都不一样。
+#
+# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
+# 注意：这是**上一次**的实测路径，不是唯一正确路径。
+case: com.zui.calendar_新建备注_35
+source_run: storage
+last_run: 2026-11-05T22:04:44.154
+verdict: PASS
+step_count: 1
+start_from: activity=com.zui.calendar.newbuild.NewBuildActivity
+steps:
+  - n: 1
+    why: 用例35步骤3：点完成保存事件
+    via: rid=save_view
+    expect: activity=com.zui.calendar.reminder.utils.SyncReminderActivity

@@ -1,0 +1,29 @@
+# 自动导出：com.zui.calendar_抢火车票_69 的可复用跳转步骤
+#
+# 只含「锚点明确 + 落点可验 + 非前置」的 tap。
+# 前置条件、造数据、判定都不在这里 —— 那些每次都不一样。
+#
+# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
+# 注意：这是**上一次**的实测路径，不是唯一正确路径。
+case: com.zui.calendar_抢火车票_69
+source_run: storage
+last_run: 2026-11-06T00:31:08.197
+verdict: FAIL
+step_count: 3
+start_from: activity=com.zui.calendar.settings.GrabVoteSettingsActivity
+steps:
+  - n: 1
+    why: 取消本次弹框（保留 setdate 已勾选状态用于步骤4观察）
+    via: rid=left_button
+    expect: rid=festival_checkbox
+    in_page: true
+  - n: 2
+    why: 第二次尝试：改为直接点选滚轮上的具体日期
+    via: rid=voteTimePickerGo
+    expect: rid=button_divider2
+    in_page: true
+  - n: 3
+    why: 返程日期 11/4 早于启程 11/6，点确定看是否有提示
+    via: rid=right_button
+    expect: rid=festival_checkbox
+    in_page: true

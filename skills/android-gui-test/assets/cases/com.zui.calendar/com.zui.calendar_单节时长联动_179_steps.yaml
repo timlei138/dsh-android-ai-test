@@ -1,0 +1,19 @@
+# 自动导出：com.zui.calendar_单节时长联动_179 的可复用跳转步骤
+#
+# 只含「锚点明确 + 落点可验 + 非前置」的 tap。
+# 前置条件、造数据、判定都不在这里 —— 那些每次都不一样。
+#
+# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
+# 注意：这是**上一次**的实测路径，不是唯一正确路径。
+case: com.zui.calendar_单节时长联动_179
+source_run: storage
+last_run: 2026-11-06T04:05:52.394
+verdict: FAIL
+step_count: 1
+start_from: activity=com.zui.calendar.AllInOneActivity
+steps:
+  - n: 1
+    why: 进入课程表入口
+    via: rid=iv_more
+    expect: rid=item_title
+    in_page: true

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Android AI 测试台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%233565e0'/%3E%3Ctext x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='sans-serif'%3E%E2%9C%93%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="logo">AI 测试台</div>
+  <a class="nav-item active" data-view="dashboard">仪表盘</a>
+  <a class="nav-item" data-view="sessions">测试记录</a>
+  <a class="nav-item" data-view="cases">用例库</a>
+  <a class="nav-item" data-view="knowledge">知识库</a>
+  <a class="nav-item" data-view="vision">视觉模型</a>
+</nav>
+<main id="main"></main>
+<div id="lightbox" class="hidden"><img id="lightbox-img" alt=""></div>
+<script src="/static/echarts.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

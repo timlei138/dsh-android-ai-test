@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-android-auto-test-preset",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Android 自动化测试 preset：主 Agent（检查/派发/汇总）+ 执行子 Agent（bash + 读文件 + SKILL 纪律）",
+  "dsh": {
+    "bundle": {
+      "patch": "./preset/cordis.patch.yml"
+    }
+  }
+}

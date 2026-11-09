@@ -1,0 +1,13 @@
+{
+    "version":  "0.1.0",
+    "name":  "@local/dsh-android-tools",
+    "main":  "lib/index.js",
+    "description":  "Android 测试工具层的原生 tool 封装：把 env / act / observe / read 从命令行脚本变成结构化工具调用，彻底绕开 shell 引号与编码问题",
+    "type":  "module",
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           }
+            },
+    "private":  true
+}

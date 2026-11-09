@@ -1,0 +1,90 @@
+# 自动导出：com.zui.calendar_全天事件_19 的可复用跳转步骤
+#
+# 只含「锚点明确 + 落点可验 + 非前置」的 tap。
+# 前置条件、造数据、判定都不在这里 —— 那些每次都不一样。
+#
+# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
+# 注意：这是**上一次**的实测路径，不是唯一正确路径。
+case: com.zui.calendar_全天事件_19
+source_run: storage
+last_run: 2026-11-04T21:23:50.469
+verdict: PASS
+step_count: 16
+start_from: activity=com.zui.calendar.newbuild.NewBuildActivity
+steps:
+  - n: 1
+    why: 切日程分类
+    via: rid=categoryLayout,text=日程
+    expect: rid=busy_layout
+    in_page: true
+  - n: 2
+    why: 步骤2：修改起始日期，调起日期弹框
+    via: rid=start_layout
+    expect: rid=button_divider2
+    in_page: true
+  - n: 3
+    why: 修改结束日期
+    via: rid=end_layout
+    expect: rid=button_divider2
+    in_page: true
+  - n: 4
+    why: 确认结束日期
+    via: rid=right_button,text=确定
+    expect: rid=action_menu_view
+    in_page: true
+  - n: 5
+    why: 步骤3：保存事件
+    via: rid=save_view,text=完成
+    expect: activity=com.zui.calendar.AllInOneActivity
+  - n: 6
+    why: 步骤4：重新进入新建事件页
+    via: rid=action_add_all_event
+    expect: activity=com.zui.calendar.newbuild.NewBuildActivity
+  - n: 7
+    why: 切到倒数日分类找农历选项
+    via: text=倒数日
+    expect: rid=countDownLlDate
+    in_page: true
+  - n: 8
+    why: 看日期弹框里有没有农历切换
+    via: rid=countDownLlDate
+    expect: rid=button_divider2
+    in_page: true
+  - n: 9
+    why: 取消日期弹框
+    via: rid=left_button
+    expect: rid=action_menu_view
+    in_page: true
+  - n: 10
+    why: 切生日分类找农历选项
+    via: text=生日
+    expect: rid=birthdayEtNotes
+    in_page: true
+  - n: 11
+    why: 看生日日期弹框有没有农历选项
+    via: rid=birthdayLlDate
+    expect: rid=button_divider2
+    in_page: true
+  - n: 12
+    why: 确定农历日期
+    via: rid=right_button
+    expect: rid=action_menu_view
+    in_page: true
+  - n: 13
+    why: 保存农历生日
+    via: rid=save_view
+    expect: activity=com.zui.calendar.AllInOneActivity
+  - n: 14
+    why: 打开菜单进纵览
+    via: rid=iv_more
+    expect: rid=item_title
+    in_page: true
+  - n: 15
+    why: 进纵览页
+    via: text=纵览
+    expect: activity=com.zui.calendar.agenda.NewBuildList
+  - n: 16
+    why: 纵览切生日分类找 C19_LUNAR
+    via: text=生日
+    expect: rid=bottom_layout
+    in_page: true

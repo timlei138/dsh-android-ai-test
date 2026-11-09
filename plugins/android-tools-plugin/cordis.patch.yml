@@ -1,0 +1,7 @@
+- insert:
+    - id: android-tools
+      name: '@local/dsh-android-tools'
+      config:
+        # 工具层根目录（含 .venv / tools / assets / storage）。
+        # 留空时工具会在调用时报「未配置」，不会静默乱猜路径。
+        target: 'D:\dsh\android-ai-test'

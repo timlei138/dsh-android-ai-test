@@ -1,0 +1,34 @@
+__pycache__/
+.venv/
+*.pyc
+
+# ══════════════════════════════════════════════════════════════════════
+# storage/ 整个不进 git
+# ══════════════════════════════════════════════════════════════════════
+#
+# 用户原话：「storage 的数据不应该提交。只是本地运行的一些东西。」
+#
+# 里面是什么：
+#   record/<uuid>/    每次运行一个目录（db + evidence + calls + timing）
+#   tmp/              Agent 的临时文件（探针、一次性脚本、草稿）
+#
+# 为什么整个忽略而不逐项列：
+#   以前是逐项列的（evidence/、sessions.db*、.crash_seen_*、vision.json...），
+#   结果每加一类产物就要补一条，漏了就误提交。
+#   现在 storage/ 的语义很明确 —— 本地运行产物 —— 整目录忽略最省心。
+#
+# 该进 git 的东西都在 assets/ 和 knowledge/：
+#   assets/cases/<应用>/<编号>.md     原始用例（人写的）
+#   assets/cases/<应用>/<编号>.yaml   跑过之后生成的结构化用例（AI 读这个）
+#   knowledge/<包名>.md               知识卡
+#   knowledge/paths/<包名>.md         路径图
+storage/
+
+# vision 配置里有 api_key，绝对不能进 git（上面 storage/ 已覆盖，这里显式再写一遍）
+storage/vision.json
+
+# 临时备份 / 日志不进 git
+*.bak_before_fix
+*.bak
+webui.out.log
+webui.err.log

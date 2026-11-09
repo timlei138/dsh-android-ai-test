@@ -1,0 +1,46 @@
+# 自动导出：com.zui.calendar_删除课程_183 的可复用跳转步骤
+#
+# 只含「锚点明确 + 落点可验 + 非前置」的 tap。
+# 前置条件、造数据、判定都不在这里 —— 那些每次都不一样。
+#
+# 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
+# 注意：这是**上一次**的实测路径，不是唯一正确路径。
+case: com.zui.calendar_删除课程_183
+source_run: storage
+last_run: 2026-11-04T04:55:50.840
+verdict: PASS
+step_count: 7
+start_from: activity=com.zui.calendar.AllInOneActivity
+steps:
+  - n: 1
+    why: 进入课程表页周视图
+    via: text=课程表
+    expect: activity=com.zui.calendar.timetable.display.TimetableActivity
+  - n: 2
+    why: 重新打开导入课程表菜单
+    via: rid=action_curriculum_table_import
+    expect: rid=tv_import_from_camera
+    in_page: true
+  - n: 3
+    why: 再次选图库导入
+    via: rid=tv_import_from_gallery
+    expect: rid=alertTitle
+    in_page: true
+  - n: 4
+    why: 裁剪完成，触发识别
+    via: rid=btnDone
+    expect: rid=message
+    in_page: true
+  - n: 5
+    why: 退出识别结果页，回到已保存的课程表（步骤2要用已保存的课程表）
+    via: rid=btn_previous,text=上一步
+    expect: activity=com.zui.calendar.timetable.crop.CropImageActivity
+  - n: 6
+    why: 退回课程表周视图
+    via: rid=btnCancel,text=上一步
+    expect: activity=com.zui.calendar.timetable.display.TimetableActivity
+  - n: 7
+    why: 用例步骤3：点击底部「删除课程」
+    via: rid=btnDelete,text=删除课程
+    expect: rid=alertTitle
+    in_page: true
