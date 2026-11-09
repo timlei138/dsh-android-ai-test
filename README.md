@@ -11,6 +11,8 @@
 ```
 Share/
 ├── 安装说明.md          ← 入口文档，先读它
+├── scripts/             安装辅助脚本
+│   └── link-dsh-deps.ps1           给插件补 DSH 依赖链接（第 4 步 ③ 必跑）
 ├── toolkit/             工具层实体：Python 脚本 + 用例 + 知识卡 + Web UI
 ├── plugins/             两个 DSH 包
 │   ├── android-tools-plugin/       把工具层封装成原生 tool
