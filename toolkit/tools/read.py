@@ -9,6 +9,7 @@ from __future__ import annotations
 from runtime import execution
 
 import argparse
+import os
 from pathlib import Path
 
 from common import (apply_stdin_args, connect, emit, evidence_paths, fail, guard_terminated,
@@ -65,7 +66,8 @@ def main() -> None:
             _OCR_NEW = False
         except ImportError:
             fail("缺依赖：pip install rapidocr "
-                 "（或 pwsh -File scripts/setup.ps1 一键装）")
+                 + ("（或 pwsh -File scripts/setup.ps1 一键装）" if os.name == "nt"
+                    else "（或 bash toolkit/scripts/setup.sh 一键装）"))
 
     if args.image:
         img_path = Path(args.image)

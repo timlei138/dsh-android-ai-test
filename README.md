@@ -47,7 +47,7 @@ Share/
 | DSH | 0.2.1-rc.2+ |
 | Node.js | 20+ |
 | Python | 3.10+ |
-| 系统 | Windows + PowerShell（目前只验证过这个组合） |
+| 系统 | Windows + PowerShell 是主线；Linux / macOS 已实跑验证（`toolkit/scripts/setup.sh`） |
 | 设备 | Android **真机**，已开 USB 调试 |
 
 > ⚠️ **跑测试前请人工确认设备连接**（`adb devices` 要显示 `device`）。

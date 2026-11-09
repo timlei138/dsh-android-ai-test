@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import uuid
 from functools import wraps
@@ -71,6 +72,22 @@ def _resolve_storage_root() -> Path:
 
 STORAGE_DIR = _resolve_storage_root()
 
+
+def storage_root_source() -> str:
+    """storage/ 这次是按哪条规则定下来的。
+
+    env.py 和 require_writable_storage() 共用这一份判断，
+    免得两处各写一套、换机器之后说法不一致。
+    """
+    if (os.environ.get("ANDROID_TEST_STORAGE") or "").strip():
+        return "env:ANDROID_TEST_STORAGE"
+    try:
+        if ROOT.resolve().is_relative_to(Path.cwd().resolve()):
+            return "工具层在 cwd 之下 -> <target>/storage"
+    except (OSError, ValueError):
+        pass
+    return "工具层在 cwd 之外 -> cwd/storage"
+
 # ══════════════════════════════════════════════════════════════════════
 # 目录约定
 # ══════════════════════════════════════════════════════════════════════
@@ -119,11 +136,117 @@ TMP_DIR = STORAGE_DIR / "tmp"
 #     AI 会自己 `dir storage` 看有什么。如果 tmp/ 还没建，它会以为这个约定不存在，
 #     然后自己找个地方放临时文件（实测踩过：放到了 storage/ 根下）。
 #     目录先建出来，约定就是"看得见的"。
+_BOOT_MKDIR_ERRORS: list[tuple[str, str]] = []
 for _d in (RECORD_DIR, TMP_DIR):
     try:
         _d.mkdir(parents=True, exist_ok=True)
+    except OSError as _exc:
+        # 不在这里抛：read_file / kb_check 这类只读工具本来就不需要写。
+        # 但也不能装没看见 —— 原来 `except OSError: pass` 的结果是：
+        # 目录没建出来、工具照常启动，等到后面某个不相干的调用报一句
+        # `PermissionError: [Errno 13]`，人只能拿那句看不懂的话去怀疑设备 / App / 代码。
+        # 2026-11-09 实测就是这么绕了一大圈才找到根因。
+        _BOOT_MKDIR_ERRORS.append((str(_d), f"{type(_exc).__name__}: {_exc}"))
+        print(f"[tools] ⚠️ 产物目录建不出来：{_d} —— {_BOOT_MKDIR_ERRORS[-1][1]}",
+              file=sys.stderr)
+
+
+def probe_writable(dirpath: Path) -> str:
+    """实测这个目录写不写得进去：真写一个探针文件再删掉。
+    返回空串 = 可写；否则是失败原因。
+
+    ★ 为什么不用 os.access(dir, W_OK)：它查的是 DAC 权限位，
+      而沙箱（Linux Landlock / macOS Seatbelt）拦在更上面一层 ——
+      权限位显示 rwx、属主是自己，open(O_WRONLY) 照样 EACCES。
+      2026-11-09 实测：目录 xuyl:xuyl 775，`touch` 报 [Errno 13]。
+      只有真写一次才作数。
+    """
+    try:
+        probe = dirpath / ".write_probe"
+        probe.write_text("probe", encoding="utf-8")
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    try:
+        probe.unlink()
     except OSError:
         pass
+    return ""
+
+
+def writability_report() -> dict[str, str]:
+    """storage 和 assets 分开实测，两处都得测。
+
+    test.db 在 storage/，而 steps.yaml 和知识卡写回在 assets/。
+    两边不同挂载点 / 不同沙箱范围时会出现
+    「库写得进、资产悄悄写不回」的半瘫状态 —— 跑完看着一切正常，
+    下次还是得从头摸路。
+    """
+    out = {}
+    for name, d in (("storage", STORAGE_DIR), ("run_history", RECORD_DIR),
+                    ("tmp", TMP_DIR), ("knowledge", KNOWLEDGE_DIR),
+                    ("cases", CASES_DIR)):
+        if not d.is_dir():
+            # 没建出来才算失败；只是还没建就先建 —— 否则新装机器上
+            # "目录不存在" 会被当成写不进去，把人往错的方向带。
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                out[name] = f"建不出来 {type(exc).__name__}: {exc}"
+                continue
+        out[name] = probe_writable(d)
+    return out
+
+
+def storage_fix_hint(suggest=None) -> str:
+    """按当前平台给出「把 storage 指到别处」的那一行命令。
+
+    原来 env.py 只印 PowerShell 写法（`$env:X = "..."`），
+    在 bash 上照着敲就是 syntax error —— 报错了却给不出可执行的解法。
+    """
+    d = str(suggest or (Path.cwd() / "storage"))
+    if os.name == "nt":
+        return f'$env:ANDROID_TEST_STORAGE = "{d}"'
+    return f'export ANDROID_TEST_STORAGE="{d}"'
+
+
+def require_writable_storage(what: str) -> None:
+    """写命令进门先实测 storage，写不进去就地停下。
+
+    ★ 绝不"悄悄换个地方落库"（理由见 _resolve_storage_root 的注释：
+      那会让 AI 以为在用 A 库、实际写的是 B 库，比直接报错坏得多）。
+      这里只把一句看不懂的 Errno 13，换成人能照着做的几条选择。
+    """
+    report = writability_report()
+    hard = [k for k in ("storage", "run_history", "tmp") if report.get(k)]
+    # knowledge / cases 是软失败：只影响 steps.yaml 与知识卡写回，不拦命令
+    if not hard:
+        soft = [k for k in ("knowledge", "cases") if report.get(k)]
+        if soft:
+            print(f"[tools] ⚠️ storage 可写，但资产目录写不回（{', '.join(soft)}）："
+                  "steps.yaml / 知识卡会静默丢失", file=sys.stderr)
+        return
+    why = report.get("storage") or report.get("run_history") or report.get("tmp") or "?"
+    stuck = STORAGE_DIR if "storage" in hard else (
+        RECORD_DIR if "run_history" in hard else TMP_DIR)
+    print("\n".join([
+        "",
+        "✗ storage 写不进去 —— 拒绝开始（不会换个地方偷偷落库）",
+        f"  要做的操作  : {what}",
+        f"  卡住的目录  : {stuck}",
+        f"  失败原因    : {why}",
+        f"  按哪条规则  : {storage_root_source()}",
+        f"  工具层 ROOT : {ROOT}",
+        f"  当前 cwd    : {Path.cwd()}",
+        "",
+        "  照下面任一条改完，重跑同一条命令即可：",
+        "    ① 推荐：把工具层装进 harness 会话的工作区内，产物天然都在沙箱里",
+        f"    ② cwd 别停在工具层的子目录里（用例目录等）：cd {ROOT}",
+        f"    ③ 显式指到可写位置：{storage_fix_hint()}",
+        f"    ④ 若是 DSH 会话沙箱拦的：会话文件策略放宽到 workspace-write 及以上，"
+        f"且工作区要覆盖 {stuck.parent}",
+        "",
+    ]), file=sys.stderr)
+    raise SystemExit(75)
 
 CALL_ID = os.environ.get("ANDROID_TEST_CALL_ID") or uuid.uuid4().hex
 PROCESS_STARTED = time.perf_counter()

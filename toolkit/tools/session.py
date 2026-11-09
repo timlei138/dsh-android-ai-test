@@ -26,8 +26,13 @@ from db import (  # noqa: I001
 )
 from runtime import (
     CASES_DIR, KNOWLEDGE_DIR, PATHS_DIR, STORAGE_DIR, current_record_dir,
-    detect_shell, last_record_dir, new_record_dir, pin_record, unpin_record,
+    detect_shell, last_record_dir, new_record_dir, pin_record,
+    require_writable_storage, unpin_record,
 )
+
+# 只有这几条不写盘。其余一律进门先实测 storage 可写性 ——
+# 否则报错点会漂到后面某个不相干的调用上，根本看不出是 storage 的问题。
+_READ_ONLY_CMDS = frozenset({"list", "current", "kb-list"})
 
 # Windows 控制台默认 GBK，中文/特殊符号会炸 → 全部 CLI 输出强制 UTF-8
 try:
@@ -1131,6 +1136,9 @@ def main() -> None:
     sub.add_parser("abandon", help="放弃当前会话（不写结论，仅解绑）")
 
     args = p.parse_args()
+
+    if args.cmd not in _READ_ONLY_CMDS:
+        require_writable_storage(args.cmd)
 
     # ══════════════════════════════════════════════════════════════
     # ★ 先做参数校验，**再**建运行目录

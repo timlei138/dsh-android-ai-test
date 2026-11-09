@@ -254,6 +254,26 @@ foreach ($d in @('assets', 'assets\cases', 'assets\knowledge',
 }
 Write-Ok 'assets/ 与 storage/ 就绪'
 
+# ★ 建出来了 ≠ 写得进去。
+#   会话文件策略（read-only / workspace-write）拦的是**真写**：
+#   目录 Test-Path 得到、权限位 rwx、属主是自己，open(O_WRONLY) 照样 EACCES。
+#   2026-11-09 就是这一步"通过"之后，session.py start 只吐了一句
+#   PermissionError: [Errno 13]，排查绕了一大圈才定位到沙箱。
+foreach ($d in @('storage', 'assets\knowledge', 'assets\cases')) {
+    $probe = Join-Path (Join-Path $Root $d) '.write_probe'
+    try {
+        Set-Content -LiteralPath $probe -Value 'probe' -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Fail "$d 写不进去：$($_.Exception.Message)"
+        Write-Host "  工具层必须装在 harness 会话**可写工作区**之内（或放宽会话文件策略）。" -ForegroundColor Red
+        Write-Host "  当前根目录：$Root" -ForegroundColor Red
+        Write-Host "  否则装完也跑不了：开会话第一步就会撞 PermissionError: [Errno 13]。" -ForegroundColor Red
+        exit 1
+    }
+}
+Write-Ok 'storage / assets 实测可写（不是只看权限位）'
+
 # ------------------------------------------------------------------ 自检
 Write-Host ''
 Write-Host '--------------------------------------------' -ForegroundColor DarkCyan
@@ -265,9 +285,17 @@ foreach ($m in @('uiautomator2','rapidocr','yaml','PIL')) {
     $r = Invoke-Native $VenvPy @('-c',"import $m")
     if ($r.Ok) { Write-Ok $m } else { Write-Fail "$m 不可用"; $ok = $false }
 }
-foreach ($t in @('tools\session.py','tools\act.py','webui.py')) {
+foreach ($t in @('tools\session.py','tools\act.py','tools\doctor.py','webui.py')) {
     if (Test-Path -LiteralPath (Join-Path $Root $t)) { Write-Ok $t } else { Write-Fail "缺 $t"; $ok = $false }
 }
+
+# 统一自检：和 POSIX 那边跑的是同一个脚本（换机器 / 换会话策略之后重跑即可）
+Write-Info 'tools/doctor.py 自检（可写性 / 产物同树 / 依赖 / 设备 / 输入法 / 用例库）...'
+$r = Invoke-Native $VenvPy @((Join-Path $Root 'tools\doctor.py'))
+$r.Output | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+if ($r.ExitCode -eq 2)      { Write-Fail 'doctor.py 有硬失败：别开会话，先照 ✗ 项的 → 修'; $ok = $false }
+elseif ($r.ExitCode -eq 1)  { Write-Warn 'doctor.py 有警告项：能跑，但有些产物会拿不全（见 ! 项）' }
+else                        { Write-Ok 'doctor.py 全部通过' }
 
 # ------------------------------------------------------------------ 收尾
 Write-Host ''
