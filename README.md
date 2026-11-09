@@ -11,14 +11,21 @@
 ```
 Share/
 ├── 安装说明.md          ← 入口文档，先读它
-├── toolkit/             工具层：Python 脚本 + 用例 + 知识卡 + Web UI
+├── toolkit/             工具层实体：Python 脚本 + 用例 + 知识卡 + Web UI
 ├── plugins/             两个 DSH 包
 │   ├── android-tools-plugin/       把工具层封装成原生 tool
 │   └── android-auto-test-preset/   两个 Agent 角色定义
-└── skills/              两个 skill，都要装
-    ├── android-gui-test/    执行纪律（DSH 里显示为 android-ai-test-skills）
-    └── android-case-check/  用例够不够格跑（主 Agent 用）
+└── skills/              两个 skill，都要装（每个目录里只有一份 SKILL.md）
+    ├── android-gui-test/SKILL.md    执行纪律（DSH 里显示为 android-ai-test-skills）
+    └── android-case-check/SKILL.md  用例够不够格跑（主 Agent 用）
 ```
+
+**`toolkit/` 是唯一一份代码，`skills/` 只放纪律文档。** 两者不重复：
+
+| | 放什么 | 谁读它 |
+|---|---|---|
+| `toolkit/` | 全部可执行代码、用例、知识卡 | 机器跑（DSH 插件把 `android_*` 工具指向这里） |
+| `skills/<名字>/SKILL.md` | 只此一个文件 | AI 读（DSH 的 skill 机制只认 `<目录>/SKILL.md`） |
 
 ## 一句话说清它做什么
 
@@ -46,8 +53,9 @@ Share/
 
 ## 备注
 
-两个 `SKILL.md` 是这个机制的核心：`skills/android-gui-test/SKILL.md` 是执行子 Agent 的作业纪律，
+两个 `SKILL.md` 是这个机制的**作业纪律**，告诉 AI 怎么用 toolkit 里那套 `android_*` 工具：
+`skills/android-gui-test/SKILL.md` 是执行子 Agent 的作业纪律，
 `skills/android-case-check/SKILL.md` 是主 Agent 判断用例够不够格跑。
 改它们**不用重启 DSH**；改 `plugins/` 下的东西要重启（或热重载）。
 
-更细的文档在 `toolkit/docs/`：环境与工具 / 执行参考 / 知识卡与路径图。
+`toolkit/` 里的实现细节看 `toolkit/docs/`：环境与工具 / 执行参考 / 知识卡与路径图。
