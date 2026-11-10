@@ -8,7 +8,7 @@
 但有两个时刻它答不了：
 
   1. 安装期 —— 那时连 venv 都没有，`doctor.py` 跑不起来（它 import 第三方包）；
-  2. 有人 `cd` 走了 —— 我此刻的 cwd 就是 `/home/xuyl/Share/toolkit/assets/...`，
+  2. 有人 `cd` 走了 —— cwd 可能停在工具层任何子目录（实测有会话被切到 `assets/cases/...`），
      这时候 cwd 完全不代表工作区，判出来的规则也就不可信。
 
 所以环境事实要能**独立于 cwd** 拿到。实测 harness 导出的变量只有这些
@@ -22,9 +22,9 @@ WORK/CWD/SPACE 的名字）：
     $DSH_HOME/sessions/<工作区路径的 slug>/session-$DSH_SESSION_ID/
 
 slug 的规则是「`/` 和 `-` 都折成 `-`，两端再补 `-`」，实测
-`--home-xuyl-dsh-work--` == `/home/xuyl/dsh-work`。因为 `-` 被折叠了，
-反推**不唯一**（`home-xuyl-dsh-work` 既可能是 `/home/xuyl/dsh/work`
-也可能是 `/home/xuyl/dsh-work`）—— 本模块用「逐级 stat，只留在磁盘上真存在
+`--home-alice-work--` == `/home/alice/work`。因为 `-` 被折叠了，
+反推**不唯一**（`home-alice-my-work` 既可能是 `/home/alice/my/work`
+也可能是 `/home/alice/my-work`）—— 本模块用「逐级 stat，只留在磁盘上真存在
 的那条」来消歧，比猜规则可靠。
 
 用法

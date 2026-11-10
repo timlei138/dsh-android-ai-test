@@ -11,6 +11,13 @@ B 段：**技能卡不许出现被测 App 的专有内容**（包名 / 控件 id
 
 这条价值很高 —— 它抓过我两次（我在示例里写了「课程表」）。
 
+2026-11 增补 —— 用户原话：
+
+  「dir "D:\\Project\\deepseek\\android-ai-test-skills 这种不应该写死路径」
+
+→ 新增 C 段：不许写死个人机器路径 / 真用户名 / 真设备 serial；
+  位置一律 `<target>`（工具层根目录）、`<serial>` 占位。
+
 ## 删掉什么
 
 A 段：原来检查"文档提到的字段/机制，代码里真的有"。
@@ -100,6 +107,27 @@ ck("提到 android-executor", "android-executor" in all_text,
    "派发目标写错的话 subagent 会被 allowedAgentPresets 拒绝")
 ck("不再提 android-worker（已废弃）",
    "android-worker" not in all_text)
+
+print()
+print("=" * 78)
+print("C) 不含写死的个人机器路径 / 真用户名 / 真设备 serial")
+print("=" * 78)
+
+PATH_PATTERNS = [
+    (r"D:\\Project", "写死的作者机器路径 D:\\Project\\…"),
+    (r"D:\\dsh\\", "写死的作者机器路径 D:\\dsh\\…"),
+    (r"/home/xuyl", "写死的部署机路径 /home/xuyl/…"),
+    (r"[Ll]eichao4|[Zz]hukl2", "真实用户名"),
+    # 设备 serial 是 8 位小写 hex；边界排除 UUID 段（前后带 -）
+    (r"(?<![0-9a-fA-F-])[0-9a-f]{8}(?![0-9a-fA-F-])", "疑似真设备 serial（该用 <serial> 占位）"),
+]
+for pat, label in PATH_PATTERNS:
+    hits = []
+    for p, txt in docs_text.items():
+        for i, ln in enumerate(txt.splitlines(), 1):
+            if re.search(pat, ln):
+                hits.append(f"{p.name}:{i} {ln.strip()[:60]}")
+    ck(f"没有「{label}」", not hits, str(hits[:3]))
 
 print()
 print("=" * 78)

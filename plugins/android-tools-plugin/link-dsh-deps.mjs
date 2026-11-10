@@ -18,8 +18,8 @@
  * dsh-app-boot 的注释（lib/index.js 约 498 行）写得很清楚 ——
  * "The runtime resolution supplies packages carried by the installation and
  *  selected bundles to Node's ESM and CommonJS resolvers"。
- * 插件目录 `/home/xuyl/Share/plugin/android-tools-plugin` 向上找，够不到
- * `/home/xuyl/.nvm/.../dsh/node_modules`，于是报：
+ * 插件目录（装在工作区或随便哪）向上找，够不到 DSH 安装目录里的
+ * `node_modules`，于是报：
  *
  *     Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/schemastery'
  *     imported from .../android-tools-plugin/lib/index.js

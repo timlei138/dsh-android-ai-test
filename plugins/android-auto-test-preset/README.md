@@ -1,6 +1,6 @@
 # Android 自动化测试 preset（2026-10-27）
 
-> **为什么重建**：旧方案（`D:\dsh\android-runner-preset`）给子 Agent 只挂
+> **为什么重建**：旧方案（`android-runner-preset`，历史参考）给子 Agent 只挂
 > `android_case` 一个工具，然后用 18851 行 Python 补回被剥夺的能力。
 > 实测两周后结论：**那 18851 行大部分在防 AI 出错，而 AI 本来不会犯那些错。**
 >
@@ -77,12 +77,12 @@ shell 里跑 python **不等于**能改源码 —— 后者会让它在跑不通
 ## 部署
 
 ```powershell
-# 1. 同步到 DSH 真实加载位置
-Copy-Item D:\dsh\android-auto-test\preset\cordis.patch.yml `
-          D:\dsh\android-auto-test-preset\cordis.patch.yml
+# 1. 同步到 DSH 真实加载位置（<包根> = 本仓库根目录）
+Copy-Item <包根>\plugins\android-auto-test-preset\preset\cordis.patch.yml `
+          <plugins目录>\android-auto-test-preset\cordis.patch.yml
 
 # 2. 在 profile 的 package.json 里挂上这个 bundle
-#    D:\Users\leichao4\.dsh\profiles\web\package.json
+#    ~/.dsh/profiles/<profile>/package.json（Windows: C:\Users\<你>\.dsh\profiles\...）
 #    "dsh": { "profile": { "bundles": [ ..., "@local/dsh-android-auto-test-preset" ] } }
 
 # 3. 重启 DSH（preset 是启动时加载的）
@@ -103,7 +103,6 @@ Copy-Item D:\dsh\android-auto-test\preset\cordis.patch.yml `
 
 ## 相关文件
 
-- 工具层与 SKILL：`D:\Project\deepseek\android-ai-test-skills`
-- 旧方案（保留参考）：`D:\dsh\langgraph-poc`、`D:\dsh\android-runner-preset`
-- 用例原文：`D:\dsh\langgraph-poc\assets\cases\联想日历\_cases.json`
-- 知识卡与路径图：`D:\dsh\langgraph-poc\assets\knowledge\`
+- 工具层与 SKILL：本包 `toolkit/` 与 `skills/`
+- 旧方案（历史参考，不随包）：`langgraph-poc`、`android-runner-preset`
+- 用例原文 / 知识卡与路径图：本包 `toolkit/assets/cases/`、`toolkit/assets/knowledge/`

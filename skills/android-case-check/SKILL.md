@@ -126,8 +126,10 @@ adb shell settings put system user_rotation 1             # 横屏（0 为竖屏
 
 ### 用例文件在哪（直接读文件，**不要查数据库**）
 
+全文的 `<target>` = 工具层根目录（`android_env()` 报出）；`<serial>` = 设备序列号。
+
 ```
-D:\Project\deepseek\android-ai-test-skills\assets\cases\<应用包名>\
+<target>\assets\cases\<应用包名>\
     <应用包名>_<功能>_<编号>.md          ← 原始用例（人写的）
     <同名>_steps.yaml                    ← 跑过之后沉淀的跳转步骤（有就比 .md 更准）
 ```
@@ -149,7 +151,7 @@ dir "<target>\assets\cases\<包名>"
 **本机不一定是 Linux。** 第一条命令先跑这个：
 
 ```
-python D:\Project\deepseek\android-ai-test-skills\tools\env.py
+python "<target>\tools\env.py"
 ```
 
 它告诉你 `shell` 是 bash 还是 powershell。**只看一次，整个会话都按那个来。**
@@ -157,7 +159,7 @@ python D:\Project\deepseek\android-ai-test-skills\tools\env.py
 实测踩过：问「有多少 case」，第一条就发
 
 ```
-ls -1 "D:/Project/deepseek/android-ai-test-skills/assets/cases"
+ls -1 "<target>/assets/cases"
 ```
 
 **Windows PowerShell 的 `ls` 不认 `-1`，直接 exit 1。**
@@ -165,7 +167,7 @@ ls -1 "D:/Project/deepseek/android-ai-test-skills/assets/cases"
 如果是 powershell，改成：
 
 ```
-dir "D:\Project\deepseek\android-ai-test-skills\assets\cases"
+dir "<target>\assets\cases"
 ```
 
 > 但 `adb shell "..."` 里的内容永远是 Android 的 Linux，不用改。
@@ -203,9 +205,9 @@ subagent(
 
 ```
 1. 用例原文（原样贴，一个字都不改）
-2. 设备 serial：51e8bf1c
+2. 设备 serial：<serial>
 3. 被测包名
-4. 工具层路径：D:\Project\deepseek\android-ai-test-skills
+4. 工具层路径：<target>
 5. 你的提醒（如果有）：比如"第3条预期含两件事，逐件核对"
 ```
 

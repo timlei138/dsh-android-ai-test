@@ -97,7 +97,7 @@ if (config.toolFilter !== void 0 && config.toolFilter.allow === void 0
 
 ## 三、建议的配置片段
 
-写进 `C:\Users\leichao4\.dsh\profiles\web\cordis.patch.yml`
+写进 `C:\Users\<你>\.dsh\profiles\web\cordis.patch.yml`
 （该文件当前是空的 `[]`，属"从零新增"而非"改别人的"）。
 
 ```yaml

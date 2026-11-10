@@ -18,7 +18,7 @@
 #    写死 requires_python="<3.13"。那个包已经改名成 `rapidocr`（3.x），
 #    原生支持 3.13 —— 所以上限取消了。
 #
-#    D:\dsh\langgraph-poc 验证过的组合：
+#    旧项目 langgraph-poc 验证过的组合：
 #        Python 3.13.3 + rapidocr 3.10.0 + onnxruntime 1.31.0 + pillow 13
 #
 #    教训：那种"卡在某个小版本"的限制，通常是某个依赖停更/改名的副作用。

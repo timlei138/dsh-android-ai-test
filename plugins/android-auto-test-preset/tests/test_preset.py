@@ -18,12 +18,15 @@ preset 的配置错误**不会"少个工具"，而是整个 preset 加载不出�
 ## 检查什么
 
   1. YAML 能解析
-  2. 每个插件的 name 在 DSH 里真实存在
+  2. 每个插件的 name 在 DSH 里真实存在（DSH 目录自动探测：DSH_PACKAGES_DIR
+     环境变量 > npm root -g；找不到则第 1/2 段 SKIP，不算失败）
   3. 每个插件的 Config schema 里**必填**的字段都给了
   4. agentPreset / allowedAgentPresets 引用的 id 在本文件里存在
   5. 几个关键能力开关（executor 有 bash 无 subagent；双方 write/edit 关）
 """
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,11 +35,36 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 PRESET = ROOT / "preset" / "cordis.patch.yml"
 
-# DSH 的插件安装目录
-DSH = Path(
-    r"C:\Users\leichao4\AppData\Local\Volta\tools\image\packages"
-    r"\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh\node_modules"
-    r"\@deepseek-ai")
+def _dsh_packages_dir() -> "Path | None":
+    """探测 DSH 的 @deepseek-ai 插件目录 —— 不写死任何一台机器的路径。
+
+    顺序：DSH_PACKAGES_DIR 环境变量 > `npm root -g` 下的候选布局。
+    找不到返回 None：依赖它的检查段整体 SKIP，不算失败。
+    """
+    env = os.environ.get("DSH_PACKAGES_DIR", "").strip()
+    if env and Path(env).is_dir():
+        return Path(env)
+    try:
+        r = subprocess.run(["npm", "root", "-g"], capture_output=True,
+                           text=True, timeout=15, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        r = ""
+    if r:
+        root = Path(r)
+        for cand in (
+            # Volta（Windows）：dsh 包内还嵌一层同名 node_modules
+            root / "@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai",
+            # 常规：dsh 包内嵌的 node_modules（Linux/npm 布局实测在这）
+            root / "@deepseek-ai/dsh/node_modules/@deepseek-ai",
+            # 顶层
+            root / "@deepseek-ai",
+        ):
+            if cand.is_dir():
+                return cand
+    return None
+
+
+DSH = _dsh_packages_dir()
 
 ok = 0
 bad = 0
@@ -84,7 +112,10 @@ for cfg in presets.values():
                 if sn.startswith("@deepseek-ai/"):
                     names.add(sn)
 
-for n in sorted(names):
+if DSH is None:
+    print("  [SKIP] 找不到 DSH 插件目录（DSH_PACKAGES_DIR / `npm root -g` 均无）"
+          " —— 第 1、2 段跳过")
+for n in sorted(names) if DSH is not None else []:
     short = n.replace("@deepseek-ai/", "")
     ck(f"{short}", (DSH / short).is_dir())
 
@@ -92,7 +123,7 @@ print()
 print("=" * 74)
 print("2) 必填 config 字段都给了")
 print("=" * 74)
-for n in sorted(names):
+for n in sorted(names) if DSH is not None else []:
     short = n.replace("@deepseek-ai/", "")
     pkg = DSH / short
     js = None

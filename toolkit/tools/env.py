@@ -8,7 +8,7 @@
 所以拿不到那个字段 —— 于是它继续按 Linux 习惯敲 `ls -1`。
 
 实测：主 Agent 问"有多少 case"，第一条命令就是
-    ls -1 "D:/Project/deepseek/android-ai-test-skills/assets/cases"
+    ls -1 "<target>/assets/cases"
 在 Windows PowerShell 上 `ls` 不认 `-1`，直接 exit 1。
 
 ## 用法
@@ -279,7 +279,7 @@ def main() -> None:
     #
     # ⚠️ 不能用 Path(__file__).resolve() —— 它会**解开 junction**：
     #   skill 装在 ~/.agents/skills/android-ai-test-skills，
-    #   是个指向源码 D:\Project\...\android-ai-test-skills 的链接。
+    #   是个指向源码树的链接（junction/symlink）。
     #   resolve() 之后报的是源码路径，而 AI 该用的是工作区那份
     #   （有 .venv、有 storage）。所以优先用工作区根目录。
     here = Path(__file__).parent          # 不 resolve，保留 junction 路径

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """跑本工作区的全部测试。
 
-用法（在 D:\\dsh\\android-auto-test 下）：
+用法（在 preset 包根目录下）：
 
     .\\run_tests.ps1
 
@@ -21,7 +21,7 @@
   · skill 里不许出现被测 App 的专有名词
 
 不测：
-  · 工具层（D:\\Project\\deepseek\\android-ai-test-skills）——
+  · 工具层（toolkit/）——
     它自己有 71 个测试，那些测试跟本工作区无关，不在这里跑。
   · preset 的 YAML —— 用 `verify_preset.py` 单独验证（它要读 DSH 的插件目录）。
 """
