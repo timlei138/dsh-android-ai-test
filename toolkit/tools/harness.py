@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -85,8 +86,22 @@ def deslug(slug: str, *, exists=_isdir, home: str | None = None) -> list[str]:
         #    （home/xuyl/dsh-work），stat 拿 cwd 拼出来的当然是另一回事，
         #    结果就是"明明存在却找不到对应目录"。
         if absolute:
-            return "/" + acc
-        return os.path.join(home or ".", acc)
+            p = "/" + acc
+        else:
+            p = os.path.join(home or ".", acc)
+        # Windows 盘符还原。会话目录名把 `D:\dsh` 折成 `--D-dsh--`（`:` `\` `-`
+        # 都是非字母数字，一律归一成 `-`），反推出来的候选于是长成 `/D/dsh` ——
+        # 这个路径在 Windows 上永远 stat 不到，deslug() 就永远返回 []，
+        # workspace() 永远退到 cwd 兜底（confidence=low），doctor / env 一直报
+        # 「工作区判定不准」。这里把 `/D/rest` 还原成盘符路径。
+        if os.name == "nt":
+            m = re.match(r"^[\\/]?([A-Za-z])[\\/](.+)$", p)
+            if m:
+                return m.group(1).upper() + ":" + os.sep + m.group(2).replace("/", os.sep)
+            m = re.match(r"^[\\/]?([A-Za-z])$", p)
+            if m:
+                return m.group(1).upper() + ":" + os.sep
+        return p
 
     def walk(i: int, acc: str, slashes: int) -> None:
         if i == len(parts):
