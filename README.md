@@ -12,7 +12,6 @@
 <包根>/
 ├── 安装说明.md          ← 入口文档，先读它
 ├── README.md            ← 本文
-├── Linux安装记录.md     ← 历史踩坑记录（随包走，不影响安装）
 ├── install.py           ← 唯一安装入口（./install.py --help）
 ├── scripts/             安装辅助脚本
 │   └── link-dsh-deps.ps1           Windows 版补依赖链接（第 4 步 ③ 必跑）

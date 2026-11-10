@@ -43,8 +43,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 IS_WIN = os.name == "nt"
 DEFAULT_NAME = "dsh-ai-auto-test"
-DOC_FILES = ("安装说明.md", "README.md", "install.py",
-             "Linux安装记录.md")   # 末项是历史踩坑记录，缺了不影响跑，但别丢
+DOC_FILES = ("安装说明.md", "README.md", "install.py")
 TOOLKIT_SKIP = {".venv", "storage", "__pycache__", ".git", "node_modules",
                 "webui", "docs"}          # webui/docs 是源码树里的附属，装机不需要
 TOP_DIRS = ("plugins", "skills", "scripts")
