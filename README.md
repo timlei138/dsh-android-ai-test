@@ -22,8 +22,8 @@
 │   │   └── lib/index.js
 │   └── android-auto-test-preset/   两个 Agent 角色定义
 └── skills/              三个 skill（前两个必装，第三个可选）
-    ├── android-gui-test/SKILL.md    执行纪律（DSH 里显示为 android-ai-test-skills）
-    ├── android-case-check/SKILL.md  用例够不够格跑（主 Agent 用）
+    ├── android-ai-test-skills/SKILL.md 执行纪律（执行子 Agent 用）
+    ├── android-case-check/SKILL.md     用例够不够格跑（主 Agent 用）
     └── lenovo-tbjira-skills/        内网 JIRA 查单/改单，跟测试机制无关
 ```
 
@@ -72,7 +72,7 @@ dependency，`pnpm install` 对它们无事可做）；preset 不 import 任何�
 ## 备注
 
 两个 `SKILL.md` 是这个机制的**作业纪律**，告诉 AI 怎么用 toolkit 里那套 `android_*` 工具：
-`skills/android-gui-test/SKILL.md` 是执行子 Agent 的作业纪律，
+`skills/android-ai-test-skills/SKILL.md` 是执行子 Agent 的作业纪律，
 `skills/android-case-check/SKILL.md` 是主 Agent 判断用例够不够格跑。
 改它们**不用重启 DSH**；改 `plugins/` 下的东西要重启（或热重载）。
 

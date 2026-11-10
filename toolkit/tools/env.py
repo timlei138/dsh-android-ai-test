@@ -278,7 +278,7 @@ def main() -> None:
     # 工具在哪、怎么开会话都直接印出来，省掉 AI 自己探路的那几步。
     #
     # ⚠️ 不能用 Path(__file__).resolve() —— 它会**解开 junction**：
-    #   skill 装在 ~/.agents/skills/android-gui-test，
+    #   skill 装在 ~/.agents/skills/android-ai-test-skills，
     #   是个指向源码 D:\Project\...\android-ai-test-skills 的链接。
     #   resolve() 之后报的是源码路径，而 AI 该用的是工作区那份
     #   （有 .venv、有 storage）。所以优先用工作区根目录。
