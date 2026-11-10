@@ -138,7 +138,7 @@ D:\Project\deepseek\android-ai-test-skills\assets\cases\<应用包名>\
 列出某应用全部用例，一条命令：
 
 ```powershell
-dir "D:\Project\deepseek\android-ai-test-skills\assets\cases\com.zui.calendar"
+dir "<target>\assets\cases\<包名>"
 ```
 
 **不要查 `sessions.db`** —— 那是运行记录，不是用例库。
@@ -177,7 +177,7 @@ dir "D:\Project\deepseek\android-ai-test-skills\assets\cases"
 → 就用这段（**它比文件里的新**，用户可能刚改过）
 
 用户：「跑 176」（没贴，但文件里有）
-→ 读 assets/cases/<应用>/com.zui.calendar_176.{yaml,md}
+→ 读 assets/cases/<包名>/<包名>_<模块>_176.{yaml,md}
 
 用户：「跑 176」（文件里也没有）
 → 问："176 的步骤和预期是什么？"
