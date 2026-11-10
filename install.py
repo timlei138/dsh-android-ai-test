@@ -237,7 +237,7 @@ def make_venv(to: Path, reuse: str | None, setup_args: list[str]) -> None:
         return
     if dst_venv.exists():
         die(f"{dst_venv} 已存在。要重建请先删掉它，或加 --recreate 转给 setup（"
-            f"手工：cd {to / 'toolkit'} && bash toolkit/scripts/setup.sh --recreate）")
+            f"手工：cd {to / 'toolkit'} && bash scripts/setup.sh --recreate）")
     script = to / "toolkit" / "scripts" / ("setup.ps1" if IS_WIN else "setup.sh")
     if not script.is_file():
         die(f"没有 {script} —— 源不完整，检查一下 --from")
