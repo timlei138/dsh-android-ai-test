@@ -34,5 +34,7 @@ desktop.ini
 *.bak
 *.bak_before_fix
 
-# ── 只属于某台机器的 skill（里面有 jira_config.json：内网地址/凭据）──
-skills/lenovo-tbjira-skills/
+# ── lenovo-tbjira-skills：代码随包走，凭据永远不随包走 ──────────────
+# 这个 skill 连的是内网 JIRA，jira_config.json 里是明文密码，
+# 每台机器自己 `python jira.py setup` 生成；仓库里只有 jira_config.example.json。
+jira_config.json

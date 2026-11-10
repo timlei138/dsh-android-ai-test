@@ -1,0 +1,2 @@
+# 只需要 requests；urllib3 随 requests 一起装。
+requests>=2.31

@@ -42,10 +42,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 IS_WIN = os.name == "nt"
 DEFAULT_NAME = "dsh-ai-auto-test"
-DOC_FILES = ("安装说明.md", "README.md", "分享介绍.html", "install.py")
+DOC_FILES = ("安装说明.md", "README.md", "分享介绍.html", "install.py",
+             "Linux安装记录.md")   # 末项是历史踩坑记录，缺了不影响跑，但别丢
 TOOLKIT_SKIP = {".venv", "storage", "__pycache__", ".git", "node_modules",
                 "webui", "docs"}          # webui/docs 是源码树里的附属，装机不需要
 TOP_DIRS = ("plugins", "skills", "scripts")
+# copy_tree 的 skip 按**文件名**匹配、且对整棵子树生效，所以加在这里 = 装机的任何角落都不会
+# 把别人的 JIRA 明文密码拷进新层（skill 自带 jira_config.example.json 作模板）。
+PERSONAL_CFG = "jira_config.json"
 
 if not IS_WIN and sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
     try:
@@ -140,13 +144,19 @@ def copy_tree(src: Path, dst: Path, skip: set[str]) -> int:
 def lay_code(from_root: Path, to: Path) -> None:
     say("1/4 铺代码（不带 .venv / storage —— 前者跨路径即废，后者是你的历史）")
     (to / "toolkit").mkdir(parents=True, exist_ok=True)
-    copy_tree(from_root / "toolkit", to / "toolkit", TOOLKIT_SKIP)
+    copy_tree(from_root / "toolkit", to / "toolkit", TOOLKIT_SKIP | {PERSONAL_CFG})
     for d in TOP_DIRS:
         if (from_root / d).is_dir():
-            copy_tree(from_root / d, to / d, {"node_modules", ".git", "__pycache__"})
+            copy_tree(from_root / d, to / d, {"node_modules", ".git", "__pycache__", PERSONAL_CFG})
+    copied, missing = [], []
     for f in DOC_FILES:
         if (from_root / f).is_file():
             shutil.copy2(from_root / f, to / f)
+            copied.append(f)
+        else:
+            missing.append(f)
+    if missing:                       # 静默少一份文档，正是「Share 那份比仓新」这类事故的形状
+        warn("文档没拷全：源里缺 " + " / ".join(missing) + f"（已带 {len(copied)} 份）")
     for sub in ("run_history", "tmp"):
         (to / "toolkit" / "storage" / sub).mkdir(parents=True, exist_ok=True)
     if not (to / "toolkit" / "assets" / "cases").is_dir():

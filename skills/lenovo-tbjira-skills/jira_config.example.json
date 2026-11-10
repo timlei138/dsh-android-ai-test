@@ -1,0 +1,7 @@
+{
+  "_说明": "复制成 jira_config.json 后填自己的；jira_config.json 已在 .gitignore 里，不会被提交。也可以完全不落盘，改用环境变量 JIRA_ITCODE / JIRA_PASSWORD。",
+  "itcode": "someone01",
+  "password": "明文密码",
+  "jira_base": "https://tbjira.lenovo.com/issue/rest/api/2",
+  "project_key": "AGENTPILOT"
+}
