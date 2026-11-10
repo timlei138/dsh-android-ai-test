@@ -214,23 +214,6 @@ adb shell "dumpsys notification --noredact | grep -c 'pkg=<包名>'"
 判据：改完再触发一次，**通知栏有没有这条通知** —— 有就是有，没有就是没有。
 不要在 ② 上做静音，然后把「通知照旧出现」判成「没有通知」。
 
-## 会话收尾：冒烟/探针会话要作废，就必须先 abandon 再 finish
-
-`session.py abandon` 撞到**已有结论**的会话时不覆盖判定，只解绑指针，返回
-`「会话 #N 已是结论态（BLOCKED），abandon 不覆盖已写的结论」` —— 这是故意的
-（`session.py:1619`，保护人手写过的结论）。后果：**先 finish 再 abandon 的冒烟
-会话会永久留在 PASS/FAIL/BLOCKED 桶里，污染用例通过率。**
-
-正确顺序（自检、搬家验证、脚本冒烟这类「不是用例」的会话）：
-
-```bash
-./.venv/bin/python tools/session.py abandon --id N --reason "作废：为什么不算用例"
-# ↑ 会话还在 running 时直接 abandon，一步落 ERROR 桶，不需要也不该先 finish
-```
-
-反过来说：**finish 是终点站，写下去就改不回 ERROR**。所以拿不准这条会话算不算
-真实用例时，先别 finish，直接 abandon 加一句原因。
-
 ## 验证要点
 
 - 点击后弹窗应消失，界面回到原应用

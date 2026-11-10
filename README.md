@@ -12,15 +12,25 @@
 Share/
 ├── 安装说明.md          ← 入口文档，先读它
 ├── scripts/             安装辅助脚本
-│   └── link-dsh-deps.ps1           给插件补 DSH 依赖链接（第 4 步 ③ 必跑）
+│   └── link-dsh-deps.ps1           Windows 版补依赖链接（第 4 步 ③ 必跑）
 ├── toolkit/             工具层实体：Python 脚本 + 用例 + 知识卡 + Web UI
 ├── plugins/             两个 DSH 包
 │   ├── android-tools-plugin/       把工具层封装成原生 tool
+│   │   ├── link-dsh-deps.mjs       ← 跨平台版补依赖链接（Linux/mac 用这个）
+│   │   └── lib/index.js
 │   └── android-auto-test-preset/   两个 Agent 角色定义
-└── skills/              两个 skill，都要装（每个目录里只有一份 SKILL.md）
+└── skills/              三个 skill（前两个必装，第三个可选）
     ├── android-gui-test/SKILL.md    执行纪律（DSH 里显示为 android-ai-test-skills）
-    └── android-case-check/SKILL.md  用例够不够格跑（主 Agent 用）
+    ├── android-case-check/SKILL.md  用例够不够格跑（主 Agent 用）
+    └── lenovo-tbjira-skills/        内网 JIRA 查单/改单，跟测试机制无关
 ```
+
+**`link-dsh-deps.ps1` 和 `link-dsh-deps.mjs` 是两个不同的东西**，别当成一个的两种写法：
+`.ps1` 在顶层 `scripts/`、Windows 专用、能自动定位 profile 目录；`.mjs` 在**插件包自己
+目录里**、跨平台、在哪个插件目录下跑就给那个插件建链接。只有
+`android-tools-plugin` 需要补链接（它 import `@deepseek-ai/dsh-tools` +
+`schemastery`，而这两个包没发布到 npm，插件 `package.json` 里也**不声明**任何
+dependency，`pnpm install` 对它们无事可做）；preset 不 import 任何外部包，不用跑。
 
 **`toolkit/` 是唯一一份代码，`skills/` 只放纪律文档。** 两者不重复：
 
@@ -28,6 +38,10 @@ Share/
 |---|---|---|
 | `toolkit/` | 全部可执行代码、用例、知识卡 | 机器跑（DSH 插件把 `android_*` 工具指向这里） |
 | `skills/<名字>/SKILL.md` | 只此一个文件 | AI 读（DSH 的 skill 机制只认 `<目录>/SKILL.md`） |
+
+> 唯一例外是 `lenovo-tbjira-skills/`：它带 `jira.py` + `lib/` + `tests/` 一整套代码，
+> 因为那个 skill 本身要执行脚本。凭据 `jira_config.json` 在 `.gitignore` 里，
+> **永不入包**；每台机器自己 `python3 jira.py setup` 生成一次。
 
 ## 一句话说清它做什么
 

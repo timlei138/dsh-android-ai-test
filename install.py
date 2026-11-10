@@ -300,7 +300,7 @@ def wire(to: Path) -> None:
     # 实测 DSH_PROFILE = "web"（**是个名字不是路径**），DSH_PROFILE_DIR 才带目录；
     # 之前直接 Path(os.environ["DSH_PROFILE"]) 会拼出相对路径 web/package.json 找不到。
     prof = None
-    for env_key in ("DSH_PROFILE_DIR", "DSH_WORKSPACE"):
+    for env_key in ("DSH_PROFILE_DIR",):   # 只有这个是路径；DSH_PROFILE 是名字（"web"）
         v = (os.environ.get(env_key) or "").strip()
         if v and (Path(v) / "package.json").is_file():
             prof = Path(v)
@@ -318,9 +318,65 @@ def wire(to: Path) -> None:
               f'"link:{to / "plugins" / "android-auto-test-preset"}"')
     else:
         warn(f"找不到 profile 的 package.json：{pj}（用 DSH_PROFILE 指一下）")
-    warn(f"然后：cd {to / 'plugins' / 'android-tools-plugin'} && node link-dsh-deps.mjs "
-         "（漏了插件根本起不来）；再重启 harness —— target 是进程起来时读一次的")
+    link_dsh_deps(to)
+    warn("最后一步只能你自己做：**重启 harness** —— config.target 是进程起来时读一次的，"
+         "改完不重启，插件还指着旧层，产物会静默分家（本项目踩过两次）")
     warn("验证生效：重开会话看 android_env() 的 tool_root 是不是新路径")
+
+
+# ── 5 给插件补 DSH 依赖链接 ────────────────────────────────────────────────
+TOOLS_PLUGIN = "plugins/android-tools-plugin"
+LINKER = "link-dsh-deps.mjs"
+NEEDED_PKGS = ("@deepseek-ai/schemastery", "@deepseek-ai/dsh-tools")
+
+
+def link_dsh_deps(to: Path) -> None:
+    """跑插件自带的 link-dsh-deps.mjs，把 @deepseek-ai/* 软链到 dsh 安装目录。
+
+    为什么必须补：`@deepseek-ai/schemastery` / `dsh-tools` **没发布到 npm**，
+    插件 package.json 里也根本不声明 dependencies（实测只有 name/main/private），
+    所以 pnpm install 对它们无事可做。缺链接的后果不是报错而是静默失效：
+    harness 日志里一句 `did not activate`，插件压根没加载。
+    只有 android-tools-plugin 需要 —— preset 不 import 任何外部包（实测 grep 为空）。
+    """
+    if os.environ.get("ANDROID_TEST_NO_LINK"):
+        warn("ANDROID_TEST_NO_LINK 已设 —— 跳过插件依赖链接，"
+             f"需要时手跑：cd {to / TOOLS_PLUGIN} && node {LINKER}")
+        return
+    plug = to / TOOLS_PLUGIN
+    script = plug / LINKER
+    if not plug.is_dir():
+        return                       # 插件没铺过去（非 --wire 场景），前面已 warn
+    if not script.is_file():
+        warn(f"缺 {TOOLS_PLUGIN}/{LINKER} —— 插件补不了依赖链接，"
+             "harness 会报 Cannot find package '@deepseek-ai/schemastery'")
+        return
+    nm = plug / "node_modules"
+    missing = [pkg for pkg in NEEDED_PKGS if not (nm / pkg / "package.json").is_file()]
+    if not missing:
+        ok(f"{TOOLS_PLUGIN} 的 DSH 依赖已链接（{len(NEEDED_PKGS)} 个包），跳过")
+        return
+    node = shutil.which("node")
+    if not node:
+        warn(f"PATH 里没有 node，补不了插件依赖链接。装好 node 后手跑："
+             f"cd {plug} && node {LINKER}")
+        return
+    say(f"5/5 补插件依赖链接（缺 {'、'.join(missing)}）")
+    try:
+        r = subprocess.run([node, script.name], cwd=str(plug))
+    except OSError as e:
+        warn(f"跑 {LINKER} 失败：{e}。手跑：cd {plug} && node {LINKER}")
+        return
+    if r.returncode != 0:
+        warn(f"{LINKER} 退出码 {r.returncode}。"
+             f"若它说找不到 dsh 安装目录：cd {plug} && node {LINKER} "
+             f"--dsh <dsh 的 node_modules>（npm i -g 的包在 "
+             f"$(npm root -g)/@deepseek-ai/dsh/node_modules）")
+    still = [pkg for pkg in NEEDED_PKGS if not (nm / pkg / "package.json").is_file()]
+    if still:
+        warn("这几个包还是没链上：" + "、".join(still) + f" —— 插件起不来，先手工补齐")
+    else:
+        ok("插件依赖已链接（node_modules/@deepseek-ai/* 可达）")
 
 
 # ── 主流程 ──────────────────────────────────────────────────────────────────
@@ -328,7 +384,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(add_help=True, description="第一次安装：装进会话工作区")
     ap.add_argument("--to", default=None, help=f"落点，默认 <cwd>/{DEFAULT_NAME}")
     ap.add_argument("--from", dest="frm", default=None, help="源（仓库或 Share 包根），默认脚本所在目录")
-    ap.add_argument("--wire", action="store_true", help="改新层里 3 处 config.target")
+    ap.add_argument("--wire", action="store_true", help="改新层里 3 处 config.target + 补插件的 DSH 依赖链接")
     ap.add_argument("--reuse-venv", default=None, metavar="VENV", help="离线：从已有 POSIX venv 拷包")
     ap.add_argument("--check", action="store_true", help="只判定落点/工作区/可写性，不写任何东西")
     ap.add_argument("--setup-args", nargs="*", default=None,

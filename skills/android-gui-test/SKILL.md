@@ -606,6 +606,15 @@ android_vision(image="<上一次 act/observe 返回的 evidence.png>",
 > 工具只检查「已记录断言之间是否自相矛盾、证据引用了没有」，
 > **不保证用例的所有预期都被覆盖** —— 逐条实际验证仍是你的事。
 
+**冒烟 / 探针会话别用 `finish` 收尾，直接 `abandon`。** `finish` 写进去就是结论，
+而 `abandon` **不覆盖已提交的结论**（`session.py` 会回你「会话 #N 已是结论态，
+abandon 不覆盖已写的结论」）—— 所以先 finish 再想作废，来不及了，通过率永久多一条
+假记录。跑完自检、装完机验证这类「不是用例」的会话，正确做法是趁它还是 `running`：
+
+```bash
+python tools/session.py abandon --id N --reason "作废：装机冒烟，不是用例"
+```
+
 ### ⚠️ 用例写法：「字段（如…）」「（最多N）」这类括号**是要验的规格**
 
 用例常这么写：
