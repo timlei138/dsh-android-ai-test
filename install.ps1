@@ -51,7 +51,13 @@ $probe = Join-Path $To 'toolkit\.w_probe'
 try { Set-Content -Path $probe -Value x -ErrorAction Stop; Remove-Item $probe -Force }
 catch { Bad "落点写不进去：$To —— 请 -To 指到你会话工作区之内的目录（$_）" }
 Good "落点可写：$To"
-$ws = if ($env:DSH_WORKSPACE) { $env:DSH_WORKSPACE } else { $null }
+# DSH_WORKSPACE 实测未被 harness 导出（dsh 包内 grep 无此名），拿不到就退回
+# 「无法判定」并明确说一声 —— 真正的硬闸门是上面的写探针，不是这条。
+$ws = if ($env:DSH_WORKSPACE) { $env:DSH_WORKSPACE } elseif ($env:DSH_SESSION_ID -and (Test-Path "$env:DSH_HOME\sessions")) {
+    $hit = Get-ChildItem "$env:DSH_HOME\sessions" -Directory -ErrorAction SilentlyContinue |
+          Where-Object { Test-Path (Join-Path $_.FullName "session-$env:DSH_SESSION_ID") } | Select-Object -First 1
+    if ($hit) { $hit.Name }
+} else { $null }
 if ($ws) {
     if ($To -like (Join-Path $ws '*')) { Good "在工作区之内（DSH_WORKSPACE=$ws）" }
     else { Warn "-To 落在当前会话工作区之外：$To。文件策略是 workspace-write 时 AI 侧写不进产物；要么挪进工作区，要么本会话用 danger-full-access" }

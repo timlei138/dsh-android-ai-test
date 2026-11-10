@@ -53,8 +53,15 @@ From="$(cd "$From" 2>/dev/null && pwd)" || die "源目录不存在：$From"
 [ -f "$From/toolkit/tools/session.py" ] || die "源里没有 toolkit/tools/session.py：$From（--from 指到仓库或 Share 包根）"
 [ -f "$From/toolkit/scripts/setup.sh" ] || die "源里没有 toolkit/scripts/setup.sh：$From"
 
-mkdir -p "$To" 2>/dev/null
-To="$(cd "$To" 2>/dev/null && pwd)" || die "落点建不出来：$To"
+if [ -z "$To" ]; then
+    # 不给 --to 就是「装进当前会话的工作区」——cwd 由 harness 定，
+    # 实测它把 bash 的起始目录设成会话工作区（不是工具层，也不是 /）。
+    To="$(pwd)/android-ai-test"
+    echo "  未指定 --to，默认装到当前目录下：$To"
+fi
+_want="$To"          # 归一化失败时 To 会被空串覆盖，先留原话给人看
+mkdir -p "$_want" 2>/dev/null
+To="$(cd "$_want" 2>/dev/null && pwd)" || die "落点建不出来：$_want（父目录不存在或不可写；沙箱策略 workspace-write 时工作区外就是写不进）"
 [ -f "$To/toolkit/tools/session.py" ] && die "落点已经装过了：$To/toolkit（要重装请先自己挪走旧目录，我不覆盖你的产物）"
 [ "$To" = "$From" ] && die "落点和源是同一个目录。就地安装请直接跑 bash $From/toolkit/scripts/setup.sh，否则换个 --to"
 case "$(pwd)/" in
@@ -74,11 +81,33 @@ if ! echo x > "$To/toolkit/.w_probe" 2>/dev/null; then
 fi
 rm -f "$To/toolkit/.w_probe" 2>/dev/null
 ok "落点可写：$To"
-if [ "${DSH_WORKSPACE:-}" ]; then
-    case "$To/" in
-        "$DSH_WORKSPACE"/*) ok "在工作区之内（DSH_WORKSPACE=$DSH_WORKSPACE）" ;;
-        *) warn "--to 落在当前会话工作区之外：$To。文件策略是 workspace-write 时 AI 侧写不进产物；要么挪进工作区，要么本会话用 danger-full-access" ;;
+# 「落点在工作区之内吗」——这条**只是警告**，硬闸门是上面那个真写探针。
+# 拿工作区的办法，按可信度排：
+#   ① $DSH_WORKSPACE：实测 dsh 包**没有**导出这个变量（全文 grep DSH_* 只有
+#      DSH_HOME / DSH_PROFILE / DSH_PROFILE_DIR / DSH_SESSION_ID / DSH_SHELL /
+#      DSH_WEB_URL / DSH_AGENTS_HOME …）。留着是防以后版本加上，别依赖。
+#   ② harness 落盘的会话目录：~/.dsh/sessions/<工作区路径的 slug>/session-<id>/。
+#      slug 把 / 和 - 都折成 -、两端补 -（实测 --home-xuyl-dsh-work-- ==
+#      /home/xuyl/dsh-work）。反推成路径不唯一，所以两边都折成 slug 比前缀。
+#   ③ 都没有 -> 明说判不了（cwd 其实就是工作区，但脚本不能假设没人 cd 走）。
+Ws=""; WsFrom=""
+if [ -n "${DSH_WORKSPACE:-}" ]; then
+    Ws="${DSH_WORKSPACE%/}"; WsFrom="DSH_WORKSPACE"
+elif [ -n "${DSH_SESSION_ID:-}" ] && [ -d "${DSH_HOME:-$HOME/.dsh}/sessions" ]; then
+    _d=$(find "${DSH_HOME:-$HOME/.dsh}/sessions" -maxdepth 2 -type d -name "$DSH_SESSION_ID" 2>/dev/null | head -1)
+    if [ -n "$_d" ]; then Ws="${_d%/$DSH_SESSION_ID}"; Ws="${Ws##*/}"; WsFrom="会话记录目录 $_d"; fi
+fi
+_slug() { printf '%s' "$1" | sed 's#[/-]\{1,\}#-#g; s#^-*##; s#-*$##'; }
+if [ -n "$Ws" ]; then
+    WsC=$(_slug "$Ws")
+    # slug 里已经没有 / 了，边界只能用 -（副作用：同级目录名以工作区名开头会被
+    # 误判成在内，例如 /home/x/dsh-work-2 —— 这只是条警告，不作硬闸门，可接受）
+    case "$(_slug "$To")" in
+        "$WsC"|"$WsC"-*) ok "在工作区之内（依据：$WsFrom）" ;;
+        *) warn "--to 落在当前会话工作区之外：$To（工作区判定依据：$WsFrom）。文件策略是 workspace-write 时 AI 侧写不进产物；要么挪进工作区，要么本会话用 danger-full-access" ;;
     esac
+else
+    warn "既没有 DSH_WORKSPACE 变量，也找不到本会话的 sessions 记录目录 —— 无法判定落点是否在工作区内；以上面真实写探针的结果为准（$To 可写）"
 fi
 
 say "1/4 铺代码（不带 .venv / storage / __pycache__ —— 前者跨路径即废，后者是你的历史）"
