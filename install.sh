@@ -56,7 +56,7 @@ From="$(cd "$From" 2>/dev/null && pwd)" || die "源目录不存在：$From"
 if [ -z "$To" ]; then
     # 不给 --to 就是「装进当前会话的工作区」——cwd 由 harness 定，
     # 实测它把 bash 的起始目录设成会话工作区（不是工具层，也不是 /）。
-    To="$(pwd)/android-ai-test"
+    To="$(pwd)/dsh-ai-auto-test"
     echo "  未指定 --to，默认装到当前目录下：$To"
 fi
 _want="$To"          # 归一化失败时 To 会被空串覆盖，先留原话给人看
@@ -90,6 +90,16 @@ ok "落点可写：$To"
 #      slug 把 / 和 - 都折成 -、两端补 -（实测 --home-xuyl-dsh-work-- ==
 #      /home/xuyl/dsh-work）。反推成路径不唯一，所以两边都折成 slug 比前缀。
 #   ③ 都没有 -> 明说判不了（cwd 其实就是工作区，但脚本不能假设没人 cd 走）。
+# 有 python3 就直接问 harness.py（判定逻辑只留一份，这里的 bash 版本是
+# python3 不在时的降级副本）
+if command -v python3 >/dev/null 2>&1 && [ -f "$From/toolkit/tools/harness.py" ]; then
+    _line=$(python3 "$From/toolkit/tools/harness.py" --inside "$To" 2>/dev/null); _rc=$?
+    case "$_rc" in
+        0) ok "$_line" ;;
+        1) warn "$_line —— 文件策略是 workspace-write 时 AI 侧写不进产物；挪进工作区，或本会话放宽策略" ;;
+        *) warn "工作区判不了：$_line；以第 0/4 步的真实写探针为准" ;;
+    esac
+else
 Ws=""; WsFrom=""
 if [ -n "${DSH_WORKSPACE:-}" ]; then
     Ws="${DSH_WORKSPACE%/}"; WsFrom="DSH_WORKSPACE"
@@ -108,6 +118,7 @@ if [ -n "$Ws" ]; then
     esac
 else
     warn "既没有 DSH_WORKSPACE 变量，也找不到本会话的 sessions 记录目录 —— 无法判定落点是否在工作区内；以上面真实写探针的结果为准（$To 可写）"
+fi
 fi
 
 say "1/4 铺代码（不带 .venv / storage / __pycache__ —— 前者跨路径即废，后者是你的历史）"

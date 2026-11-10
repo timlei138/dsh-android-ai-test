@@ -121,6 +121,40 @@ def _writ() -> bool:
     return not bad_hard
 
 
+def _harness() -> None:
+    """会话工作区在哪 —— 这条**不依赖 cwd**，是 _roots() 那条的对照。
+
+    runtime.py 用 `Path.cwd()` 判产物落点：正常首跑 cwd 就是工作区，所以它是对的；
+    但有人 `cd` 走过、或从安装位置直接跑，cwd 就不再代表工作区，判出来的规则会
+    把产物丢到意料之外的地方（2026-11-09 那 16 条用例就是这么废掉记录通道的）。
+    harness.py 改成从落盘的会话目录名反推，cwd 跑哪儿都不影响结论。
+    """
+    try:
+        import harness
+        ws = harness.workspace()
+    except Exception as exc:                      # 自检工具自己不该把 doctor 弄崩
+        check(SOFT, "工作区判定", f"harness.py 读失败：{exc}",
+              "不是致命问题：产物落点仍按 runtime.py 的 cwd 规则走")
+        return
+    detail = f"{ws['path']}  [{ws['confidence']}]  依据：{ws['source']}"
+    inside = None
+    try:
+        inside = Path(ws["path"]).resolve() in ROOT.resolve().parents or \
+            Path(ws["path"]).resolve() == ROOT.resolve()
+    except OSError:
+        pass
+    if ws["confidence"] == "low":
+        check(SOFT, "工作区判定", detail,
+              "拿不到 DSH_SESSION_ID / 会话目录（不在 harness 会话里跑？），"
+              "现在只能拿 cwd 兜底 —— 确认 cwd 就是你想要产物落下去的地方")
+    elif inside is False:
+        check(SOFT, "工作区判定", detail + f"  ← 工具层 {ROOT} 在它之外",
+              "工具层装在工作区之外：文件策略 workspace-write 时 AI 侧写不进产物。"
+              f"要么把工具层挪进工作区，要么本会话放宽策略")
+    else:
+        check(INFO, "工作区判定", detail + "  工具层在其内")
+
+
 def _db() -> None:
     db = STORAGE_DIR / "test.db"
     if not db.is_file():
@@ -192,6 +226,7 @@ def main() -> int:
     _deps()
     storage_ok = _writ()
     _roots()
+    _harness()
     _db()
     _device()
     _assets(args.package)

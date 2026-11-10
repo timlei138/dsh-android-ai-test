@@ -39,6 +39,7 @@ from runtime import (  # noqa: E402
     ASSETS_DIR, KNOWLEDGE_DIR, RECORD_DIR, ROOT, STORAGE_DIR, TMP_DIR,
     detect_shell, storage_fix_hint, storage_root_source, writability_report,
 )
+import harness  # noqa: E402  纯标准库，import 不会引入第三方依赖
 
 # 必须第一件事就切 UTF-8。
 #
@@ -72,6 +73,25 @@ def _storage_source() -> str:
     才能在换机器 / 换 cwd 之后判断"这个路径对不对"，而不是等到写不进去才怀疑工具坏了。
     """
     return storage_root_source()
+
+
+def _workspace() -> tuple[dict, bool | None]:
+    """本会话的工作区在哪 + 工具层在不在里面。
+
+    为什么不看 `os.getcwd()`：harness 起 bash 时 cwd 确实是工作区，可一旦有人
+    `cd` 走（实测我自己就常在用例目录里），cwd 就不再代表工作区，而
+    `runtime.py` 的 storage 落点规则恰恰是拿 cwd 判的 —— 于是产物会悄悄落到
+    另一棵树（2026-11-09 那 16 条用例的记录通道就是这么废的）。
+    `harness.py` 从落盘的会话目录名反推，与 cwd 无关，所以这里报的是**真**工作区，
+    和 `storage_source` 那条（cwd 规则）并排放着，两者不一致就该警觉。
+    """
+    try:
+        import harness
+        ws = harness.workspace()
+        return ws, harness.is_inside(ROOT, ws)
+    except Exception as exc:  # noqa: BLE001
+        return ({"path": None, "source": f"harness.py 不可用：{exc}",
+                 "confidence": "unknown"}, None)
 
 
 def _roots_agree() -> tuple[bool, str]:
@@ -153,6 +173,7 @@ def main() -> None:
     env = detect_shell()
     _writ = writability_report()
     _root_ok, _root_note = _roots_agree()
+    _ws, _inside = _workspace()
     if "--json" in sys.argv:
         payload = dict(env)
         payload.update({
@@ -175,6 +196,13 @@ def main() -> None:
             "storage_writable": not _writ["storage"],
             "assets_writable": not (_writ["knowledge"] or _writ["cases"]),
             "tool_root": str(ROOT),
+            "workspace": _ws,
+            "workspace_confidence": _ws["confidence"],
+            "tool_root_in_workspace": _inside,
+            # 产物根落点（cwd 规则算出来的）在不在真工作区里。false = 这次跑的
+            # 会话/证据会写到另一棵树，脚本判这个布尔就行，不用自己比路径。
+            "storage_in_workspace": (None if _ws.get("path") is None else
+                                     harness.is_inside(STORAGE_DIR, _ws)),
             "roots_agree": _root_ok,
             "root_note": _root_note,
             # ★ 设备和输入法：主 Agent 开工就看到，别等子 Agent 跑到打字那步才炸
@@ -207,6 +235,11 @@ def main() -> None:
     print(f"  tmp      = {TMP_DIR}")
     print(f"  knowledge= {KNOWLEDGE_DIR}")
     print(f"  assets   = {ASSETS_DIR}")
+    print()
+    _mark = {True: "在其内 ✅", False: "在它外面 ⚠️  ← 落点规则信的是 cwd，两者不一致就要警觉",
+             None: "判不了"}[_inside]
+    print(f"会话工作区：{_ws['path']}  [{_ws['confidence']}]  依据：{_ws['source']}")
+    print(f"           工具层 {_mark}：{ROOT}")
     print()
     # ── 可写性：真写一个探针，别看权限位 ──────────────────────
     hard_keys = ("storage", "run_history", "tmp")
