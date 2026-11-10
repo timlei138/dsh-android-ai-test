@@ -100,6 +100,32 @@ function toCommandLine(argv) {
     .join(' ')
 }
 
+/**
+ * 按平台拼命令行。
+ *
+ * ★ 为什么不能只用上面那个：shell 服务在 POSIX 上把 command 交给 `sh -c` 执行。
+ *   Windows 的引号规则套过来，`/a/b c/.venv/bin/python` 会变成
+ *   字面量字符串 `"/a/b c/.venv/bin/python"` 而被 sh 当成「命令的第一个词」，
+ *   报 `command not found`。POSIX 一律用单引号包 (单引号内无转义，最安全)。
+ */
+function buildCommandLine(argv) {
+  if (process.platform === 'win32') return toCommandLine(argv)
+  return argv
+    .map((a) => {
+      const s = String(a)
+      if (s === '') return "''"
+      if (!/[\s"'&|<>()$`\\!*?;~#^]/.test(s)) return s
+      return `'${s.replace(/'/g, `'\\''`)}'`
+    })
+    .join(' ')
+}
+
+/** 各平台的 venv 解释器相对位置。 */
+function venvPython(target) {
+  if (process.platform === 'win32') return `${target}\\.venv\\Scripts\\python.exe`
+  return `${target}/.venv/bin/python`
+}
+
 export function apply(ctx, config = {}) {
   const target = config.target
   const timeoutMs = Number(config.timeoutMs ?? 300_000)
@@ -136,14 +162,15 @@ export function apply(ctx, config = {}) {
           'android-tools: config.target 未配置（应指向 android-ai-test 目录）',
       }
     }
-    const py = `${target}\\.venv\\Scripts\\python.exe`
+    const py = venvPython(target)
     // 只有这两个路径进命令行 —— 它们由 config 和常量决定，不含用户输入
-    const argv = [py, `${target}\\tools\\${script}`, '--stdin-json']
+    const sep = process.platform === 'win32' ? '\\' : '/'
+    const argv = [py, `${target}${sep}tools${sep}${script}`, '--stdin-json']
     const stdinPayload = JSON.stringify({ args })
 
     // 所有工具层脚本都要求 UTF-8 输出；显式给，别靠继承
     const request = {
-      command: toCommandLine(argv),
+      command: buildCommandLine(argv),
       workdir: target,
       timeoutMs,
       onExpiry: 'kill',
