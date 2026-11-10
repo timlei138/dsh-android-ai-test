@@ -506,16 +506,42 @@ def main() -> None:
     why = getattr(args, "why", None)
 
     # 顺带声明权限意图（在动作之前生效，这样本次动作触发的弹窗就能被接住）
+    #
+    # ⚠️ 意图落不了地就必须当场报错，绝不能静默往下走。
+    #    旧写法是 `if si:` + `except: pass` —— 没有活动会话（或会话库和
+    #    工具层不同树）时意图被丢掉，后面 perm.py 读不到意图就回落
+    #    default=grant，于是「测拒绝授权」的用例实际点了「同意」，
+    #    还留下一条看起来正常的记录。实测跑 169 时两条拒绝分支全废在这里。
     perm_inline = None
     if getattr(args, "perm_action", None):
+        si = None
+        why_missing = ""
         try:
             from db import current_session, get_db
             si = current_session()
-            if si:
+        except Exception as e:  # noqa: BLE001
+            why_missing = f"读会话失败：{e}"
+        if si:
+            try:
                 get_db().set_perm_intent(si, args.perm_action, args.perm or "")
-                perm_inline = {"action": args.perm_action, "permission": args.perm or ""}
-        except Exception:  # noqa: BLE001
-            pass
+                perm_inline = {"action": args.perm_action, "permission": args.perm or "",
+                               "session": si}
+            except Exception as e:  # noqa: BLE001
+                fail(f"permAction={args.perm_action} 写不进会话 {si}：{e}"
+                     "｜先修记录通道再跑，否则这条授权判定不会被留证")
+        elif args.perm_action == "deny":
+            from runtime import storage_root_source  # 只在报错路径上付代价
+            fail("permAction=deny 需要活动会话才能生效，当前取不到会话"
+                 f"{('：' + why_missing) if why_missing else ''}。"
+                 f"会话指针来源：{storage_root_source()}。"
+                 "两种可能：① 没开会话（先 session.py start）；"
+                 "② 插件 tool_root 和会话不在同一棵树"
+                 "（改 plugins/*/[preset/]cordis.patch.yml 的 target 或重启 harness）。"
+                 "不报错继续跑的话会按默认点「同意」，把拒绝分支测成假通过。")
+        else:  # grant 本来就是默认值，丢了意图不改变行为，只说明一句
+            perm_inline = {"action": "grant", "permission": args.perm or "",
+                           "registered": False,
+                           "note": "无活动会话，未写意图；grant 与默认行为一致"}
 
     try:
         d = connect(args.serial)
