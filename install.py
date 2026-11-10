@@ -9,15 +9,16 @@
     python3 install.py --reuse-venv <旧 .venv>  # 离线：从旧 venv 拷包，不跑 pip
     python3 install.py -- --skip-device-check   # -- 之后的参数原样转给 toolkit/scripts/setup.sh
 
-为什么是一份 python，而不是 install.sh + install.ps1 两份
+为什么只有一份 python 入口（shell 那两个已经删了）
 --------------------------------------------------------
 `安装说明.md` §2.5 ⑧ 那句话原来写的是「不存在两份副本要同步的问题」，
 2026-11-09 被打脸了：仓里一份、已装层一份、Windows/Linux 又各一份 shell，
 `runtime.py` 就在其中一次漂移里落后了。环境判定（工作区在哪、能不能真写进去）
 这件事本来只有一条逻辑，写两遍就必然对不齐 —— 而 install.ps1 这台机器上
 根本没有 pwsh，**从来没被执行过**，语法都没验证过。
-系统 python3 是前置条件（装依赖要用），所以让它当唯一入口，shell 那两个
-退化成两行转发。
+系统 python3 是前置条件（装依赖要用），所以让它当唯一入口。2026-11-10 起
+连那两行转发的壳也删了：Windows 上 `python install.py` 一样能跑，
+不需要一个从没被执行过的 .ps1 挡路。
 
 四步，每步都是一条能照抄的结论
 ------------------------------
@@ -42,7 +43,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 IS_WIN = os.name == "nt"
 DEFAULT_NAME = "dsh-ai-auto-test"
-DOC_FILES = ("安装说明.md", "README.md", "分享介绍.html", "install.py",
+DOC_FILES = ("安装说明.md", "README.md", "install.py",
              "Linux安装记录.md")   # 末项是历史踩坑记录，缺了不影响跑，但别丢
 TOOLKIT_SKIP = {".venv", "storage", "__pycache__", ".git", "node_modules",
                 "webui", "docs"}          # webui/docs 是源码树里的附属，装机不需要

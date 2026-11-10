@@ -225,7 +225,7 @@ def main() -> int:
     ap.add_argument("--tool-root", default=None)
     ap.add_argument("--inside", metavar="PATH", default=None,
                     help="只回答一件事：PATH 在不在工作区内。0=在内 1=在外 2=判不了。"
-                         "给 install.sh / doctor 当查询口用，别自己解析 --json")
+                         "给 install.py / doctor 当查询口用，别自己解析 --json")
     a = ap.parse_args()
 
     if a.inside:
