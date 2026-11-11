@@ -422,6 +422,15 @@ button.ghost.danger:hover { background: var(--fail-soft); }
   font-family: inherit; line-height: 1.7;
   max-height: 52vh; overflow: auto;
 }
+/* 用例原文编辑框：和只读态 .case-pre 视觉对齐，换成可改的 textarea */
+.case-edit {
+  display: block; width: 100%; min-height: 46vh; max-height: 52vh;
+  resize: vertical; background: var(--bg3); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; font: 13px/1.7 inherit;
+  font-family: inherit; outline: none; box-sizing: border-box;
+}
+.case-edit:focus { border-color: var(--accent); }
 
 /* 用例详情里的页签（用例原文 / 程序化描述-YAML） */
 .casetabs {

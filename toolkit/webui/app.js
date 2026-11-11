@@ -808,6 +808,9 @@ async function openCaseView(id) {
        </div>`
     : "";
 
+  // 只有真有 .md 原文的用例才能编辑（只有 _steps.yaml 的孤立产物没有原文）
+  const canEdit = !!c.has_md;
+
   const m = modal(`用例 #${c.id} · ${c.title || ""}`, `
     <div class="meta" style="margin-bottom:8px">
       模块 ${esc(c.package || "未识别")} · 跑过 ${c.run_count ?? 0} 次 ·
@@ -826,8 +829,62 @@ async function openCaseView(id) {
       </div>
       <pre class="case-pre" id="cyaml">加载中…</pre>
     </div>` : ""}`,
-    `<button class="ghost" data-cancel>关闭</button>`);
+    `<span class="muted" id="c-edit-state" style="margin-right:auto"></span>
+     <button class="ghost" data-cancel>关闭</button>
+     ${canEdit ? `<button data-edit>编辑原文</button>` : ""}`);
   $("[data-cancel]", m.el).addEventListener("click", m.close);
+
+  if (canEdit) {
+    // 编辑态：把「用例原文」那块 pre 换成 textarea，底部按钮换成 保存 / 取消
+    const pane = $('[data-pane="src"]', m.el);
+    const srcBtn = $("[data-edit]", m.el);
+    let draft = c.input || "";
+
+    const enterEdit = () => {
+      srcBtn.hidden = true;
+      $("[data-cancel]", m.el).hidden = true;
+      $(".casetab", m.el) && $$(".casetab", m.el).forEach(b => { b.disabled = true; });
+      pane.innerHTML = `
+        <div class="panel-title">用例原文 · 编辑中
+          <span class="muted" style="font-weight:400;font-size:12px">
+            · 保存后直接写回 <code>${esc(c.package)}/${esc(c.id)}.md</code></span></div>
+        <textarea class="case-edit" spellcheck="false">${esc(draft)}</textarea>`;
+      const ta = $(".case-edit", pane);
+      ta.focus();
+      const foot = $(".modal-foot", m.el);
+      const saveBtn = document.createElement("button");
+      saveBtn.textContent = "保存";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "ghost";
+      cancelBtn.textContent = "取消";
+      foot.appendChild(cancelBtn);
+      foot.appendChild(saveBtn);
+
+      cancelBtn.addEventListener("click", () => { m.close(); openCaseView(c.id); });
+      saveBtn.addEventListener("click", async () => {
+        const content = ta.value;
+        if (!content.trim()) { $("#c-edit-state", m.el).textContent = "原文不能为空"; return; }
+        saveBtn.disabled = true;
+        $("#c-edit-state", m.el).textContent = "保存中…";
+        try {
+          const r = await api(`/api/cases/${encodeURIComponent(c.id)}/content`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content }),
+          });
+          const kb = (r.bytes / 1024).toFixed(1);
+          toast(`已保存 · ${r.path} · ${kb} KB` +
+                (r.db_synced ? " · 库记录已同步" : ""));
+          m.close();
+          openCaseView(c.id);   // 重新拉一次，显示写回后的真实内容
+        } catch (e) {
+          saveBtn.disabled = false;
+          $("#c-edit-state", m.el).textContent = "保存失败：" + e.message;
+        }
+      });
+    };
+    srcBtn.addEventListener("click", enterEdit);
+  }
 
   if (spec) {
     // 惰性加载：切到 YAML 页签时才取内容
@@ -846,16 +903,13 @@ async function openCaseView(id) {
       }
     };
     $$(".casetab", m.el).forEach(b =>
-      b.addEventListener("click", () => showTab(b.dataset.tab)));
+      b.addEventListener("click", () => { if (!b.disabled) showTab(b.dataset.tab); }));
   }
 }
 
-// ⚠️ 用例**不提供 WebUI 修改入口**（有意为之，勿加回）：
-//    case.input（用例原文）与同名 YAML（程序化描述）是同一份用例的两种形态，
-//    一旦只改其中一个，两者就会静默不一致 —— 属于"合法但内容对不上"，
-//    和"YAML 能解析但中文已被编码毁掉"是同一类问题。
-//    正确姿势：改原文 → 重跑用例 → 重新沉淀 YAML。该流程在 WebUI 之外完成。
-//    服务端 POST /api/cases/<id> 也已一并拒绝（见 webui.py）。
+// 用例**原文**可改（写回 assets/cases/<应用>/<stem>.md，格式统一 CRLF）。
+// 程序化描述（_steps.yaml）仍只读：它由"已验证成功的会话"沉淀，
+// 手工改动会破坏它与证据/知识卡的对应关系 —— 改原文后重跑再沉淀即可。
 
 
 function confirmDeleteCase(id) {

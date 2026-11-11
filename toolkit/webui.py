@@ -172,6 +172,16 @@ def run_stats_all(days: int = 3) -> list[dict]:
         return []
 
 
+def _normalize_crlf(text: str) -> str:
+    """统一换行成 CRLF（并去掉 BOM）。
+
+    全库 70 个用例 md 都是 CRLF、无 BOM。浏览器 textarea 里是 LF，
+    直接落盘会让每次编辑都变成「整文件重写」的 git 噪音。
+    """
+    text = text.lstrip("\ufeff")
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+
 def _find_spec(title: str, suffix: str) -> Path | None:
     """按名字在 assets/cases/**/ 下找文件。
 
@@ -819,14 +829,75 @@ class Handler(BaseHTTPRequestHandler):
                                     str(data.get("package") or "").strip() or None)
             return self._json({"ok": True, "case_id": cid})
 
+        # ── 用例原文可编辑 ────────────────────────────────────
+        #
+        # 写的是 `assets/cases/<应用>/<stem>.md` —— 用例的**唯一真相是文件**，
+        # 数据库只是"跑过的痕迹"。所以这里不写 sessions.user_input（那是历史
+        # 快照，改了等于篡改记录），只写文件；若 `cases` 表里恰有同名记录，
+        # 顺手同步它的 input，避免「文件改了、库还是旧的」两处不一致。
+        #
+        # ⚠️ 程序化描述（`_steps.yaml`）仍**只读**：它由"已验证成功的会话"沉淀，
+        #    手工改动会破坏它与证据/知识卡的对应关系。改原文后重跑再沉淀即可。
+        m = re.match(r"^/api/cases/([^/]+)/content$", path)
+        if m:
+            stem = urllib.parse.unquote(m.group(1))
+            if not SPEC_NAME_RE.match(stem):
+                return self._json({"error": "bad name"}, 400)
+            fp = _find_spec(stem, ".md")
+            if fp is None:
+                # 只有 `_steps.yaml` 没有 md 的孤立导产物 —— 没有可编辑的原文
+                return self._json({
+                    "error": "这条用例没有 .md 原文文件，无法编辑。"
+                             "（只有程序化描述 YAML 的用例不能在此改）",
+                }, 404)
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+                content = data["content"]
+                if not isinstance(content, str):
+                    raise ValueError
+            except (ValueError, KeyError):
+                return self._json({"error": "bad body"}, 400)
+            if not content.strip():
+                return self._json({"error": "用例原文不能为空"}, 400)
+            try:
+                # 全库 70 个用例 md 都是 CRLF、无 BOM —— 按同一格式落盘，
+                # 否则每次编辑都会在 git 里变成整文件重写。
+                fp.write_text(_normalize_crlf(content), encoding="utf-8",
+                              newline="")
+            except OSError as e:
+                return self._json({"error": f"写入失败：{e}"}, 500)
+            # 同名库记录同步（有才同步，没有就只动文件）
+            synced = False
+            db = _open_db()
+            if db is not None:
+                try:
+                    for c in db.list_cases(limit=100000, include_mock=True):
+                        if str(c.get("title") or "") == stem:
+                            synced = bool(db.update_case(int(c["id"]),
+                                                         user_input=content))
+                            break
+                except Exception:  # noqa: BLE001
+                    synced = False
+            st = fp.stat()
+            return self._json({
+                "ok": True,
+                "path": str(fp.relative_to(ROOT)).replace("\\", "/"),
+                "bytes": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime)
+                .isoformat(timespec="seconds"),
+                "db_synced": synced,
+            })
+
         m = re.match(r"^/api/cases/(\d+)$", path)
         if m:
-            # 用例**只读**：case.input 与同名 YAML 是同一份用例的两种形态，
-            # 只改一个会让两者静默不一致（"合法但对不上"）。
-            # 正解是 改原文 → 重跑 → 重新沉淀 YAML，该流程在 WebUI 之外完成。
+            # 数据库自增 id 的旧链接：用例**原文**请用
+            # POST /api/cases/<stem>/content（按文件名定位文件）。
+            # 这里保留拒绝是有意的 —— 数字 id 在文件库里没有对应文件，
+            # 猜一个改掉就是改错用例。
             return self._json({
-                "error": "用例为只读，不支持通过 WebUI 修改。"
-                         "如需调整请改用例文件后重跑，再重新沉淀程序化描述。",
+                "error": "请按文件名编辑（POST /api/cases/<用例文件名>/content），"
+                         "不要用数据库自增 id。",
                 "readonly": True,
             }, 403)
 
