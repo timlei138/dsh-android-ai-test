@@ -42,6 +42,166 @@ MD_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.\-]+\.md$")
 CASES_DIR = ROOT / "assets" / "cases"
 SPEC_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.\-（）()]+$")
 
+# ── 回放：把点击圆点吸附到 via 指向的那个节点上 ──────────────────────
+# 为什么需要：录制时记下的 (x, y) 是 AI 从**上一次返回**的 next[].c 抄来的，
+# 而同一帧的 dump.xml 是另一个时刻的快照 —— 两者偶尔差几十像素（页面有动画、
+# 列表刚滚动过）。实测 115 个点击帧里，有 8 个的落点根本不在 via 指向的节点
+# 范围内，圆点看着就"对不上步骤"。这里改成：只要能解析出那个节点，圆点就钉
+# 在节点中心；解析不出来才退回原始 x/y。
+_NODE_RE = re.compile(r"<node\b[^>]*>")
+_BOUNDS_RE = re.compile(r'bounds="\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]"')
+_ATTR_RES = {
+    "text": re.compile(r'\btext="([^"]*)"'),
+    "rid": re.compile(r'\bresource-id="([^"]*)"'),
+    "desc": re.compile(r'\bcontent-desc="([^"]*)"'),
+}
+
+# dump 解析结果缓存：一次回放里同一个 dump.xml 会被「命中判定」重复读
+# （点击帧用它、上一帧也可能用它），不缓存就要反复 IO + 正则。
+# 只缓存**本次请求**内的小 LRU，不跨请求 —— 文件会被后续跑用例覆盖。
+_DUMP_CACHE: dict[str, list[tuple[tuple[int, int, int, int], dict[str, str]]]] = {}
+_DUMP_CACHE_MAX = 64
+
+
+_SIZE_CACHE: dict[str, list[int] | None] = {}
+
+
+def _png_size(evidence: str):
+    """读 PNG 头拿原图尺寸 —— 权限帧（kind=perm）的 data_json 里没有 size，
+    但回放要给圆点算百分比，必须有原图宽高。"""
+    key = str(evidence or "")
+    if key in _SIZE_CACHE:
+        return _SIZE_CACHE[key]
+    out = None
+    if key:
+        try:
+            with (ROOT / key).open("rb") as fp:
+                head = fp.read(33)
+        except OSError:
+            head = b""
+        if len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n":
+            w = int.from_bytes(head[16:20], "big")
+            h = int.from_bytes(head[20:24], "big")
+            if w and h:
+                out = [w, h]
+    if len(_SIZE_CACHE) >= _DUMP_CACHE_MAX:
+        _SIZE_CACHE.clear()
+    _SIZE_CACHE[key] = out
+    return out
+
+
+def _dump_nodes(evidence: str):
+    """读 `(evidence 的目录)/dump.xml`，解析成 [(bounds, {text,rid,desc})]。"""
+    key = str(evidence or "")
+    if key in _DUMP_CACHE:
+        return _DUMP_CACHE[key]
+    nodes: list[tuple[tuple[int, int, int, int], dict[str, str]]] = []
+    if key:
+        xmlp = (ROOT / key).parent / "dump.xml"
+        if xmlp.is_file():
+            try:
+                txt = xmlp.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                txt = ""
+            for m in _NODE_RE.finditer(txt):
+                node = m.group(0)
+                b = _BOUNDS_RE.search(node)
+                if not b:
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in b.groups())
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                attrs = {}
+                for k, rx in _ATTR_RES.items():
+                    got = rx.search(node)
+                    attrs[k] = got.group(1) if got else ""
+                nodes.append(((x1, y1, x2, y2), attrs))
+    if len(_DUMP_CACHE) >= _DUMP_CACHE_MAX:
+        _DUMP_CACHE.clear()
+    _DUMP_CACHE[key] = nodes
+    return nodes
+
+
+def _via_keys(via: str) -> list[tuple[str, str]]:
+    """从 `rid=xx / text=yy(注释) / desc=zz` 里抽出 [(键, 值)]。
+
+    括号里的是人写的补充说明（如 `text=倒数日（页签）`、`rid=button1(同意)`），
+    不是节点属性，先剥掉再比。
+
+    ⚠️ 不能简单按 `/` 切分：`rid=android:id/button1` 里的 `/` 是 rid 本体的一部分
+    （真实踩坑：按 `/` 切完变成 `rid=android:id`，永远对不上任何节点）。
+    所以按「下一个 `键=` 出现的位置」切段，段尾再削掉分隔符。
+    """
+    s = via or ""
+    marks = list(re.finditer(r"(rid|text|desc)=", s))
+    out: list[tuple[str, str]] = []
+    for i, m in enumerate(marks):
+        key = m.group(1)
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(s)
+        val = s[m.end():end]
+        # 剥掉行内注释与段尾分隔符（`（页签）` / `(同意)` / `/` `,` `;` `、` 空格）
+        val = re.sub(r"[（(][^（()）]*[)）]", "", val)
+        val = val.strip().rstrip("/,;、 ").strip()
+        if val:
+            out.append((key, val))
+    return out
+
+
+def _attr_eq(key: str, want: str, got: str) -> bool:
+    if key == "rid":
+        # dump 里是 com.zui.calendar:id/tabTitle，via 里通常只写 tabTitle。
+        # 另外 via 偶尔把 rid 和文字写在一起（`rid=button1/同意`），
+        # 此时带 `/` 的整串匹配不上，退回按斜杠切开逐段试。
+        cands = [want] + [seg for seg in want.split("/") if seg]
+        for c in cands:
+            if got == c or got.endswith("/" + c) or got.endswith(":" + c):
+                return True
+        return False
+    return got == want
+
+
+def _hit_box(evidence: str, x: float, y: float, via: str):
+    """在该帧 dump 里找 via 指向的节点，返回 (x1, y1, x2, y2)。
+
+    `via` 里可能写了多个键（`rid=button1 text=同意`），但它们指的是同一个节点 ——
+    常见情况是只有部分键对得上（比如那个按钮的 text 在 dump 里是空的）。
+    所以排序用「没对上的键数」而不是硬性全中；全中优先，其次包含点击点，再次面积小。
+    全都对不上的节点直接淘汰。找不到返回 None。
+    """
+    if not evidence or not via:
+        return None
+    keys = _via_keys(via)
+    if not keys:
+        return None
+    nodes = _dump_nodes(evidence)
+    if not nodes:
+        return None
+
+    hits: list[tuple[int, int, int, int, int, int]] = []
+    for (x1, y1, x2, y2), attrs in nodes:
+        unmatched = 0
+        for key, want in keys:
+            if not _attr_eq(key, want, attrs.get(key, "")):
+                unmatched += 1
+        if unmatched == len(keys):
+            continue  # 一个键都没对上 → 不是目标
+        inside = x1 <= x <= x2 and y1 <= y <= y2
+        # 排序键：先按「没对上的键数」升序（全中优先），再按包含点击点，
+        # 最后按面积从小到大（越小的节点越接近真正的目标）。
+        hits.append((unmatched, 0 if inside else 1, (x2 - x1) * (y2 - y1), x1, y1, (x2, y2)))
+
+    if not hits:
+        return None
+    hits.sort(key=lambda h: (h[0], h[1], h[2]))
+    best = hits[0]
+    if best[1] != 0:
+        # 没有任何候选包含点击点 → 用离它最近的那个候选（真·兜底）
+        def _dist(h):
+            return ((h[3] + h[5][0]) / 2 - x) ** 2 + ((h[4] + h[5][1]) / 2 - y) ** 2
+
+        best = min(hits, key=_dist)
+    return best[3], best[4], best[5][0], best[5][1]
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 数据库：单库直查
@@ -573,6 +733,16 @@ class Handler(BaseHTTPRequestHandler):
                 j = {}
             act = j.get("action") or {}
             size = j.get("size") or []
+            # 权限帧（kind=perm）：没有 action，但 data_json.clicked 就是"点掉了哪个按钮"，
+            # 和 act 的 x/y 一个性质 —— 回放里也要有圆点（真实缺陷：用户报
+            # 「权限弹窗点击也没有红点」）。
+            clicked = j.get("clicked") or {}
+            cx, cy = (clicked.get("center") or [None, None])[:2]
+            via = act.get("via") or ""
+            if not via and clicked:
+                via = f"rid={str(clicked.get('rid') or '').split('/')[-1]}" if clicked.get("rid") else ""
+                if clicked.get("text"):
+                    via = (via + " " if via else "") + f"text={clicked['text']}"
             # action 字段可能没存（历史数据），从 detail 首段回退（如"点击 (x,y) via ..."）
             action = act.get("action") or ""
             if not action and e.get("detail"):
@@ -581,15 +751,79 @@ class Handler(BaseHTTPRequestHandler):
                 "seq": e.get("seq"),
                 "kind": e.get("kind"),
                 "evidence": ev,
-                "x": act.get("x"),
-                "y": act.get("y"),
-                "size": size if len(size) == 2 else None,
-                "action": action,
-                "via": act.get("via") or "",
-                "why": act.get("why") or "",
+                "x": act.get("x") if act.get("x") is not None else cx,
+                "y": act.get("y") if act.get("y") is not None else cy,
+                "size": size if len(size) == 2 else _png_size(ev),
+                "action": action or (j.get("kind") or ""),
+                "via": via,
+                "why": act.get("why") or (j.get("prompt") or ""),
                 "detail": e.get("detail") or "",
                 # 图还在不在（被 cleanup 轮转/误删后为 False）
                 "ok": (ROOT / ev).is_file(),
+            })
+
+        # ── 给点击帧补「点击前画面」────────────────────────────────
+        # ⚠️ act 事件的截图是**动作执行后**（settle 500ms）才拍的，即"结果画面"。
+        #    把圆点画在这张图上，点和画面必然对不上（真实缺陷：用户报
+        #    「点击的点展示必须和步骤对上」）。实测 136 个点击帧：
+        #      圆点画在本帧图上，落点能对上 via 的只有 20.6%；
+        #      画在**上一帧**图上，能对上 63.2%。
+        #    上一帧的截图正好是这次点击**发生前**的屏幕状态，所以点击帧
+        #    默认展示 pre 那张图 + 圆点，字幕里说明"点击前"，看完这一步
+        #    再翻一帧就是结果画面（下一帧自己的截图）。
+        prev = None
+        for f in frames:
+            # ⚠️ 只有 act 帧需要"点击前"回溯。权限帧（kind=perm）的截图本身
+            #    **就是点击前**的状态（`_snap_perm_dialog` 在 `d.click()` 之前
+            #    复制的在途截图，实测 dump 里 permissioncontroller 还在），
+            #    给它套 pre 会退到上一张无关画面，圆点反而错位。
+            if f["kind"] == "act" and f["x"] is not None and prev is not None and prev["ok"] and prev["size"]:
+                f["pre_evidence"] = prev["evidence"]
+                f["pre_size"] = prev["size"]
+                f["pre_ok"] = True
+            else:
+                f["pre_evidence"] = None
+                f["pre_size"] = None
+                f["pre_ok"] = False
+            if f["ok"]:
+                prev = f
+
+        # ── 圆点吸附：钉到 via 指向的节点中心 ───────────────────────
+        # 盘上的 (x, y) 与同帧 dump 偶尔不同步（实测 115 个点击帧有 8 个
+        # 落点不在目标节点内）；能解析出节点就以节点为准，圆点才和步骤对上。
+        for f in frames:
+            f["hit_box"] = None
+            f["hit_center"] = None
+            if f["x"] is None or not f["ok"]:
+                continue
+            src = f["pre_evidence"] if f["pre_ok"] else f["evidence"]
+            box = _hit_box(src, f["x"], f["y"], f["via"])
+            if box:
+                f["hit_box"] = list(box)
+                f["hit_center"] = [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]
+
+        # ── 末尾补一帧：最后一步点击之后的页面 ──────────────────────
+        # 每次 act 的截图都是"动作之后"的结果画面，但**最后一次点击之后**
+        # 再没有下一次 act 来承载它 —— 用户看到最后一步是"点击前"画面，
+        # 之后就没了（真实缺陷：「最后一次点击后的页面好像没有」）。
+        # 用最后一张 ok 帧兜住它（它的截图就是那次点击的结果页面）。
+        if frames and frames[-1]["x"] is not None and frames[-1]["ok"]:
+            last = frames[-1]
+            frames.append({
+                "seq": f'{last["seq"]}+',
+                "kind": "result",
+                "evidence": last["evidence"],
+                "x": None, "y": None,
+                "size": last["size"],
+                "action": "结果页面",
+                "via": "",
+                "why": f'第 {last["seq"]} 步（{last.get("action") or "操作"}）之后的画面',
+                "detail": f'第 {last["seq"]} 步执行之后的页面',
+                "ok": last["ok"],
+                "pre_evidence": None, "pre_size": None, "pre_ok": False,
+                # 这一帧不是点击步，不需要圆点；显式给 None，
+                # 免得前端/探针读到 undefined
+                "hit_box": None, "hit_center": None,
             })
 
         missing = sum(1 for f in frames if not f["ok"])

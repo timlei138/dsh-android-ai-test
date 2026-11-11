@@ -479,7 +479,7 @@ async function replaySession(id) {
     <div class="rp">
       <div class="rp-stage">
         <img class="rp-img" alt="帧">
-        <div class="rp-dot hidden"></div>
+        <div class="rp-box"><div class="rp-dot hidden"></div></div>
         <div class="rp-gone hidden">🖼 该帧的截图已清理</div>
       </div>
       <div class="rp-sub"></div>
@@ -500,8 +500,14 @@ async function replaySession(id) {
     </div>`);
   m.el.querySelector(".modal").classList.add("rp-modal");   // 宽版，图才看得清
 
+  /* 舞台比例是 CSS 里的**常量 4/3**（电脑屏幕是宽的），任何会话、任何帧、任何朝向
+     都不改动 —— 这才是「播放框一致」。图片自己 object-fit: contain：横屏帧
+     （3840×2560）刚好铺满，竖屏帧（1904×3040）在固定区域里留左右边。将来真出现
+     横竖切换，框也不会跳，只是那一帧的图留边而已。 */
   const img = $(".rp-img", m.el);
   const dot = $(".rp-dot", m.el);
+  const box = $(".rp-box", m.el);
+  const stage = $(".rp-stage", m.el);
   const sub = $(".rp-sub", m.el);
   const gone = $(".rp-gone", m.el);
   const range = $(".rp-range", m.el);
@@ -512,39 +518,100 @@ async function replaySession(id) {
   let i = 0;
   let timer = null;
 
+  // 图片解码完 / 窗口尺寸变了 → 重算内容区（圆点靠它对齐）
+  img.addEventListener("load", layoutBox);
+  const onResize = () => {
+    if (!document.body.contains(m.el)) { window.removeEventListener("resize", onResize); return; }
+    layoutBox();
+  };
+  window.addEventListener("resize", onResize);
+
+  /* 把 .rp-box 摆到图片**真实内容区**上（object-fit: contain 之后的那块矩形）。
+     舞台尺寸是固定的（CSS aspect-ratio 4/3），图片可能上下或左右留边 ——
+     圆点必须在内容区里按百分比定位，否则会被留边带偏。 */
+  function layoutBox() {
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    const bw = stage.clientWidth, bh = stage.clientHeight;   // ≈ 舞台内框
+    if (!nw || !nh || !bw || !bh) { box.style.inset = "0"; return; }
+    const s = Math.min(bw / nw, bh / nh);
+    const cw = nw * s, ch = nh * s;
+    box.style.left = `${(bw - cw) / 2}px`;
+    box.style.top = `${(bh - ch) / 2}px`;
+    box.style.width = `${cw}px`;
+    box.style.height = `${ch}px`;
+  }
+
   function show(n) {
     i = Math.max(0, Math.min(data.total - 1, n));
     const f = data.frames[i];
     range.value = i + 1;
     count.textContent = `${i + 1} / ${data.total}`;
 
-    // 图片缺失时不留破图；**舞台尺寸保持不变**（靠 CSS 的 aspect-ratio），
+    // ⚠️ 点击帧要展示**点击发生前**的画面，圆点才和画面对得上。
+    //    act 的截图是动作执行后（settle 500ms）拍的"结果画面"，
+    //    把圆点画在那上面必然错位。后端已算好 pre_evidence（上一帧的图）。
+    const isClick = f.x != null && f.y != null;
+    const usePre = isClick && f.pre_ok && f.pre_evidence;
+    const shownEv = usePre ? f.pre_evidence : f.evidence;
+    const shownOk = usePre ? true : f.ok;
+    const [w, h] = (usePre ? f.pre_size : f.size) || [];
+
+    // 图片缺失时不留破图；**舞台尺寸保持不变**（CSS 固定 aspect-ratio），
     // 否则整块会塌成一条，看着像页面坏了。
     // ⚠️ 用 `.hidden` class（项目约定，带 !important）而不是 `el.hidden` 属性 ——
     // 属性会被作者样式里的 display 盖掉（真实缺陷：图在却显示"已清理"占位）。
-    gone.classList.toggle("hidden", !!f.ok);
+    gone.classList.toggle("hidden", !!shownOk);
     // ⚠️ 用 visibility 而非 display：display:none 会让 img 不占位、舞台塌掉
-    img.style.visibility = f.ok ? "visible" : "hidden";
-    if (f.ok) img.src = `/files/${f.evidence}`;
-    if (f.size) $(".rp-stage", m.el).style.aspectRatio = `${f.size[0]} / ${f.size[1]}`;
+    img.style.visibility = shownOk ? "visible" : "hidden";
+    if (shownOk) img.src = `/files/${shownEv}`;
+    // ⚠️ 不按每帧原图改舞台 aspect-ratio —— 那正是「播放框忽大忽小」的根因。
+    //    舞台比例打开时按会话主流朝向定一次，播放中恒定；图片自己 contain 缩放。
 
-    // 点击位置圆点：用**百分比**换算，图片缩放多少都准
-    const [w, h] = f.size || [];
-    const hasDot = f.ok && w && h && f.x != null && f.y != null;
+    // 点击位置圆点：在图片内容区里按**百分比**定位，缩放多少都准。
+    // 坐标优先用后端算好的 hit_center（via 指向的那个节点的中心）——
+    // 录制存的 x/y 和同帧 dump 偶尔不同步，照 x/y 画会"对不上步骤"。
+    const hasDot = shownOk && w && h && isClick;
     dot.classList.toggle("hidden", !hasDot);
+    const snapped = hasDot && !!(f.hit_center && f.hit_center.length === 2);
+    dot.classList.toggle("rp-dot-snap", snapped);
     if (hasDot) {
-      dot.style.left = `${(f.x / w) * 100}%`;
-      dot.style.top = `${(f.y / h) * 100}%`;
+      const cx = snapped ? f.hit_center[0] : f.x;
+      const cy = snapped ? f.hit_center[1] : f.y;
+      dot.style.left = `${(cx / w) * 100}%`;
+      dot.style.top = `${(cy / h) * 100}%`;
     }
+    // 图片是异步解码的：src 换了之后 naturalWidth 才有效 → 立刻算一次，
+    // 同时挂 load 回调兜住「这次还没解码完」的情况。
+    layoutBox();
 
     // 字幕条（在图下方，**不遮挡画面**）
-    const parts = [`<span class="rp-sub-n">第 ${f.seq} 步</span>`];
+    const parts = [];
+    if (f.kind === "result") {
+      // 末尾补的「最后一步之后的页面」：它不是一步操作，别写成"第 N 步"
+      parts.push(`<span class="rp-sub-n">结果页面</span>`);
+      parts.push(`<b>${esc(f.action || "结果页面")}</b>`);
+      if (f.why) parts.push(esc(f.why));
+    } else {
+      parts.push(`<span class="rp-sub-n">第 ${f.seq} 步</span>`);
+    }
     if (f.kind === "act") {
       parts.push(`<b>${esc(f.action || "操作")}</b>`);
       if (f.x != null) parts.push(`<code>${f.x}, ${f.y}</code>`);
       if (f.via) parts.push(`<code>${esc(f.via)}</code>`);
       if (f.why) parts.push(esc(f.why));
-    } else {
+      // 圆点是不是吸附到了 via 指向的节点（没吸附成说明这一步的 dump 里找不到该节点）
+      if (f.hit_center && f.hit_center.length === 2) {
+        parts.push(`<span class="rp-snap-tag">圆点在 ${esc(f.via.split(/\s+/)[0] || "目标")} 上</span>`);
+      }
+    } else if (f.kind === "perm") {
+      // 权限弹窗帧：圆点点在"允许/拒绝"按钮上（后端从 clicked.center 取的）
+      parts.push(`<b>权限弹窗</b>`);
+      if (f.x != null) parts.push(`<code>${f.x}, ${f.y}</code>`);
+      if (f.via) parts.push(`<code>${esc(f.via)}</code>`);
+      if (f.hit_center && f.hit_center.length === 2) {
+        parts.push(`<span class="rp-snap-tag">圆点在按钮上</span>`);
+      }
+    } else if (f.kind !== "result") {
       parts.push(`<b>${esc(f.kind)}</b>`);
       if (f.detail) parts.push(esc(f.detail));
     }
@@ -581,8 +648,33 @@ async function replaySession(id) {
   document.addEventListener("keydown", onKey);
 
   const origClose = $(".modal-x", m.el);
-  origClose.addEventListener("click", stop);
+  origClose.addEventListener("click", () => {
+    stop();
+    window.removeEventListener("resize", onResize);
+  });
   show(0);
+}
+
+/**
+ * 断言下面的「证据」行。
+ *
+ * 两种引用要分开对待：
+ *   1. 截图还在 → 可点链接。**文字用会话内序号 seq**（时间线上标的就是 #seq），
+ *      锚点仍用 events.id（唯一）。之前文字写的是主键 id（10353 这种），
+ *      跟时间线上的 #2 对不上，看着像「跳错了」。
+ *   2. 截图已被清理（历史数据）→ 不给链接，只写「已清理」。
+ *      点过去什么都没有，反而让人以为证据丢了。
+ */
+function evidenceLinks(s, f) {
+  const refs = (f.event_refs || []).filter(r => r.seq != null);
+  if (!refs.length) return "";
+  const html = refs.map(r => {
+    const label = `#${esc(r.seq)}`;
+    return r.has_file
+      ? `<a href="#event-${s.id}-${r.id}">${label}</a>`
+      : `<span class="ev-gone-link" title="该事件的截图已被清理，事件条目本身还在">${label}<span class="ev-gone-tag">已清理</span></span>`;
+  }).join(" · ");
+  return `<div class="small">证据：${html}</div>`;
 }
 
 async function viewSession(id) {
@@ -628,9 +720,7 @@ async function viewSession(id) {
             ${f.expect ? `<b>期望</b>${esc(f.expect)}` : ""}
             ${f.actual ? `<span class="small">　实际：${esc(f.actual)}</span>` : ""}
             ${f.note ? `<div class="small">${esc(f.note)}</div>` : ""}
-            ${(f.event_ids || []).length ? `<div class="small">证据：
-              ${f.event_ids.map(id => `<a href="#event-${s.id}-${id}">事件 ${esc(id)}</a>`).join(" · ")}
-            </div>` : ""}
+            ${evidenceLinks(s, f)}
           </div>`).join("") || "<span class='muted'>无断言记录</span>"}
       </div>
     </div>
@@ -686,6 +776,40 @@ async function viewSession(id) {
       $("#lightbox-img").src = img.src;
       $("#lightbox").classList.remove("hidden");
     }));
+
+  // 「证据：#N」跳转。
+  //
+  // 不能只靠浏览器的原生 hash 跳转：事件图是 loading="lazy"，点下去的瞬间
+  // 上方那些图还没加载、高度是 0，浏览器按当时的布局算好落点就完事了；
+  // 之后图陆续撑开，目标条目被顶到屏幕外（实测 1000182 点 #55 后
+  // 目标落在视口下方 1920px，重设 hash 也没用 —— 布局早已不同）。
+  // 所以：拦下点击、手动滚，并在图片陆续加载期间反复校正落点。
+  //
+  // 高亮用 class（.ev-hit）而不是 :target —— replaceState 改 hash 不会让
+  // 浏览器重新计算 :target，样式会不亮。:target 规则留着兜底（直接粘贴带
+  // # 的 URL 进来时浏览器自己会跳、会亮）。
+  main.addEventListener("click", ev => {
+    const a = ev.target.closest?.('a[href^="#event-"]');
+    if (!a) return;
+    const el = document.getElementById(a.getAttribute("href").slice(1));
+    if (!el) return;
+    ev.preventDefault();
+    $$(".event.ev-hit", main).forEach(x => x.classList.remove("ev-hit"));
+    el.classList.add("ev-hit");
+    const settle = () => el.scrollIntoView({ block: "start" });
+    settle();
+    let n = 0;
+    const again = () => {
+      if (!document.body.contains(el) || n++ > 12) return;
+      settle();
+      setTimeout(again, 120);
+    };
+    setTimeout(again, 60);
+    $$("img.shot", main).forEach(img => {
+      if (!img.complete) img.addEventListener("load", settle, { once: true });
+    });
+    history.replaceState(null, "", "#" + el.id);
+  });
 }
 
 $("#lightbox").addEventListener("click", () => $("#lightbox").classList.add("hidden"));

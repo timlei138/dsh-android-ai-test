@@ -989,12 +989,34 @@ class SessionDB:
             "SELECT * FROM events WHERE session_id=? ORDER BY seq", (session_id,))]
         s["findings"] = [dict(r) for r in self._conn().execute(
             "SELECT * FROM findings WHERE session_id=? ORDER BY id", (session_id,))]
+        # 事件入参 -> 展示用引用。前端要显示会话内序号（seq）而不是数据库主键
+        # （id 全库累计、动辄上万，跟时间线上的 #1 #2 对不上，看着像跳错了）；
+        # 还要知道证据文件在不在 —— 历史数据里有一批截图被清理过，
+        # 那种引用只能显示「已清理」，不能给链接（点过去什么都没有）。
+        by_id = {e["id"]: e for e in s["events"]}
         for finding in s["findings"]:
-            finding["event_ids"] = [r[0] for r in self._conn().execute(
-                "SELECT event_id FROM finding_events WHERE finding_id=? ORDER BY event_id",
+            ids = [r[0] for r in self._conn().execute(
+                "SELECT fe.event_id FROM finding_events fe"
+                " LEFT JOIN events e ON e.id=fe.event_id"
+                " WHERE fe.finding_id=?"
+                " ORDER BY COALESCE(e.seq, 999999), fe.event_id",
                 (finding["id"],))]
-            if finding["event_id"] is not None and finding["event_id"] not in finding["event_ids"]:
-                finding["event_ids"].insert(0, finding["event_id"])
+            if finding["event_id"] is not None and finding["event_id"] not in ids:
+                ids.insert(0, finding["event_id"])
+            finding["event_ids"] = ids
+            refs = []
+            for eid in ids:
+                ev = by_id.get(eid)
+                if not ev:
+                    continue
+                ev_rel = ev.get("evidence") or ""
+                refs.append({
+                    "id": eid,
+                    "seq": ev.get("seq"),
+                    "kind": ev.get("kind"),
+                    "has_file": bool(ev_rel) and (ROOT / ev_rel).is_file(),
+                })
+            finding["event_refs"] = refs
         return s
 
     # ── 单库化后新增：按 run_id 查询 ─────────────────────────────
