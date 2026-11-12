@@ -263,12 +263,14 @@
               根本没跑到判定那一步。这种情况**不是用例结论**，要单独说给用户，
               不要混进通过率里。
 
-              ## 知识卡新发现
+              ## 知识卡与实际不符
 
-              子 Agent 收尾时提的知识卡草稿在 `<target>\storage\pending_kb.md`。
+              子 Agent 发现知识卡写错了，会写进它的 `--summary`（那是唯一出口 ——
+              工具层已经没有写知识卡的入口了，卡只能人改）。
 
-              **不用你查、也不用你问** —— 那是用户的资产。用户问「有没有新发现」时
-              读一下那个文件如实汇报即可；要不要写进知识卡由用户决定。
+              **你照原样转达给用户就行**：哪条卡怎么写的、实际是什么样。
+              不要自己改 `assets/knowledge/*.md`，也不要让子 Agent 去改 ——
+              改不改由用户决定。
         # ── 技能 ────────────────────────────────────────────────────────
         - id: skill-filesystem
           name: '@deepseek-ai/dsh-skill-filesystem'
@@ -559,9 +561,6 @@
 
                             # 记断言：**一次写完所有预期**，不要一条一条调
                             & "<工具层>\.venv\Scripts\python.exe" "<工具层>\tools\session.py" findings-batch --file "<工具层>\storage\tmp\facts.json"
-
-                            # 知识卡新发现：同样一次传全部
-                            & "...\session.py" kb-propose --card <包名> --fact "..." --fact "..." --evidence 16
                             ```
 
                             ⚠️ **中文长文本不要放命令行**（PowerShell 会把

@@ -25,14 +25,14 @@ from db import (  # noqa: I001
     set_current,
 )
 from runtime import (
-    CASES_DIR, KNOWLEDGE_DIR, PATHS_DIR, STORAGE_DIR, current_record_dir,
+    CASES_DIR, PATHS_DIR, STORAGE_DIR, current_record_dir,
     detect_shell, last_record_dir, new_record_dir, pin_record,
     require_writable_storage, unpin_record,
 )
 
 # 只有这几条不写盘。其余一律进门先实测 storage 可写性 ——
 # 否则报错点会漂到后面某个不相干的调用上，根本看不出是 storage 的问题。
-_READ_ONLY_CMDS = frozenset({"list", "current", "kb-list"})
+_READ_ONLY_CMDS = frozenset({"list", "current"})
 
 # Windows 控制台默认 GBK，中文/特殊符号会炸 → 全部 CLI 输出强制 UTF-8
 try:
@@ -179,241 +179,6 @@ def apply_pending_paths(only: str | None = None,
             "path": f"assets/knowledge/paths/{pkg}.md"}
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 知识卡回写：AI 判重，Python 只存草稿
-# ══════════════════════════════════════════════════════════════════════
-#
-# ## 为什么判重交给 AI
-#
-# 「这条事实卡里有没有」是语义问题。Python 只能做完全匹配，
-# 而知识卡里同一件事常有多种说法：
-#
-#     卡里写：「点空格后出现 iv_add_hint」
-#     本轮事实：「点一下格子才长出加号浮标」
-#     → 说的是同一件事，字符串匹配不出来，AI 一眼就知道
-#
-# 所以流程是：
-#
-#     子 Agent 读卡 → 自己判断哪些是真新的 → 只把新的提过来
-#     Python 收到后：查格式违规 → 存草稿
-#     人在主 Agent 里看一眼 → kb-apply / kb-reject
-#
-# ## Python 只拦「格式违规」
-#
-# 这几类能机械判，不用麻烦 AI：
-#   · 坐标 / 像素（换机型就废）
-#   · 会话号（"会话473 实测" 这种）
-#   · 直接下判定（"应判 FAIL"、"别判 PASS"）
-#
-# ## 草稿格式
-#
-#     storage/pending_kb.md
-#
-#     # 知识卡更新建议（N 条待确认）
-#     card: `com.zui.calendar`
-#     1. 事实内容
-#        evidence: 16,17
-#     2. ...
-
-_KB_DRAFT = STORAGE_DIR / "pending_kb.md"
-
-# 格式违规：机械可判，不需要 AI 参与
-#
-# ⚠️ 2026-10-28 踩过：最初只写 `b\s*=\s*\[`，结果
-#    `bounds=[44,344][2996,517]` 漏了过去（"bounds" 结尾是 s 不是等号）。
-#    现在同时覆盖 `b=` / `bounds=` 两种写法；中心坐标 (1520,430) 也一并拦。
-_KB_VIOLATIONS: list[tuple[str, str, str]] = [
-    (r"(?:bounds|\bb)\s*=\s*\[\s*\d+\s*,\s*\d+\s*\]",
-     "含 bounds 数值", "坐标换机型就失效，改写成「界面里的什么位置」"),
-    (r"\(\s*\d{3,}\s*,\s*\d{3,}\s*\)",
-     "含坐标点", "坐标换机型就失效，改成按 rid / 文字定位"),
-    (r"\d+\s*px(?!\w)",
-     "含像素值", "像素换机型就失效"),
-    (r"\by\s*[=≈]\s*\d{3,}",
-     "含 y 坐标", "坐标换机型就失效"),
-    (r"\bx\s*[≈=]\s*\d{3,}",
-     "含 x 坐标", "坐标换机型就失效"),
-    (r"会话\s*#?\s*\d{2,}",
-     "含会话号", "去掉会话号，只留规律"),
-    (r"实测[:：]\s*\d+\s*个用例",
-     "含某次执行统计", "只写规律，不写某次跑了几条"),
-    (r"应判|判\s*(PASS|FAIL)|不算验证到|否则.{0,6}(误判|FAIL)",
-     "含判定结论", "知识卡只写现象，判定留给执行者拿用例对照"),
-]
-
-
-def _kb_check(fact: str) -> tuple[bool, str, str]:
-    """检查一条事实有没有格式违规。返回 (通过, 问题, 改写建议)。"""
-    for rx, issue, hint in _KB_VIOLATIONS:
-        if re.search(rx, fact):
-            return False, issue, hint
-    if len(fact.strip()) < 8:
-        return False, "太短，说明不了什么", "写清观察到的完整现象"
-    return True, "", ""
-
-
-def _kb_parse(text: str) -> tuple[str | None, list[dict]]:
-    """解析草稿。返回 (包名, [{n, fact, evidence}])。"""
-    card = None
-    m = re.search(r"^card:\s*`([^`]+)`", text, re.M)
-    if m:
-        card = m.group(1)
-    items: list[dict] = []
-    cur: dict | None = None
-    for ln in text.splitlines():
-        m2 = re.match(r"^(\d+)\.\s+(.*)$", ln)
-        if m2:
-            if cur:
-                items.append(cur)
-            cur = {"n": int(m2.group(1)), "fact": m2.group(2).strip(),
-                   "evidence": []}
-            continue
-        m3 = re.match(r"^\s+evidence:\s*(.*)$", ln)
-        if m3 and cur is not None:
-            cur["evidence"] = [x.strip() for x in m3.group(1).split(",")
-                               if x.strip()]
-    if cur:
-        items.append(cur)
-    return card, items
-
-
-def _kb_write(card: str, items: list[dict]) -> None:
-    """把草稿写回 pending_kb.md（items 为空就删文件）。"""
-    if not items:
-        if _KB_DRAFT.is_file():
-            _KB_DRAFT.unlink()
-        return
-    head = [f"# 知识卡更新建议（{len(items)} 条待确认）", "",
-            f"card: `{card}`", "",
-            "> 确认后执行 `python tools/session.py kb-apply`",
-            "> 全部丢弃执行 `python tools/session.py kb-reject`", ""]
-    body: list[str] = []
-    for i, it in enumerate(items, 1):
-        body.append(f"{i}. {it['fact']}")
-        if it.get("evidence"):
-            body.append(f"   evidence: {', '.join(str(x) for x in it['evidence'])}")
-        body.append("")
-    _KB_DRAFT.write_text("\n".join(head + body), encoding="utf-8")
-
-
-def kb_propose(card: str, facts: list[str], evidence: list[int],
-               id: int | None = None) -> dict:
-    """提交本轮总结的事实 → 草稿。**不判重**（判重由 AI 读卡自己做）。"""
-    accepted: list[dict] = []
-    rejected: list[dict] = []
-
-    for f in facts:
-        ok, issue, hint = _kb_check(f)
-        if ok:
-            accepted.append({"fact": f.strip(), "evidence": list(evidence)})
-        else:
-            rejected.append({"fact": f[:80], "issue": issue, "hint": hint})
-
-    if not accepted:
-        return {"ok": False, "accepted": 0, "rejected": len(rejected),
-                "errors": rejected,
-                "hint": "全部被格式检查拦下。知识卡只写现象和操作经验，"
-                        "不写坐标/会话号/判定结论。"}
-
-    # 合并进已有草稿（可能之前已经提过别的）
-    pkg = card
-    existing: list[dict] = []
-    if _KB_DRAFT.is_file():
-        old_card, old_items = _kb_parse(_KB_DRAFT.read_text(encoding="utf-8"))
-        if old_card:
-            pkg = old_card
-        existing = old_items
-
-    # 完全相同的文字就不重复进草稿
-    seen = {it["fact"] for it in existing}
-    added = [it for it in accepted if it["fact"] not in seen]
-
-    _kb_write(pkg, existing + added)
-
-    return {"ok": True, "card": pkg,
-            "accepted": len(added),
-            "skipped_same_text": len(accepted) - len(added),
-            "rejected": len(rejected),
-            "errors": rejected,
-            "total_pending": len(existing) + len(added),
-            "path": "storage/pending_kb.md",
-            "hint": ("已记为草稿，等人在主 Agent 里确认。"
-                     if added else "和已有草稿文字相同，没重复添加。")}
-
-
-def kb_apply(only: str | None = None, card: str | None = None) -> dict:
-    """把草稿写入知识卡（人确认后执行）。"""
-    if not _KB_DRAFT.is_file():
-        return {"ok": False, "error": "没有待确认草稿"}
-
-    pkg, items = _kb_parse(_KB_DRAFT.read_text(encoding="utf-8"))
-    pkg = card or pkg
-    if not pkg:
-        return {"ok": False, "error": "草稿里没有 card 包名"}
-
-    target = KNOWLEDGE_DIR / f"{pkg}.md"
-    if not target.is_file():
-        return {"ok": False,
-                "error": f"知识卡不存在：assets/knowledge/{pkg}.md"}
-
-    picks: set[int] = set()
-    if only:
-        for p in only.split(","):
-            p = p.strip()
-            if p.isdigit():
-                picks.add(int(p))
-
-    chosen = [it for it in items if not picks or it["n"] in picks]
-    if not chosen:
-        return {"ok": False, "error": "没有选中任何条目"}
-
-    text = target.read_text(encoding="utf-8")
-    append = ["", "## 后续补充", ""]
-    for it in chosen:
-        append += [f"- {it['fact']}"]
-        if it.get("evidence"):
-            append += [f"  （证据事件 {', '.join(it['evidence'])}）"]
-    if "## 后续补充" not in text:
-        text = text.rstrip("\n") + "\n" + "\n".join(append) + "\n"
-    else:
-        text = text.rstrip("\n") + "\n" + "\n".join(append[2:]) + "\n"
-    target.write_text(text, encoding="utf-8")
-
-    rest = [it for it in items if it not in chosen]
-    _kb_write(pkg, rest)
-
-    return {"ok": True, "card": pkg,
-            "applied": len(chosen),
-            "remaining": len(rest),
-            "target": f"assets/knowledge/{pkg}.md",
-            "hint": ("已写入知识卡末尾「## 后续补充」。"
-                     "高频的可以手工挪进对应章节。")}
-
-
-def kb_reject(only: str | None = None) -> dict:
-    """丢弃草稿（可只丢几条）。"""
-    if not _KB_DRAFT.is_file():
-        return {"ok": False, "error": "没有待确认草稿"}
-    pkg, items = _kb_parse(_KB_DRAFT.read_text(encoding="utf-8"))
-    if not only:
-        _KB_DRAFT.unlink()
-        return {"ok": True, "dropped": len(items), "remaining": 0,
-                "hint": "草稿已清空"}
-    picks = {int(p.strip()) for p in only.split(",") if p.strip().isdigit()}
-    rest = [it for it in items if it["n"] not in picks]
-    _kb_write(pkg or "", rest)
-    return {"ok": True, "dropped": len(items) - len(rest),
-            "remaining": len(rest)}
-
-
-def kb_list() -> dict:
-    """查看待确认草稿。"""
-    if not _KB_DRAFT.is_file():
-        return {"ok": True, "pending": 0, "items": []}
-    pkg, items = _kb_parse(_KB_DRAFT.read_text(encoding="utf-8"))
-    return {"ok": True, "card": pkg, "pending": len(items),
-            "items": [{"n": it["n"], "fact": it["fact"],
-                       "evidence": it["evidence"]} for it in items]}
 
 
 # 「弹窗标题」类 rid：出现即说明某个弹层打开了，是最可靠的页内落点。
@@ -1100,36 +865,6 @@ def main() -> None:
     s.add_argument("--id", type=int, default=None,
                    help="（兼容用，可忽略）草稿里已带会话号，不需要指定")
 
-    # ── 知识卡回写 ──────────────────────────────────────────────────
-    #
-    # Python 只做机械的事：格式过滤、存草稿、写文件。
-    # **"卡里有没有这条" 是语义判断，交给 AI 自己读卡对比。**
-    s = sub.add_parser("kb-propose",
-                       help="提交本轮总结的知识条目 → 草稿（AI 判重后调用）")
-    s.add_argument("--card", required=True,
-                   help="包名，如 com.zui.calendar（决定写进哪张卡）")
-    s.add_argument("--fact", action="append", default=None,
-                   help="一条事实，可重复传多次。只写观察到的现象/操作经验，"
-                        "不写坐标、会话号、该怎么判 PASS/FAIL")
-    # ★ 也接受 JSON 文件：多条事实用命令行传要反复转义引号，
-    #   实测 AI 宁可拆两次调用也不愿写长命令行。给个文件入口。
-    s.add_argument("--file", default=None,
-                   help="JSON 文件：字符串数组，或 [{fact, evidence:[..]}]。"
-                        "比多条 --fact 好写（不用转义引号）")
-    s.add_argument("--evidence", type=int, action="append", default=[],
-                   help="佐证事件 ID，可重复")
-    s.add_argument("--id", type=int, default=None, help="关联会话（缺省当前）")
-
-    s = sub.add_parser("kb-apply", help="把待确认草稿写入知识卡（人确认后执行）")
-    s.add_argument("--only", default=None,
-                   help="只应用第几条（如 1,3）；缺省=全部")
-    s.add_argument("--card", default=None, help="目标包名（缺省取草稿里的）")
-
-    s = sub.add_parser("kb-reject", help="丢弃待确认草稿")
-    s.add_argument("--only", default=None,
-                   help="只丢弃第几条；缺省=全部清空")
-
-    sub.add_parser("kb-list", help="查看待确认的知识草稿")
 
     sub.add_parser("list")
     sub.add_parser("current")
@@ -1677,41 +1412,6 @@ def main() -> None:
         print(json.dumps(apply_pending_paths(
             only=getattr(args, "only", None),
             package=getattr(args, "package", None)), ensure_ascii=False))
-    elif args.cmd == "kb-propose":
-        # 事实来源：--fact（可重复）/ --file（JSON，好写长文本）二选一或并存
-        _facts: list[str] = list(args.fact or [])
-        _ev: list[int] = list(args.evidence or [])
-        if args.file:
-            try:
-                raw = Path(maybe_file(args.file)).read_text(encoding="utf-8-sig")
-                payload = json.loads(raw)
-            except (OSError, ValueError) as exc:
-                raise SystemExit(f"读不了事实文件：{exc}")
-            if not isinstance(payload, list):
-                raise SystemExit("事实文件要是数组")
-            for item in payload:
-                if isinstance(item, str):
-                    _facts.append(item)
-                elif isinstance(item, dict) and item.get("fact"):
-                    _facts.append(str(item["fact"]))
-                    for e in (item.get("evidence") or []):
-                        _ev.append(int(e))
-                else:
-                    raise SystemExit("数组项要是字符串或 {fact, evidence}")
-        if not _facts:
-            raise SystemExit("需要 --fact <一条> 或 --file <json>")
-        print(json.dumps(kb_propose(
-            card=args.card,
-            facts=_facts,
-            evidence=_ev,
-            id=args.id), ensure_ascii=False))
-    elif args.cmd == "kb-apply":
-        print(json.dumps(kb_apply(only=args.only, card=args.card),
-                         ensure_ascii=False))
-    elif args.cmd == "kb-reject":
-        print(json.dumps(kb_reject(only=args.only), ensure_ascii=False))
-    elif args.cmd == "kb-list":
-        print(json.dumps(kb_list(), ensure_ascii=False))
     elif args.cmd == "list":
         print(json.dumps(db.list_sessions(20), ensure_ascii=False, indent=2))
     elif args.cmd == "current":
