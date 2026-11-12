@@ -251,8 +251,8 @@ def _resolve(path_arg: str) -> Path:
 #
 # 这两张卡是**两个独立文件**，而且互不指路：
 #
-#     knowledge/com.zui.calendar.md         33KB / 934 行  坑与行为规律
-#     knowledge/paths/com.zui.calendar.md   12KB / 386 行  在哪找什么
+#     knowledge/com.zui.calendar.md         13KB / 219 行  事实与判据
+#     knowledge/paths/com.zui.calendar.md   13KB / 397 行  在哪找什么
 #
 # 知识卡里提到「路径图」但**没写文件在哪**；只有路径卡反过来提了知识卡。
 # 结果：只读知识卡的 AI 会漏掉整个路径图（从哪个页面点什么到哪）。

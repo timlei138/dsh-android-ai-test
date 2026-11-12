@@ -539,7 +539,7 @@ export function apply(ctx, config = {}) {
         },
         max_tokens: {
           type: 'number',
-          description: '回答长度上限，默认 500',
+          description: '回答长度上限，默认 2000（这类模型 reasoning 开销大，给小了会返回空回答）',
         },
       },
       output: {

@@ -546,7 +546,8 @@ def knowledge_hint(package: str | None, shown: bool = False,
         "sections": sections,
         "tip": ("**执行前先定位**：路径图是节点图（节点=落脚点，边=认什么锚点→去哪）。"
                 "先认自己在哪个节点（看 activity + 屏幕上有什么），再检索该节点的出边。"
-                "知识卡是坑与行为规律（按交互类型词检索命中标题，只读对应小节）。"
+                "知识卡是客观事实（什么情况下会发生什么、怎么运作、怎么算符合预期），"
+                "按交互类型词检索命中标题，只读对应小节。"
                 "**用 card= 参数读，不要用 path= 整份读。**"),
         "system_card": _system_card_hint(),
     }
