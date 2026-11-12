@@ -235,10 +235,10 @@ code {
 
    高度账（实测）：图之外还有 头 ~58 + 字幕 ~50 + 播控 ~44 + 内边距 ~32 + 两段间距 ~20 ≈ 204px。
    要总高 ≤ 84vh（与 .modal 的 max-height 对齐，原 88vh 会高估预算、把播控条挤出可视区）→
-   图高 ≤ 84vh - 204px → 宽 ≤ (84vh - 204px) × 3040 / 1904。
+   图高 ≤ 84vh - 204px → 宽 ≤ (84vh - 204px) × 4 / 3。
    min() 里可以直接写这个算式（CSS 支持在 calc 里混用 vh 与 px）。 */
 .modal.rp-modal {
-  width: min(1100px, 92vw, calc((84vh - 204px) * 3040 / 1904));
+  width: min(1100px, 92vw, calc((84vh - 204px) * 4 / 3));
   /* 可拖动：transform 由 JS 的 makeDraggable 写入（不改 left/top，
      以免破坏上面的宽度算式与 flex 居中）。 */
   will-change: transform;
@@ -254,14 +254,13 @@ code {
 
 /* ── 轨迹回放（截图串播 + 点击位置遮罩）── */
 .rp { display: flex; flex-direction: column; gap: 10px; }
-/* 舞台：黑底 + 固定宽高比（宽高比与原图一致）。
-   ⚠️ 不要再给 max-height 之类的额外限高 —— 一旦舞台比例与图不一致，
-   `object-fit: contain` 会在框内留白，而圆点是按**框**的百分比定位的，
-   位置就会偏（真实缺陷：限高后圆点对不上）。舞台只保持原图比例，让它自己缩放。 */
+/* 舞台：黑底 + 固定 4:3（电脑屏幕是宽的），任何会话 / 帧 / 朝向都不改。
+   ⚠️ 不要再给 max-height 之类的额外限高 —— 舞台比例变了，圆点的百分比定位就偏。 */
 .rp-stage {
-  position: relative;                 /* 圆点按百分比定位在图上 */
+  position: relative;                 /* .rp-box 的定位容器 */
+  width: 100%;
   background: #111; border-radius: 10px; overflow: hidden;
-  aspect-ratio: 3040 / 1904;          /* 占位默认值，JS 会按实际帧覆盖 */
+  aspect-ratio: 4 / 3;
   line-height: 0;                     /* 去掉 img 下方缝隙 */
 }
 .rp-img { width: 100%; height: 100%; display: block; object-fit: contain; }

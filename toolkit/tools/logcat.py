@@ -118,10 +118,10 @@ def capture_context(d, device_ts: str | None, max_lines: int = 2500) -> str | No
     ⚠️ 两个真实事故决定了这个实现（勿回退）：
 
     1. 合并取 `-b main,system,crash` 时，main 的海量普通日志排在 crash 段之前：
-       实测窗口 10201 行里 FATAL EXCEPTION 在**第 3529 行**。无论 `lines[:N]`
-       还是 `lines[-N:]`，只要 N=2500 就必然把崩溃栈切掉 →
+       崩溃栈会被截在窗口尾部之外。无论 `lines[:N]` 还是 `lines[-N:]`，
+       只要 N 小于普通日志量就必然把崩溃栈切掉 →
        crash.log"有文件但没现场"。
-    2. 所以先单独取 crash 缓冲（实测仅 ~24 行，且**必含**完整崩溃栈），
+    2. 所以先单独取 crash 缓冲（很小，且**必含**完整崩溃栈），
        再用剩余配额去取 main+system 的 20s 前情做上下文。
        这样无论普通日志多吵，崩溃现场都不会丢。
     """

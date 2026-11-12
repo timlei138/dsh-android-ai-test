@@ -597,10 +597,9 @@ def main() -> None:
     timed_call("settle_wait", time.sleep, args.settle / 1000)
     _is_click = args.action in ("tap", "longclick")
 
-    # ⚠️ evidence_paths() 在下面第 638 行左右只调**一次**，别在这里再调一遍。
+    # ⚠️ evidence_paths() 在下面**只调一次**，别在这里再调一遍。
     #   它内部会 mkdir + auto_name() 自增序号：调两次就会多建一个空目录、
-    #   并且把 step 号用掉一个（实测 1000182 的 54 个 act 建了 116 个目录、
-    #   其中 54 个是空的）。
+    #   并且把 step 号用掉一个。
     # ⚠️ 必须按 action 分支求值：字典字面量会**同时**求值所有 value，
     # 而 tap 没有 args.text / swipe 没有 args.x / back 没有 args.code
     # → AttributeError 让除 input 外的所有动作在采集阶段直接崩（真实事故）。

@@ -192,8 +192,8 @@ def detect(d, timeout_s: float = 0.8, interval_s: float = 0.2) -> dict | None:
     确实慢的设备用 timeout_s 显式加大（handle 的第二轮用 2s 兜底）。
 
     ⚠️ 取 activity 用 `foreground_of()`（走 dumpsys），**不是 u2 的 app_current**：
-      后者在本 ROM 上要 5.4 秒（`dumpsys window windows` 没有 mCurrentFocus，
-      退回 `dumpsys activity top` 2506 行），而每步都调一次等于白等 5 秒。
+      后者在本 ROM 上要好几秒（`dumpsys window windows` 没有 mCurrentFocus，
+      退回 `dumpsys activity top`），而每步都调一次等于白等。
       判断逻辑一个字没改 —— 仍然是 `is_permission_activity(activity)`。
     """
     from common import foreground_of

@@ -472,10 +472,9 @@ def knowledge_hint(package: str | None, shown: bool = False,
                    screen: str | None = None) -> dict | None:
     """知识卡浮现：告诉 AI"这个包有卡、卡里有哪些小节"。
 
-    ⚠️ 为什么需要（真实教训）：`assets/knowledge/` 下有 5 张真机实测的卡
-    （`com.zui.calendar.md` 500 行经验），但**全链路没有任何地方提示卡存在**——
-    跑 168/169 那几轮，AI 从头到尾没读过那张卡，把"首次启动三连弹框""图库导入
-    标准链路"这些已经沉淀好的坑重新探了一遍。**已有资产完全没被用上。**
+    ⚠️ 为什么需要（真实教训）：`assets/knowledge/` 下有真机验证过的卡，
+    但**全链路没有任何地方提示卡存在**——跑 168/169 那几轮，AI 从头到尾
+    没读过那张卡，把已经沉淀好的事实重新探了一遍。**已有资产完全没被用上。**
 
     设计取舍：
     - **只给标题、不给行号**：卡片会持续编辑，行号是易腐数据；
@@ -1135,7 +1134,7 @@ def foreground_of(d) -> dict:
     ### ② 本机型它慢 43 倍
 
       `dumpsys window windows` 在本 ROM **没有 mCurrentFocus 输出**，
-      于是 adbutils 退到 `dumpsys activity top`（2506 行 / 5.4 秒）。
+      于是 adbutils 退到 `dumpsys activity top`（很啰嗦，一次要好几秒）。
       实测：u2.app_current 5388ms，下面这条 125ms。
 
     ## 三级回退（和 AiAgentTest 一致）
