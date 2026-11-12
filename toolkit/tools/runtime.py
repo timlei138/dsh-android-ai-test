@@ -390,6 +390,124 @@ def detect_shell() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 本次运行真正会被 spawn 的 shell 解释器
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么工具层要关心这件事：
+#
+#   DSH 在 Windows 上的 `ctx.shell` 由 `@deepseek-ai/dsh-pwsh-sandbox` 提供，
+#   它 extends `PwshLocalExecutor` —— 也就是**每一个 android_* 工具调用，
+#   都先起一个 PowerShell 进程**，再由它去起 python。
+#
+#   而 PowerShell 7 和 Windows 自带 5.1 的**启动开销差一倍多**（实测中位
+#   937ms vs 2320ms）。落在 5.1 上，每次工具调用白付约 1.4 秒；一条用例
+#   三十来次调用就是 40 秒上下，一整批几十条就是几十分钟。
+#
+#   更麻烦的是它**不报错**：`resolvePwshPath()` 找不到 pwsh.exe 时会静默
+#   兜底到最后那个候选 `System32\WindowsPowerShell\v1.0\powershell.exe`。
+#   没装 PS7 的机器上，一切照常工作，只是慢 —— 没人会发现。
+#
+# 所以这里把 DSH 的选择规则**原样复刻一遍**，让 doctor / env 能提前说出来。
+# 复刻的依据是 `@deepseek-ai/dsh-pwsh-local/lib/index.js`：
+#   candidatePwshPaths()  L23-34   候选顺序
+#   candidateExists()     L42-49   lstat 后 isFile() || isSymbolicLink()
+#   resolvePwshPath()     L59-65   取第一个存在的
+# ⚠️ DSH 升级若改了这三个函数，这里要跟着改（doctor 会把路径报出来，好复核）。
+
+_PWSH7_HINT = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+
+
+def _shell_candidates() -> list[Path]:
+    """按 DSH 的顺序列出候选解释器（不含 config.pwshPath 那条显式覆盖）。
+
+    candidatePwshPaths() 的三段：ProgramFiles 下 PS7 的固定位置 → PATH 里每
+    个目录下的 pwsh.exe → System32 的 5.1 兜底。PATH 的分隔符和引号剥离也
+    照抄（Windows 上 `;`，条目可能带引号）。
+    """
+    out: list[Path] = []
+    program_files = os.environ.get("ProgramFiles") or "C:\\Program Files"
+    system_root = os.environ.get("SystemRoot") or "C:\\Windows"
+
+    out.append(Path(program_files) / "PowerShell" / "7" / "pwsh.exe")
+    for entry in (os.environ.get("PATH") or "").split(";"):
+        trimmed = entry.strip().strip('"')
+        if not trimmed:
+            continue
+        out.append(Path(trimmed) / "pwsh.exe")
+    out.append(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    return out
+
+
+def _candidate_exists(path: Path) -> bool:
+    """DSH 用的判据：lstat 之后是文件或符号链接（不跟随重解析点）。
+
+    Store 版 pwsh 在 WindowsApps 下是个 execution alias，Node 报 symlink、
+    老版本 Node 报普通文件 —— 两种都算存在。所以这里不能用 `Path.exists()`：
+    它对 alias 会跟随到目标，目标 ACL 不允许时抛 OSError 判成"不存在"，
+    于是错误地认为没装 PS7。用 lstat 语义（`is_symlink()` 先判）才和 DSH 一致。
+    """
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    import stat as _stat
+    return _stat.S_ISREG(st.st_mode) or _stat.S_ISLNK(st.st_mode)
+
+
+def resolve_shell_exe() -> dict:
+    """本次运行 `ctx.shell` 会 spawn 哪个解释器 —— 复刻 DSH 的选择结果。
+
+    返回：
+        {
+          "path": "<解释器绝对路径>" | None,
+          "kind": "pwsh7" | "pwsh7-path" | "powershell5" | "pwsh" | "unknown",
+          "version": "7" | "5.1" | "",
+          "slow": True | False,        ← 落在 5.1 就是 True
+          "advice": "..."              ← 只在慢时给话
+        }
+
+    kind 的含义：
+        pwsh7       → 命中了 ProgramFiles\\PowerShell\\7（MSI 包）
+        pwsh7-path  → PATH 里找到的 pwsh.exe（Store / MSIX 包通常走这条）
+        powershell5 → 兜底的 Windows PowerShell 5.1（慢，而且是「没装 PS7」的信号）
+        pwsh        → 非 Windows，按 PATH 解析
+    """
+    if os.name != "nt":
+        return {"path": None, "kind": "pwsh", "version": "", "slow": False, "advice": ""}
+
+    chosen: Path | None = None
+    for cand in _shell_candidates():
+        if _candidate_exists(cand):
+            chosen = cand
+            break
+
+    if chosen is None:
+        return {"path": None, "kind": "unknown", "version": "", "slow": False,
+                "advice": "找不到任何 PowerShell（连系统自带的 5.1 都没有）—— DSH 的 shell 服务起不来。"}
+
+    name = chosen.name.lower()
+    parent_parts = [p.lower() for p in chosen.parts]
+    if name == "powershell.exe":
+        return {
+            "path": str(chosen),
+            "kind": "powershell5",
+            "version": "5.1",
+            "slow": True,
+            "advice": (
+                "本次跑的是 Windows 自带的 PowerShell 5.1，不是 pwsh 7。"
+                "每次 android_* 工具调用都要多花约 1.4 秒起 shell（实测 5.1 中位 2320ms、pwsh 7 是 937ms），"
+                "一条用例三十来次调用 ≈ 40 秒，长任务累积很大。"
+                "装 PowerShell 7 后**重启 DSH**（pwsh 路径在进程启动时解析并缓存）即可，"
+                "命令：winget install --id Microsoft.PowerShell --source winget"
+            ),
+        }
+    if "powershell" in parent_parts and "7" in parent_parts:
+        return {"path": str(chosen), "kind": "pwsh7", "version": "7", "slow": False, "advice": ""}
+    # PATH 里命中的 pwsh.exe —— Store 版走这条（WindowsApps 下的 alias）
+    return {"path": str(chosen), "kind": "pwsh7-path", "version": "7", "slow": False, "advice": ""}
+
+
+# ══════════════════════════════════════════════════════════════════════
 # "当前运行目录" 的磁盘指针
 # ══════════════════════════════════════════════════════════════════════
 #

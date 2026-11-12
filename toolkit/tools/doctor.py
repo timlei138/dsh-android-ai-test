@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from runtime import (  # noqa: E402
     ASSETS_DIR, CASES_DIR, KNOWLEDGE_DIR, RECORD_DIR, ROOT, STORAGE_DIR, TMP_DIR,
-    probe_writable, storage_fix_hint, storage_root_source, writability_report,
+    probe_writable, resolve_shell_exe, storage_fix_hint, storage_root_source,
+    writability_report,
 )
 
 try:
@@ -216,6 +217,36 @@ def _assets(package: str | None) -> None:
                   f"{card} " + ("在" if card.is_file() else "缺（首次跑会自动长出来）"))
 
 
+def _shell() -> None:
+    """每一次 android_* 调用背后的 shell 解释器。
+
+    Windows 上 `ctx.shell` 由 dsh-pwsh-sandbox 提供，每个工具调用都要先起一个
+    PowerShell 进程再由它起 python。pwsh 7 与系统自带 5.1 的启动开销实测差一倍
+    多（中位 937ms vs 2320ms），落在 5.1 上每次白付约 1.4 秒，一条用例三十来次
+    调用 ≈ 40 秒 —— 长任务累积起来是几十分钟。
+
+    最坑的是它**不报错**：DSH 的 resolvePwshPath() 找不到 pwsh.exe 会静默兜底到
+    System32 里的 5.1，一切照常工作，只是慢。所以只能靠主动报出来。
+
+    ⚠️ 这不是硬失败：5.1 上工具层一样能跑，只是慢。判 SOFT 让长任务的人看见即可。
+    """
+    info = resolve_shell_exe()
+    kind, path = info["kind"], info["path"]
+    if kind == "pwsh7":
+        check(INFO, "shell 解释器", f"pwsh 7（固定安装位置）  {path}")
+    elif kind == "pwsh7-path":
+        check(INFO, "shell 解释器", f"pwsh 7（PATH / Store 版）  {path}")
+    elif kind == "powershell5":
+        check(SOFT, "shell 解释器",
+              f"Windows PowerShell 5.1  {path}",
+              info["advice"])
+    elif kind == "pwsh":
+        check(INFO, "shell 解释器", "非 Windows：按 PATH 解析 pwsh")
+    else:
+        check(HARD, "shell 解释器", "找不到任何 PowerShell",
+              "DSH 的 shell 服务起不来 —— 所有工具调用都会失败")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="工具层自检")
     p.add_argument("--json", action="store_true")
@@ -229,6 +260,7 @@ def main() -> int:
     _harness()
     _db()
     _device()
+    _shell()
     _assets(args.package)
 
     worst = HARD if any(r["level"] == HARD for r in _rows) else (

@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import apply_stdin_args, ensure_utf8_stdio  # noqa: E402
 from runtime import (  # noqa: E402
     ASSETS_DIR, KNOWLEDGE_DIR, RECORD_DIR, ROOT, STORAGE_DIR, TMP_DIR,
-    detect_shell, storage_fix_hint, storage_root_source, writability_report,
+    detect_shell, resolve_shell_exe, storage_fix_hint, storage_root_source,
+    writability_report,
 )
 import harness  # noqa: E402  纯标准库，import 不会引入第三方依赖
 
@@ -174,6 +175,7 @@ def main() -> None:
     _writ = writability_report()
     _root_ok, _root_note = _roots_agree()
     _ws, _inside = _workspace()
+    _shell = resolve_shell_exe()
     if "--json" in sys.argv:
         payload = dict(env)
         payload.update({
@@ -207,6 +209,8 @@ def main() -> None:
             "root_note": _root_note,
             # ★ 设备和输入法：主 Agent 开工就看到，别等子 Agent 跑到打字那步才炸
             "device": _device(),
+            # ★ 每次工具调用背后的 shell 是谁 —— 落在 5.1 就是每次白付 1.4 秒
+            "shell_exe": _shell,
             "storage_source": _storage_source(),
         })
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -271,6 +275,26 @@ def main() -> None:
         print(f"  输入法   = {dev['ime'] or '(空)'} {mark}")
     if dev["advice"]:
         print(f"  ⚠️ {dev['advice']}")
+    print()
+
+    # ── shell 解释器：决定每一次工具调用的固定开销 ────────────────
+    #
+    # 这条不报出来，5.1 / 7 的差别就永远看不见：DSH 找不到 pwsh.exe 会
+    # 静默兜底到 5.1，一切照常工作，只是每次调用慢 1.4 秒。
+    print("★ shell（每次 android_* 调用都经它起进程）：")
+    if _shell["kind"] == "pwsh7":
+        print(f"  pwsh 7 ✅ {_shell['path']}")
+    elif _shell["kind"] == "pwsh7-path":
+        print(f"  pwsh 7 ✅ {_shell['path']}")
+    elif _shell["kind"] == "powershell5":
+        print(f"  ⚠️ PowerShell 5.1 —— {_shell['path']}")
+        print("     每次工具调用多约 1.4 秒；一条用例三十来次 ≈ 40 秒。")
+        print("     装 PS7 后重启 DSH 即可："
+              "winget install --id Microsoft.PowerShell --source winget")
+    elif _shell["kind"] == "pwsh":
+        print(f"  {env['shell']}（非 Windows，按 PATH 解析）")
+    else:
+        print("  ⚠️ 找不到任何 PowerShell —— DSH 的 shell 服务可能起不来")
     print()
 
     # ── 工具目录 + 开会话模板 ────────────────────────────────────
