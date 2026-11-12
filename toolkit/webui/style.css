@@ -19,6 +19,36 @@
   --run-soft: #e3f2fa;
   --radius: 12px;
   --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
+  /* 主题切换时给底色/文字加短过渡，避免闪一下；颜色变量本身切换是瞬时的 */
+  color-scheme: light;
+}
+
+/* ── 深色主题 ──
+   由 <html data-theme="dark"> 触发（app.js 里的 theme 模块负责写属性 + localStorage）。
+   ⚠️ 只覆盖变量，不改任何具体组件样式 —— 全站都走 var()，改变量即可整体换肤。
+   ⚠️ 不要把选择器写成 html[data-theme="dark"] body 之类：变量定义在 :root 上，
+      写 html[data-theme="dark"] 就够（与 :root 同元素，优先级更高能覆盖）。 */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161c;
+  --card: #1c1f27;
+  --bg3: #242833;
+  --border: #2f3542;
+  --text: #e6e9f0;
+  --muted: #98a1b6;
+  --accent: #6b93ff;
+  --accent-soft: #1e2a45;
+  --pass: #4ec98a;
+  --pass-soft: #14301f;
+  --fail: #ff7b7b;
+  --fail-soft: #35191b;
+  --warn: #e0b64d;
+  --warn-soft: #33280f;
+  --blocked: #b394ea;
+  --blocked-soft: #251c3a;
+  --run: #62b6e0;
+  --run-soft: #12293a;
+  --shadow: 0 1px 2px rgba(0,0,0,.30), 0 1px 3px rgba(0,0,0,.36);
 }
 * { box-sizing: border-box; margin: 0; }
 body {
@@ -77,9 +107,12 @@ code {
 }
 .chip.PASS, .chip.pass { background: var(--pass-soft); color: var(--pass); }
 .chip.FAIL, .chip.fail { background: var(--fail-soft); color: var(--fail); }
+.chip.WARN, .chip.warn { background: var(--warn-soft); color: var(--warn); }
 .chip.BLOCKED, .chip.blocked { background: var(--blocked-soft); color: var(--blocked); }
 .chip.ERROR { background: var(--fail-soft); color: var(--fail); }
 .chip.running { background: var(--run-soft); color: var(--run); }
+.chip.paused { background: var(--bg3); color: var(--muted); }
+.chip.waiting { background: var(--warn-soft); color: var(--warn); }
 
 /* ── 仪表盘 ── */
 .stat-group { margin-bottom: 26px; }
@@ -127,11 +160,6 @@ code {
   border-left: 3px solid var(--accent); padding: 10px 14px; margin: 12px 0;
   background: var(--card); border-radius: 0 8px 8px 0; color: var(--muted);
   white-space: pre-wrap; box-shadow: var(--shadow);
-  /* 口述可以很长（实测最长 617 字符 ≈ 20 行），整块展开会把下面的
-     断言和时间线一路挤到屏幕外。限高 + 内部滚动：内容一点不少，
-     也不用先滚过一大段才能看到结果。
-     overflow-wrap 兜住超长无空格串（URL、长 rid），否则会横向溢出。 */
-  max-height: 220px; overflow-y: auto; overflow-wrap: anywhere;
 }
 .findings { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
 .finding {
@@ -174,30 +202,6 @@ code {
   background: var(--bg3); border-radius: 10px; padding: 0 8px; line-height: 18px;
 }
 .event-detail { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: pre-wrap; }
-/* 从「证据：#N」点过来的落点高亮。没有这个样式时浏览器确实滚到了，
-   但滚动是瞬时的、页面又长，人看不出是哪一条，会以为「点了没反应/跳错了」。
-   .ev-hit 是脚本加上的（点击即亮）；.event:target 兜底直接粘贴带 # 的 URL。 */
-.event:target,
-.event.ev-hit {
-  background: var(--accent-soft);
-  border-radius: 8px;
-  box-shadow: 0 0 0 2px var(--accent);
-  padding-left: 12px; padding-right: 12px;
-  margin-left: -12px; margin-right: -12px;
-}
-.event:target::after,
-.event.ev-hit::after {
-  content: "◀ 你点的证据";
-  position: absolute; right: 8px; top: 10px;
-  font-size: 11.5px; color: var(--accent); font-weight: 700;
-}
-/* 证据截图已被清理的历史引用：不给链接，标个「已清理」，别让人以为图丢了。 */
-.ev-gone-link { color: var(--muted); }
-.ev-gone-tag {
-  font-size: 10.5px; margin-left: 3px; padding: 0 5px;
-  border: 1px solid var(--border); border-radius: 8px;
-  color: var(--muted);
-}
 .why {
   margin-top: 4px; font-size: 12.5px; color: var(--accent);
   background: var(--accent-soft); border-radius: 6px; padding: 4px 10px;
@@ -225,35 +229,42 @@ code {
 .ev-file { margin-top: 8px; font-size: 12.5px; }
 
 /* 回放用的宽版弹窗。
-   ⚠️ **框必须完全不随帧内容变**（用户要求「播放框一致」）：同一个框，任何会话、
-   任何帧、任何朝向都是这个大小；图片自己在里面 contain 缩放居中。
-   所以比例是**常量** 3/4（手机竖屏常见比例），不再按会话主流朝向去算 ——
-   按会话算会有两个问题：①同会话横竖混排时少数帧的比例不一样 ②换会话框又变。
-   将来真出现横竖变化，也只是图片在这块固定区域里留边，框绝不动。
+   ⚠️ **限宽而不限高**：舞台必须保持原图比例，圆点按百分比定位才准
+   （给舞台加 max-height 会让 object-fit 留白 → 圆点偏移，已踩过）。
+   所以改为按视口反推宽度：取"92vw"与"按高度算出的可用宽"中的较小值。
 
-   高度账（实测）：舞台之外还有 头 ~52 + 字幕 ~50 + 播控 ~44 + 内边距 ~32 ≈ 182px。
-   要总高 ≤ 94vh → 舞台高 ≤ 94vh - 200px（留点余量）→ 宽 = 高 × (4/3) + 36（左右内边距）。 */
+   高度账（实测）：图之外还有 头 ~58 + 字幕 ~50 + 播控 ~44 + 内边距 ~32 + 两段间距 ~20 ≈ 204px。
+   要总高 ≤ 84vh（与 .modal 的 max-height 对齐，原 88vh 会高估预算、把播控条挤出可视区）→
+   图高 ≤ 84vh - 204px → 宽 ≤ (84vh - 204px) × 3040 / 1904。
+   min() 里可以直接写这个算式（CSS 支持在 calc 里混用 vh 与 px）。 */
 .modal.rp-modal {
-  width: min(1240px, 94vw, calc((94vh - 200px) * 1.3333 + 36px));
-  max-height: 94vh;                   /* 回放要尽量大；别的弹窗仍按 84vh */
+  width: min(1100px, 92vw, calc((84vh - 204px) * 3040 / 1904));
+  /* 可拖动：transform 由 JS 的 makeDraggable 写入（不改 left/top，
+     以免破坏上面的宽度算式与 flex 居中）。 */
+  will-change: transform;
+}
+/* 拖动中：抬升层级 + 强化阴影，并**关掉过渡**，否则跟手感会发飘。
+   标题栏只在回放窗显示抓手光标，避免普通弹窗也像可拖。 */
+.modal.rp-modal .modal-head { cursor: move; }
+.modal.rp-modal.dragging {
+  box-shadow: 0 18px 56px rgba(16,24,40,.34);
+  transition: none;
+  z-index: 1;
 }
 
 /* ── 轨迹回放（截图串播 + 点击位置遮罩）── */
 .rp { display: flex; flex-direction: column; gap: 10px; }
-/* 舞台：**比例恒定 4/3，永不改动**。图片 contain 居中留边。
-   ⚠️ 不要按每帧原图去改 aspect-ratio（那是「播放框忽大忽小」的根因）；
-   圆点也不按舞台定位（留边会让它偏），而是按下面 .rp-box 定位。 */
+/* 舞台：黑底 + 固定宽高比（宽高比与原图一致）。
+   ⚠️ 不要再给 max-height 之类的额外限高 —— 一旦舞台比例与图不一致，
+   `object-fit: contain` 会在框内留白，而圆点是按**框**的百分比定位的，
+   位置就会偏（真实缺陷：限高后圆点对不上）。舞台只保持原图比例，让它自己缩放。 */
 .rp-stage {
-  position: relative;                 /* .rp-box / .rp-gone 的定位容器 */
-  width: 100%;
-  aspect-ratio: 4 / 3;
+  position: relative;                 /* 圆点按百分比定位在图上 */
   background: #111; border-radius: 10px; overflow: hidden;
+  aspect-ratio: 3040 / 1904;          /* 占位默认值，JS 会按实际帧覆盖 */
   line-height: 0;                     /* 去掉 img 下方缝隙 */
 }
 .rp-img { width: 100%; height: 100%; display: block; object-fit: contain; }
-/* 图片**真实内容区**（contain 之后的那个矩形），由 JS 按 naturalWidth/Height 算好。
-   圆点放在这里面按百分比定位 → 不管留边多少，点和原图坐标永远对得上。 */
-.rp-box { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 /* 遮罩层上的点击圆点：百分比定位 → 图缩放多少都准。
    半透明填充，能透出下面的界面内容。 */
 .rp-dot {
@@ -268,10 +279,6 @@ code {
   0%   { box-shadow: 0 0 0 2px rgba(255, 59, 48, .22); }
   100% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); }
 }
-/* 圆点已吸附到 via 指向的节点中心（后端解出了 hit_center）→ 实线；
-   解不出来退回原始坐标时用虚线，代表"这个点位是录制时的坐标，可能有偏差"。 */
-.rp-dot-snap { border-style: solid; }
-.rp-dot:not(.rp-dot-snap) { border-style: dashed; }
 /* 字幕条：在图**下方**，不遮挡画面 */
 .rp-sub {
   padding: 9px 14px; border-radius: 8px; background: var(--card);
@@ -285,12 +292,6 @@ code {
 }
 .rp-sub code { background: rgba(128, 128, 128, .18); padding: 1px 6px; border-radius: 4px; }
 .rp-sep { margin: 0 7px; opacity: .38; }
-/* 字幕里的小标签：说明圆点钉在哪个选择器上 */
-.rp-snap-tag {
-  display: inline-block; padding: 1px 7px; border-radius: 10px;
-  font-size: 11.5px; line-height: 1.6; white-space: nowrap;
-  background: rgba(56, 195, 184, .14); color: #2aa79c; border: 1px solid rgba(56, 195, 184, .32);
-}
 .rp-gone {
   position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; color: var(--muted); font-size: 14px;
@@ -300,7 +301,7 @@ code {
 .rp-count { font-size: 12.5px; color: var(--muted); min-width: 68px; text-align: right; }
 .rp-speed { font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--card); color: inherit; }
-.rp-warn { font-size: 12.5px; color: #b8860b; }
+.rp-warn { font-size: 12.5px; color: var(--warn); }
 button[disabled] { opacity: .45; cursor: not-allowed; }
 .ev-file a { color: var(--accent); text-decoration: none; }
 .ev-file a:hover { text-decoration: underline; }
@@ -376,14 +377,30 @@ button:disabled { opacity: .5; cursor: default; }
 .row-link { color: var(--text); text-decoration: none; cursor: pointer; }
 .row-link:hover { color: var(--accent); text-decoration: underline; }
 
-/* 测试记录表列宽：c-act 必须够宽，否则「删除」被裁（真实 bug） */
+/* 测试记录表列宽与对齐。
+   ⚠️ c-act 必须够宽，否则「删除」被裁（真实 bug）。
+   风格：**所有列（表头 + 数据）统一居中**。
+   列宽按内容实测确定；标题列设上限 230px，避免 1fr 独吞剩余空间。 */
 .list-table.recs .lt-head, .list-table.recs .lt-row {
-  grid-template-columns: 52px minmax(160px, 2.2fr) 96px minmax(110px, 1.1fr)
-                         158px 72px 92px 96px;
+  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
+                         120px 68px 88px 120px;
 }
+/* 勾选框列：垂直居中（checkbox 是行内替换元素，text-align 管不了纵向） */
+.list-table.recs .c-chk { display: flex; align-items: center; justify-content: center; }
+.list-table.recs .c-chk input { cursor: pointer; }
+/* 「删除选中」与表格「操作」列对齐：工具栏复用表格的 9 列网格，
+   筛选组横跨前 8 列，按钮固定落在第 9 列（操作列）内居中 */
+.rec-toolbar2 .rec-filters { grid-column: 1 / 9; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.rec-toolbar2 .rec-batch-del { grid-column: 9; justify-self: center; }
+/* 所有列统一居中（表头 + 数据） */
+.list-table.recs .lt-head > span,
+.list-table.recs .lt-row > span { text-align: center; }
+/* 例外：操作列是按钮组，用 flex 居中（text-align 对 flex 容器不生效） */
+.list-table.recs .lt-row .c-act { justify-content: center; }
+.list-table.recs .lt-head .c-act { text-align: center; }
 .lt-row .c-act { overflow: visible; }
 .lt-row .c-act button { white-space: nowrap; }
-.lt-row.diag { background: #fbfbfd; }
+.lt-row.diag { background: var(--bg3); }
 .lt-row.diag .c-title { font-weight: 500; }
 .tag-diag {
   display: inline-block; font-size: 10.5px; font-weight: 600; line-height: 1.6;
@@ -410,13 +427,59 @@ button:disabled { opacity: .5; cursor: default; }
 /* 小按钮 */
 button.sm { padding: 4px 12px; font-size: 12px; border-radius: 6px; }
 button.danger { background: var(--fail); }
-button.ghost.danger { background: var(--card); color: var(--fail); border-color: #f0c9c9; }
+button.ghost.danger { background: var(--card); color: var(--fail); border-color: var(--fail-soft); }
 button.ghost.danger:hover { background: var(--fail-soft); }
 
 /* ══════════════ 模块分组 tab ══════════════ */
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .lib-toolbar { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
 .lib-toolbar .tabs { margin-bottom: 0; flex: 1; }
+
+/* ── 测试记录：搜索 / 统计 / 结论筛选 / 主题切换 ── */
+/* 搜索框与统计行同处一行（搜索框在左，统计紧邻其右） */
+.rec-toolbar { align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 搜索框：占满"统计文字"之外的空间（自适应拉宽），上限 560px，窄屏允许换行 */
+.rec-search {
+  flex: 1 1 320px; min-width: 200px; max-width: 560px;
+  padding: 9px 18px; font-size: 13.5px; font-family: inherit;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); color: var(--text); outline: none;
+  text-align: left; transition: border-color .15s, box-shadow .15s;
+}
+/* 统计文字：紧跟在搜索框右侧，不推到最右端 */
+.rec-stats { margin: 0; text-align: left; white-space: nowrap; }
+/* 主题切换按钮：与「正式测试」同行，靠行尾 */
+.theme-toggle {
+  flex: 0 0 auto; margin-left: auto; white-space: nowrap;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.rec-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(90,140,255,.14); }
+.rec-search::placeholder { color: var(--muted); }
+/* 隐藏浏览器原生 search 的清除按钮（清空改为直接删字符，删空即恢复全部列表） */
+.rec-search::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+/* 结论筛选第二行：与表格同款 9 列网格（列宽和 gap 必须一致，否则列位错开） */
+.rec-toolbar2 {
+  display: grid;
+  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
+                         120px 68px 88px 120px;
+  gap: 12px; align-items: center; margin: -4px 0 14px;
+}
+.rec-flt-label { margin: 0; white-space: nowrap; }
+/* 状态筛选按钮：复用 chip 配色，默认描边态；选中后填充同色 */
+.stab {
+  display: inline-flex; align-items: center; cursor: pointer; font-size: 12.5px;
+  padding: 5px 13px; border-radius: 999px; background: var(--card);
+  border: 1px solid var(--border); color: var(--muted); user-select: none;
+  transition: border-color .15s, color .15s, background .15s; line-height: 1.2;
+}
+.stab:hover { border-color: var(--accent); color: var(--accent); }
+.stab.on { color: #fff; font-weight: 600; border-color: transparent; }
+/* 各状态选中态的底色（与 .chip 软色系对应的实色，保证深色模式可读） */
+.stab.on[data-st="PASS"]    { background: var(--pass); }
+.stab.on[data-st="FAIL"]    { background: var(--fail); }
+.stab.on[data-st="BLOCKED"] { background: var(--blocked); }
+.stab.on[data-st="WARN"]    { background: var(--warn); }
+.stab.on[data-st="ERROR"]   { background: var(--fail); }
 .tab {
   padding: 5px 14px; border-radius: 999px; cursor: pointer; font-size: 12.5px;
   background: var(--card); border: 1px solid var(--border); color: var(--muted);
@@ -461,15 +524,6 @@ button.ghost.danger:hover { background: var(--fail-soft); }
   font-family: inherit; line-height: 1.7;
   max-height: 52vh; overflow: auto;
 }
-/* 用例原文编辑框：和只读态 .case-pre 视觉对齐，换成可改的 textarea */
-.case-edit {
-  display: block; width: 100%; min-height: 46vh; max-height: 52vh;
-  resize: vertical; background: var(--bg3); color: var(--text);
-  border: 1px solid var(--border); border-radius: 8px;
-  padding: 12px 14px; font: 13px/1.7 inherit;
-  font-family: inherit; outline: none; box-sizing: border-box;
-}
-.case-edit:focus { border-color: var(--accent); }
 
 /* 用例详情里的页签（用例原文 / 程序化描述-YAML） */
 .casetabs {
@@ -520,7 +574,7 @@ button.ghost.danger:hover { background: var(--fail-soft); }
 /* 整体成功率 4 段配色（与模块进度条同一套色板，保持一致）：
    ≥90 优秀 / ≥70 良好 / ≥50 偏低 / <50 差 */
 .big-rate.lv-a b { color: var(--pass); }
-.big-rate.lv-b b { color: #0d8f7a; }
+.big-rate.lv-b b { color: var(--pass); }
 .big-rate.lv-c b { color: var(--warn); }
 .big-rate.lv-d b { color: var(--fail); }
 .chart-mid { width: 100%; height: 380px; flex: 1; min-height: 0; }
@@ -578,7 +632,89 @@ button.ghost.danger:hover { background: var(--fail-soft); }
   font-size: 13px; line-height: 1.7; border: 1px solid var(--border);
 }
 .test-box.pending { background: var(--bg3); color: var(--muted); }
-.test-box.ok { background: var(--pass-soft); border-color: #bfe6cf; color: var(--pass); }
-.test-box.err { background: var(--fail-soft); border-color: #f2c9c9; color: var(--fail); }
+.test-box.ok { background: var(--pass-soft); border-color: var(--pass); color: var(--pass); }
+.test-box.err { background: var(--fail-soft); border-color: var(--fail); color: var(--fail); }
 .test-box code { background: rgba(0,0,0,.06); }
 .test-box .meta { color: var(--muted); font-size: 12.5px; }
+
+
+/* ══════════════════════════════════════════════════════════════
+   新版兼容补丁（基于旧版 style.css 作基底）
+   上面是 2026-11-09 旧版完整样式；这里只补两处与当前 JS 不兼容的地方
+   + 新版独有元素的样式。除此之外不再叠加任何列宽/主题补丁。
+   ══════════════════════════════════════════════════════════════ */
+
+/* 1) 结论筛选行：当前 JS 用 flex 一行（删除选中紧跟筛选组），
+      旧版的 grid 第 9 列定位会把它推到最右，这里覆盖掉。 */
+.rec-toolbar2 {
+  display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap; margin: -4px 0 14px;
+}
+.rec-toolbar2 .rec-filters {
+  grid-column: auto; display: flex; align-items: center;
+  gap: 9px; flex-wrap: wrap; min-width: 0;
+}
+.rec-toolbar2 .rec-batch-del {
+  grid-column: auto; justify-self: auto; margin-left: 28px;
+}
+
+/* 2) 结论筛选按钮：默认带状态色 + 加粗，不用实色填充（不用蓝色背景）。
+      当前 JS 的 STATUS_FILTERS 无 WARN，去掉 WARN 规则。 */
+.stab {
+  appearance: none; -webkit-appearance: none;
+  font-weight: 600; color: var(--text);
+}
+.stab[data-st="PASS"]    { color: var(--pass); }
+.stab[data-st="FAIL"]    { color: var(--fail); }
+.stab[data-st="BLOCKED"] { color: var(--blocked); }
+.stab[data-st="ERROR"]   { color: var(--fail); }
+.stab > .chip { background: transparent; color: inherit; font-weight: 600; padding: 0; }
+.stab.on { color: #fff; font-weight: 700; border-color: transparent; }
+.stab.on[data-st="PASS"]    { background: var(--pass); }
+.stab.on[data-st="FAIL"]    { background: var(--fail); }
+.stab.on[data-st="BLOCKED"] { background: var(--blocked); }
+.stab.on[data-st="ERROR"]   { background: var(--fail); }
+
+/* 3) 常驻主题按钮：sidebar 里那个已按用户要求删除，只剩测试记录页那个 */
+.theme-toggle { flex: 0 0 auto; margin-left: auto; white-space: nowrap; }
+
+/* 4) 轨迹回放可拖动 + 复位按钮 */
+.modal.rp-modal { will-change: transform; }
+.modal.rp-modal .modal-head { cursor: move; touch-action: none; user-select: none; }
+.modal.rp-modal.dragging {
+  box-shadow: 0 18px 56px rgba(16,24,40,.34);
+  transition: none; z-index: 1;
+}
+.rp-recenter { flex: 0 0 auto; padding: 4px 10px; font-size: 13px; }
+
+/* 5) 新版独有元素（旧版 CSS 没有这些类） */
+.event:target, .event.ev-hit {
+  background: var(--accent-soft); border-radius: 8px;
+  box-shadow: 0 0 0 2px var(--accent);
+  padding-left: 12px; padding-right: 12px;
+  margin-left: -12px; margin-right: -12px;
+}
+.event:target::after, .event.ev-hit::after {
+  content: "◀ 你点的证据"; position: absolute; right: 8px; top: 10px;
+  font-size: 11.5px; color: var(--accent); font-weight: 700;
+}
+.ev-gone-link { color: var(--muted); }
+.ev-gone-tag {
+  font-size: 10.5px; margin-left: 3px; padding: 0 5px;
+  border: 1px solid var(--border); border-radius: 8px; color: var(--muted);
+}
+.rp-box { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+.rp-dot-snap { border-style: solid; }
+.rp-dot:not(.rp-dot-snap) { border-style: dashed; }
+.rp-snap-tag {
+  display: inline-block; padding: 1px 7px; border-radius: 10px;
+  font-size: 11.5px; line-height: 1.6; white-space: nowrap;
+  background: rgba(56,195,184,.14); color: #2aa79c;
+  border: 1px solid rgba(56,195,184,.35);
+}
+.case-edit {
+  display: block; width: 100%; min-height: 46vh; max-height: 52vh;
+  resize: vertical; background: var(--bg3); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+}
+.case-edit:focus { border-color: var(--accent); }
