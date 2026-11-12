@@ -126,7 +126,20 @@ def apply_stdin_args() -> None:
         return
     import json as _json
     try:
-        raw = sys.stdin.read()
+        # ⚠️ 必须读 **bytes 再显式按 UTF-8 解码**，不能用 `sys.stdin.read()`。
+        #
+        # `sys.stdin.read()` 用的是 `sys.stdin.encoding`，而它在子进程里可能是
+        # **gbk**（Windows 上 PYTHONIOENCODING/PYTHONUTF8 没继承到时就退成系统
+        # 编码，本机实测 `sys.stdin.encoding == 'gbk'`）。拿 gbk 去解 UTF-8 字节，
+        # 解不出来的部分会变成 surrogate（`'\udc92'` 这种），于是：
+        #   · 参数看着"有字"，但中文变成了乱码；
+        #   · 往 meta.json / DB 写 JSON 时直接抛
+        #     `UnicodeEncodeError: 'utf-8' codec can't encode character
+        #      '\udc92' ... surrogates not allowed`
+        #     —— 表现是「动作做了但采集失败」，2026-11-12 实测带中文 --why 必挂。
+        #
+        # 走 buffer 就没有"猜编码"这一步：argv 的 JSON 约定就是 UTF-8。
+        raw = sys.stdin.buffer.read().decode("utf-8-sig")  # sig：顺手吃掉 BOM
         payload = _json.loads(raw) if raw.strip() else {}
     except (OSError, ValueError):
         return

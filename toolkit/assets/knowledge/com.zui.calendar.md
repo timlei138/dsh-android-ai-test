@@ -144,15 +144,24 @@ dump 里**没有** `Dialog` 字样，activity 名也不带 Dialog，**但这就�
 
 **⭐ 「提醒生效了没有」的判据：看通知栏**
 
-**最简单的方法 —— 直接把通知栏拉下来看：**
+**最简单的方法 —— 直接看通知栏：**
 
-```powershell
-# 1. 拉下通知栏
-python tools/act.py swipe --from <屏幕上方> --to <屏幕下方>
-# 2. observe 看屏幕上有没有那条日程通知（截图/OCR 都能看到标题）
+```
+android_system(action="notifications", why="判提醒有没有来")
 ```
 
+一次调用就把通知栏展开、截图、dump 解析完，返回：
+
+- `applied` —— 展开成功没有（`true` 成功 / `false` 没成功 / `null` 判不了，看截图）
+- `notifications[]` —— 每条通知的 `title` / `texts` / `center`（要点击就用这个坐标）
+- `rows_detected` —— 认不认得出通知行。**`false` 时 `notifications` 为空不代表没有通知**，
+  是这个 ROM 换了行 id，请看截图判断
+- `shade_note` —— 认不出时的说明
+
 **这也是用户实际做的动作** —— 提醒来了，就是通知栏里多一条。
+
+用完记得收起（`android_system(action="close_shade")`），或直接
+`android_system(action="notifications", close=True)` 看一眼顺手收掉。
 
 **要看结构化数据时（不用拉通知栏）：**
 
@@ -223,14 +232,17 @@ alarm 存在≠用户收到通知，alarm 不在≠通知没来（触发后就�
 3. `dumpsys alarm` 里目标闹钟仍在
 
 
-### 通知栏会挡住操作且 back 关不掉
+### 通知栏会挡住操作 —— 用 android_system 收起
 
 上一条用例结束在**通知栏展开**状态时，下一条的第一步会打在通知栏上而**完全无效**，
 表现为 `activity` 仍是 `NotificationShade`、checkpoint 不命中。
 
 - 判据：`dumpsys window | grep -m1 mCurrentFocus` 返回 `Window{… u0 NotificationShade}`
-- **`act back` 与 `KEYCODE_BACK` 都关不掉**（反复无效）
-- ✅ 有效手段：`adb shell input swipe 1520 1400 1520 200 300`（从下往上滑），或 `KEYCODE_HOME`
+- ✅ **收起的正确做法**：`android_system(action="close_shade")` —— 内部走 back 键，
+  收起后再用 `dumpsys window` 复核一遍，仍展开才退到 `cmd statusbar collapse`
+- 通知栏展开时按 `android_act(action="back")` 也能收起（2026-11-12 实测）；
+  但 `close_shade` 会复核、也能收快捷设置面板，优先用它
+- ⚠️ 不要用「再拉一次通知栏」去收起 —— 实测连拉两次仍是展开
 
 
 ---

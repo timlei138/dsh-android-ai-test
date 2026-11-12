@@ -469,6 +469,8 @@
                             · android_read_file —— **读知识卡 + 路径卡**（UTF-8，永不乱码）
                             · android_perm      —— **查/授/撤权限**（走 adb，不走弹窗）
                             · android_state     —— **清数据 / 起停 App**（只在用例明确要求时用）
+                            · android_system    —— **通知栏 / 快捷设置 / 亮屏解锁 / 多任务**
+                                                  （别用 swipe 下拉，见下）
                             · bash              —— 只用来跑 `session.py`（开会话、记断言、收尾）
                                                   动设备、看屏幕一律走 android_* 工具，不要用 bash
                             · read/glob/grep    —— 读 SKILL.md、读知识卡、看用例 md
@@ -660,6 +662,39 @@
 
                             · 用例没写清理 → **什么都不做**（清理不是你的收尾动作，见 SKILL）
                             · 清完数据下次进 App 会重弹隐私协议 + 权限框，那是正常的
+
+                            ## 通知栏 / 系统面板：`android_system`
+
+                            **别用 `android_act` 的 swipe 去拉通知栏** —— 手势要求起点贴着
+                            屏幕最顶端、速度有讲究、坐标随分辨率变，实测同一条用例里
+                            「再试一次拉下通知栏」出现过 9 次。
+
+                            ```
+                            android_system(action="notifications", why="判提醒有没有来")
+                            android_system(action="notifications", close=True)   # 看一眼顺手收起
+                            android_system(action="quick_settings")
+                            android_system(action="close_shade")
+                            android_system(action="wake")      # 只点亮，不动当前 App
+                            android_system(action="unlock")    # 点亮 + 上滑解锁
+                            android_system(action="recents")   # 多任务
+                            ```
+
+                            返回里先看 `applied`（**动作到底生效了没有**）：
+
+                            · `true` —— 生效了
+                            · `false` —— 没生效，先 `unlock` 再试一次；**同一步最多试 2 次**
+                            · `null` —— **工具判不了**，这时必须看截图确认，**不要重试**
+                              （重试不会让判断更清楚）。`recents` 永远是 `null`，
+                              因为多任务界面由 launcher 决定，没有跨 ROM 通用的标记
+
+                            `notifications` 还会顺手把面板内容解析出来：
+
+                            · `notifications[]` —— 每条通知的 `title` / `texts` / `center`
+                            · `rows_detected` —— 认不认得出通知行。**`false` 时列表为空
+                              ≠ 没有通知**，是这个 ROM 换了行 id，请看截图
+                            · `shade_note` —— 认不出时的说明
+
+                            ⚠️ 展开的通知栏会挡住后续操作，用完记得 `close_shade`。
 
                             ## serial
 

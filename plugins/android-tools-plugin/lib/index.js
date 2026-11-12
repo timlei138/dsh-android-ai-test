@@ -667,4 +667,81 @@ export function apply(ctx, config = {}) {
       },
     }),
   )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'android_system',
+      description:
+        '系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 多任务）。**别再用 swipe 手势下拉通知栏**：手势要求起点贴顶、速度有讲究、坐标随分辨率变，历史上同一会话里反复"再试一次拉下通知栏"的有 9 个；系统调用本身只要 43 毫秒。一次调用内做完「打开 → 截图 → dump → 解析出通知列表」，所以比「act 下拉 + observe 看」少一次往返（约省 5 秒）。返回值里的 notifications 已按条解析好（title/texts/clickable/center），判「提醒有没有来」直接看它，不必再 observe。',
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          enum: [
+            'notifications',
+            'quick_settings',
+            'close_shade',
+            'wake',
+            'unlock',
+            'recents',
+          ],
+          description:
+            'notifications=展开通知栏并解析通知列表 / quick_settings=展开快捷设置 / close_shade=收起面板 / wake=点亮屏幕 / unlock=点亮并上滑解锁（无密码锁屏）/ recents=打开多任务',
+        },
+        close: {
+          type: 'boolean',
+          description:
+            'notifications / quick_settings 用：证据拍完顺手收起。证据仍是「展开的样子」，收起后 next 为空（那些坐标已失效）',
+        },
+        why: { type: 'string', description: '为什么做这个动作（进时间轴）' },
+        name: { type: 'string', description: '证据名，如 case85/step07' },
+        expect: {
+          type: 'string',
+          description:
+            '检查点：这一步应落在哪。形如 activity=XxxActivity 或 rid=xxx',
+        },
+        settle: {
+          type: 'number',
+          description: '动作后稳定等待毫秒数，默认 500',
+        },
+        serial: { type: 'string', description: '设备 serial；只有一台设备时可省略' },
+        full: {
+          type: 'boolean',
+          description: '返回全量 nodes（默认只给精简可点清单 next）',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            ok: { type: 'boolean' },
+            shade_open: { type: 'boolean' },
+            notifications: { type: 'array' },
+            notification_count: { type: 'number' },
+            hint: { type: 'string' },
+          },
+        },
+        render: (_a, v) => [
+          { type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v) },
+        ],
+      },
+      async execute(args, exec) {
+        const rest = [String(args.action || '')]
+        const push = (flag, value) => {
+          if (value !== undefined && value !== null && value !== '') {
+            rest.push(flag, String(value))
+          }
+        }
+        if (args.close === true) rest.push('--close')
+        push('--why', args.why)
+        push('--name', args.name)
+        push('--expect', args.expect)
+        push('--settle', args.settle)
+        push('--serial', args.serial)
+        if (args.full === true) rest.push('--full')
+        return runTool('system.py', rest, exec)
+      },
+    }),
+  )
 }
