@@ -7,6 +7,42 @@ const main = $("#main");
 let kbCurrent = null;    // 当前编辑的知识卡名
 let caseFilter = "all";  // 用例库当前模块过滤
 let showDiag = false;    // 测试记录是否显示验证/调试会话
+let recQuery = "";       // 测试记录搜索词（标题 / 结论 模糊匹配）
+let recSearchTimer = null; // 输入防抖：停止输入 1s 后自动搜索
+let recStatusFilter = []; // 测试记录结论筛选（多选）：空=不过滤
+let viewSeq = 0;         // 导航令牌：迟到响应不覆盖当前视图
+
+// ── 主题（浅色 / 深色）──
+const THEME_KEY = "dsh-theme";
+function systemPrefersDark() {
+  try { return window.matchMedia("(prefers-color-scheme: dark)").matches; } catch { return false; }
+}
+function getTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch {}
+  return saved === "dark" || saved === "light" ? saved : (systemPrefersDark() ? "dark" : "light");
+}
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "dark") root.setAttribute("data-theme", "dark");
+  else root.removeAttribute("data-theme");
+  syncThemeButtons(mode);
+}
+function syncThemeButtons(mode) {
+  const dark = (mode || getTheme()) === "dark";
+  $$("[data-theme-toggle]").forEach(b => {
+    b.textContent = dark ? "☀ 浅色" : "🌙 深色";
+    b.title = dark ? "切换到浅色主题" : "切换到深色主题";
+    b.setAttribute("aria-label", b.title);
+    b.setAttribute("aria-pressed", String(dark));
+  });
+}
+function setTheme(mode) {
+  try { localStorage.setItem(THEME_KEY, mode); } catch {}
+  applyTheme(mode);
+}
+function toggleTheme() { setTheme(getTheme() === "dark" ? "light" : "dark"); }
+applyTheme(getTheme());   // 尽早应用，避免首屏闪白
 
 // ── 工具 ──
 async function api(path, opts) {
@@ -120,6 +156,63 @@ function modal(title, bodyHTML, footerHTML = "") {
   return { el, close };
 }
 
+// ── 拖动模态框（用于轨迹回放：图较大，常要挪开遮挡）──
+// 用 transform: translate() 位移，不改 left/top：面板仍由 flex 居中、不撑坏宽版回放布局。
+function makeDraggable(panel, handle) {
+  const h = handle || panel.querySelector(".modal-head");
+  if (!h) return { reset() {} };
+  let dx = 0, dy = 0, sx = 0, sy = 0, dragging = false;
+  let base = null;
+  const measure = () => {
+    const t = panel.style.transform;
+    panel.style.transform = "none";
+    const r = panel.getBoundingClientRect();
+    base = { l: r.left, t: r.top, w: r.width, h: r.height };
+    panel.style.transform = t;
+  };
+  const clamp = () => {
+    if (!base) measure();
+    const keep = Math.min(120, base.w);
+    const minX = -base.l - (base.w - keep);
+    const maxX = window.innerWidth - keep - base.l;
+    const minY = -base.t;
+    const maxY = window.innerHeight - 48 - base.t;
+    dx = Math.max(minX, Math.min(maxX, dx));
+    dy = Math.max(minY, Math.min(maxY, dy));
+  };
+  const apply = () => { panel.style.transform = `translate(${dx}px, ${dy}px)`; };
+  h.style.cursor = "move";
+  h.style.touchAction = "none";
+  h.style.userSelect = "none";
+  h.title = "按住可拖动窗口（双击标题栏 / 点 ⌖ 复位）";
+  h.addEventListener("pointerdown", ev => {
+    if (ev.target.closest("button")) return;
+    dragging = true; base = null;
+    sx = ev.clientX - dx; sy = ev.clientY - dy;
+    h.setPointerCapture(ev.pointerId);
+    panel.classList.add("dragging");
+  });
+  h.addEventListener("pointermove", ev => {
+    if (!dragging) return;
+    dx = ev.clientX - sx; dy = ev.clientY - sy;
+    clamp(); apply();
+  });
+  const end = ev => {
+    if (!dragging) return;
+    dragging = false;
+    panel.classList.remove("dragging");
+    try { h.releasePointerCapture(ev.pointerId); } catch {}
+  };
+  h.addEventListener("pointerup", end);
+  h.addEventListener("pointercancel", end);
+  const reset = () => { dx = 0; dy = 0; base = null; apply(); };
+  h.addEventListener("dblclick", reset);
+  window.addEventListener("resize", () => {
+    if (dx || dy) { base = null; clamp(); apply(); }
+  });
+  return { reset };
+}
+
 // ── 视图路由（点哪个哪个高亮）──
 const VIEWS = {
   dashboard: () => viewDashboard(),
@@ -133,6 +226,9 @@ function activateNav(view) {
 }
 $$(".nav-item").forEach(el =>
   el.addEventListener("click", () => {
+    if (el.dataset.view !== "sessions" && recSearchTimer) {
+      clearTimeout(recSearchTimer); recSearchTimer = null;
+    }
     activateNav(el.dataset.view);
     (VIEWS[el.dataset.view] || viewDashboard)();
   }));
@@ -335,22 +431,70 @@ async function viewDashboard() {
 }
 
 // ══════════════════ 测试记录 ══════════════════
+// 结论的本地化别名：输入中文也能命中对应状态（不区分大小写）
+const STATUS_FILTERS = ["PASS", "FAIL", "BLOCKED", "ERROR"];
+const STATUS_ALIASES = {
+  PASS: ["pass", "通过", "成功", "合格", "已通过"],
+  FAIL: ["fail", "失败", "不通过", "未通过", "错误"],
+  BLOCKED: ["blocked", "阻断", "阻塞", "受阻", "无法判定"],
+  ERROR: ["error", "错误"],
+  RUNNING: ["running", "执行中", "运行中", "进行中"],
+};
+function matchSession(s, q) {
+  const title = String(s.title || `会话 #${s.id}`).toLowerCase();
+  if (title.includes(q)) return true;
+  const st = String(s.status || "").toUpperCase();
+  if (st.toLowerCase().includes(q)) return true;
+  const alias = STATUS_ALIASES[st];
+  return !!(alias && alias.some(a => a.includes(q)));
+}
+
 async function viewSessions() {
+  const seq = ++viewSeq;
   activateNav("sessions");
   main.innerHTML = "<div class='sub'>加载中…</div>";
-  const { sessions, kinds } = await api("/api/sessions" + (showDiag ? "?all=1" : ""));
+  let url = "/api/sessions" + (showDiag ? "?all=1" : "");
+  if (recStatusFilter.length) {
+    const p = recStatusFilter.map(x => "status=" + encodeURIComponent(x)).join("&");
+    url += (url.includes("?") ? "&" : "?") + p;
+  }
+  const { sessions, kinds } = await api(url);
+  if (seq !== viewSeq) return; // 用户已切走，放弃本次渲染
   const diagN = (kinds && kinds.diag) || 0;
   const testN = (kinds && kinds.test) || 0;
 
+  const q = recQuery.trim().toLowerCase();
+  let matched = q ? sessions.filter(s => matchSession(s, q)) : sessions;
+  if (recStatusFilter.length) {
+    const allow = recStatusFilter.map(x => x.toUpperCase());
+    matched = matched.filter(s => allow.includes(String(s.status || "").toUpperCase()));
+  }
+  const fcount = recStatusFilter.length
+    ? ` · 结论筛选 [${recStatusFilter.join("/")}] 命中 <b>${matched.length}</b> 条` : "";
+
   main.innerHTML = `
     <h1>测试记录</h1>
-    <div class="lib-toolbar">
-      <div class="sub" style="margin:0">正式测试 <b>${testN}</b> 条${diagN ? ` · 验证/调试 <b>${diagN}</b> 条（默认不显示）` : ""}</div>
-      <span style="flex:1"></span>
+    <div class="lib-toolbar rec-toolbar">
+      <input type="search" id="rec-search" class="rec-search" placeholder="按标题或结论搜索…"
+        value="${esc(recQuery)}" title="按标题或结论模糊匹配（不区分大小写），停止输入 1 秒自动搜索">
+      <div class="sub rec-stats">正式测试 <b>${testN}</b> 条${diagN ? ` · 验证/调试 <b>${diagN}</b> 条（默认不显示）` : ""}${
+        q ? ` · 搜索"${esc(recQuery.trim())}"命中 <b>${matched.length}</b> 条` : ""}${fcount}</div>
       ${diagN ? `<label class="chk"><input type="checkbox" id="show-diag"${showDiag ? " checked" : ""}>显示验证记录</label>` : ""}
+      <button class="ghost sm theme-toggle" data-theme-toggle title="切换浅色/深色主题">🌙 深色</button>
+    </div>
+    <div class="lib-toolbar rec-toolbar2">
+      <div class="rec-filters">
+        <span class="sub rec-flt-label">按结论筛选：</span>
+        ${STATUS_FILTERS.map(st => `<button class="stab${recStatusFilter.includes(st) ? " on" : ""}"
+          data-st="${st}" title="筛选结论为 ${st} 的记录（可多选）">${statusChip(st)}</button>`).join("")}
+        ${recStatusFilter.length ? `<button class="ghost sm" id="rec-flt-clear" title="清除结论筛选">清除筛选</button>` : ""}
+      </div>
+      <button class="ghost sm danger rec-batch-del" id="rec-batch-del" disabled
+        title="删除勾选的记录及其截图/日志证据，不可恢复">🗑 删除选中</button>
     </div>
     <div class="list-table recs">
       <div class="lt-head">
+        <span class="c-chk"><input type="checkbox" id="rec-sel-all" title="全选 / 全不选（仅当前列表）"></span>
         <span class="c-id">#</span>
         <span class="c-title">标题</span>
         <span class="c-status">结论</span>
@@ -360,12 +504,13 @@ async function viewSessions() {
         <span class="c-cnt">事件/断言</span>
         <span class="c-act">操作</span>
       </div>
-      ${sessions.map(s => `
-        <div class="lt-row${s.kind === "diag" ? " diag" : ""}" data-id="${s.id}">
+      ${matched.map(s => `
+        <div class="lt-row${s.kind === "diag" ? " diag" : ""}" data-id="${esc(s.id)}">
+          <span class="c-chk"><input type="checkbox" class="rec-check" data-id="${esc(s.id)}" title="勾选后可批量删除"></span>
           <span class="c-id" title="${esc(s.id)}">${esc(sidShort(s.id))}</span>
           <span class="c-title" title="${esc(s.title || `会话 #${s.id}`)}">
             ${s.kind === "diag" ? '<span class="tag-diag">验证</span>' : ""}
-            <a class="row-link" data-id="${s.id}">${esc(s.title || `会话 #${s.id}`)}</a>
+            <a class="row-link" data-id="${esc(s.id)}">${esc(s.title || `会话 #${s.id}`)}</a>
           </span>
           <span class="c-status">${statusChip(s.status)}</span>
           <span class="c-pkg" title="${esc(s.package || "")}">${esc(pkgShort(s.package))}</span>
@@ -373,21 +518,57 @@ async function viewSessions() {
           <span class="c-dur">${fmtDuration(s.duration_seconds)}</span>
           <span class="c-cnt">${s.event_count} / ${s.finding_count}</span>
           <span class="c-act">
-            <button class="ghost sm" data-replay="${s.id}"
+            <button class="ghost sm" data-replay="${esc(s.id)}"
               ${s.has_evidence ? "" : "disabled"}
               title="${s.has_evidence ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 回放</button>
-            <button class="ghost sm danger" data-del="${s.id}" title="删除该记录及其截图/日志">删除</button>
+            <button class="ghost sm danger" data-del="${esc(s.id)}" title="删除该记录及其截图/日志">删除</button>
           </span>
-        </div>`).join("") || "<div class='lt-empty'>还没有记录。用 <code>session.py start</code> 开启会话后由 AI 执行用例。</div>"}
+        </div>`).join("") || (q
+          ? `<div class='lt-empty'>没有标题或结论匹配"${esc(recQuery.trim())}"的记录。</div>`
+          : "<div class='lt-empty'>还没有记录。用 <code>session.py start</code> 开启会话后由 AI 执行用例。</div>")}
     </div>`;
 
+  // 搜索框：停止输入 1 秒自动搜索；清空立即恢复
+  const searchEl = $("#rec-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", () => {
+      recQuery = searchEl.value;
+      if (recSearchTimer) { clearTimeout(recSearchTimer); recSearchTimer = null; }
+      if (!recQuery.trim()) { viewSessions(); return; }
+      recSearchTimer = setTimeout(() => { recSearchTimer = null; viewSessions(); }, 1000);
+    });
+    searchEl.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") {
+        if (recSearchTimer) { clearTimeout(recSearchTimer); recSearchTimer = null; }
+        recQuery = searchEl.value;
+        viewSessions();
+      }
+    });
+    if (recQuery) {
+      searchEl.focus();
+      try { searchEl.setSelectionRange(searchEl.value.length, searchEl.value.length); } catch {}
+    }
+  }
   const cb = $("#show-diag");
   if (cb) cb.addEventListener("change", () => { showDiag = cb.checked; viewSessions(); });
+  $$(".stab", main).forEach(btn =>
+    btn.addEventListener("click", () => {
+      const st = btn.dataset.st;
+      const i = recStatusFilter.indexOf(st);
+      if (i >= 0) recStatusFilter.splice(i, 1);
+      else recStatusFilter.push(st);
+      viewSessions();
+    }));
+  const clr = $("#rec-flt-clear");
+  if (clr) clr.addEventListener("click", () => { recStatusFilter = []; viewSessions(); });
+  $$("[data-theme-toggle]").forEach(b =>
+    b.addEventListener("click", () => { toggleTheme(); syncThemeButtons(); }));
+  syncThemeButtons();
   $$(".row-link", main).forEach(el =>
     el.addEventListener("click", () => viewSession(el.dataset.id)));
   $$("[data-del]", main).forEach(el =>
     el.addEventListener("click", ev => {
-      ev.stopPropagation();          // 不能触发"点击查看"
+      ev.stopPropagation();
       confirmDeleteSession(el.dataset.del);
     }));
   $$("[data-replay]", main).forEach(el =>
@@ -395,6 +576,57 @@ async function viewSessions() {
       ev.stopPropagation();
       replaySession(el.dataset.replay);
     }));
+
+  // 批量删除
+  const selAll = $("#rec-sel-all");
+  const batchBtn = $("#rec-batch-del");
+  const checkedIds = () => $$(".rec-check:checked", main).map(el => el.dataset.id);
+  const syncBatch = () => {
+    const ids = checkedIds();
+    if (batchBtn) {
+      batchBtn.disabled = !ids.length;
+      batchBtn.textContent = ids.length ? `🗑 删除选中 (${ids.length})` : "🗑 删除选中";
+    }
+    if (selAll) selAll.checked = ids.length > 0 && ids.length === $$(".rec-check", main).length;
+  };
+  $$(".rec-check", main).forEach(el => el.addEventListener("change", syncBatch));
+  if (selAll) selAll.addEventListener("change", () => {
+    $$(".rec-check", main).forEach(el => { el.checked = selAll.checked; });
+    syncBatch();
+  });
+  if (batchBtn) batchBtn.addEventListener("click", () => {
+    const ids = checkedIds();
+    if (ids.length) confirmDeleteSessions(ids);
+  });
+}
+
+function confirmDeleteSessions(ids) {
+  const m = modal("批量删除测试记录", `
+    <div class="warn-text">确定删除 <b>${ids.length}</b> 条记录吗？</div>
+    <div class="meta">将同时删除这些记录的事件流、断言，以及<b>磁盘上的截图与日志证据</b>，<b>不可恢复</b>。
+    被测 App 本身不受影响。</div>
+    <label class="chk" style="margin-top:10px">
+      <input type="checkbox" id="del-ev-b" checked> 同时删除截图 / 日志文件
+    </label>`,
+    `<button class="ghost" data-cancel>取消</button>
+     <button class="danger" data-ok>确认删除</button>`);
+  $("[data-cancel]", m.el).addEventListener("click", m.close);
+  $("[data-ok]", m.el).addEventListener("click", async () => {
+    const withEv = $("#del-ev-b", m.el).checked;
+    const okBtn = $("[data-ok]", m.el);
+    okBtn.disabled = true; okBtn.textContent = "删除中…";
+    let okN = 0, failN = 0;
+    for (const id of ids) {
+      try {
+        const r = await api(`/api/sessions/${encodeURIComponent(id)}?evidence=${withEv ? 1 : 0}`,
+                            { method: "DELETE" });
+        if (r && r.ok) okN++; else failN++;
+      } catch { failN++; }
+    }
+    m.close();
+    await viewSessions();
+    toast(`批量删除完成：成功 ${okN} 条${failN ? `，失败 ${failN} 条` : ""}`);
+  });
 }
 
 function confirmDeleteSession(id) {
@@ -495,10 +727,13 @@ async function replaySession(id) {
           <option value="500">2×</option>
           <option value="250">4×</option>
         </select>
+        <button class="ghost rp-recenter" data-rp="recenter" title="把窗口移回屏幕中央">⌖</button>
       </div>
       ${data.missing ? `<div class="rp-warn">⚠️ ${data.missing} 帧的截图已被清理，播放时显示占位</div>` : ""}
     </div>`);
   m.el.querySelector(".modal").classList.add("rp-modal");   // 宽版，图才看得清
+  const drag = makeDraggable(m.el.querySelector(".modal"));
+  $("[data-rp='recenter']", m.el).addEventListener("click", () => drag.reset());
 
   /* 舞台比例是 CSS 里的**常量 4/3**（电脑屏幕是宽的），任何会话、任何帧、任何朝向
      都不改动 —— 这才是「播放框一致」。图片自己 object-fit: contain：横屏帧
@@ -626,7 +861,13 @@ async function replaySession(id) {
     if (timer) { stop(); return; }
     playBtn.textContent = "⏸";
     const tick = () => {
-      if (i >= data.total - 1) { stop(); return; }
+      if (i >= data.total - 1) {
+        // 播放到末帧：停播并把进度条/画面复位到起点，
+        // 这样一次回放结束后再点播放会从头开始（关闭窗口后重开也是第 1 帧）。
+        stop();
+        show(0);
+        return;
+      }
       show(i + 1);
     };
     timer = setInterval(tick, Number(speedSel.value));
@@ -1196,3 +1437,13 @@ async function viewKnowledge(name) {
 
 activateNav("dashboard");
 viewDashboard();
+
+
+/* ── 常驻主题按钮（sidebar 底部，所有视图都能切换）──
+   viewSessions() 里的按钮是每次重渲染生成的，那边已各自绑定；
+   这里只负责 sidebar 里那个不随视图重建的按钮。 */
+(function initGlobalTheme() {
+  // 主题切换按钮现在只在「测试记录」页工具行（viewSessions 里每次重渲染都会绑定），
+  // sidebar 里那个重复的已移除；这里只负责首屏同步按钮文字。
+  syncThemeButtons();
+})();

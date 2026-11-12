@@ -2,8 +2,10 @@
 """本地 Web 测试台（v2）：测试会话时间线 + 知识库编辑。
 零依赖：Python 标准库 http.server。
 
-启动:  python webui.py [--port 8900]
-访问:  http://127.0.0.1:8900
+启动:  python webui.py [--port 8900] [--host 0.0.0.0]
+默认绑定 0.0.0.0（内网可访问），启动时打印本机内网 IP。
+访问:  http://<本机内网IP>:8900
+⚠️ 无鉴权，仅限可信内网使用；可用 --host 127.0.0.1 退回仅本机。
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import base64
 import json
 import os
 import re
+import socket
 import sys
 import urllib.parse
 from datetime import datetime
@@ -241,7 +244,8 @@ def _open_db() -> SessionDB | None:
 
 
 def all_sessions(include: tuple[str, ...] | None = None,
-                 kind: str | None = "test") -> list[dict]:
+                  kind: str | None = "test",
+                  statuses: list[str] | None = None) -> list[dict]:
     """全部会话列表（单库直查，不再跨库合并）。
 
     每个 session 的 `id` 保持全局数字 id；`run_id` 从库里读，
@@ -261,6 +265,10 @@ def all_sessions(include: tuple[str, ...] | None = None,
         r["run_id"] = r.get("run_id") or ""
         out.append(r)
     out.sort(key=lambda r: str(r.get("started_at") or ""), reverse=True)
+    # 结论筛选（前端「按结论筛选」多选按钮 → URL ?status=PASS&status=FAIL）
+    if statuses:
+        want = {str(x).upper() for x in statuses if x}
+        out = [r for r in out if str(r.get("status") or "").upper() in want]
     return out
 
 
@@ -874,9 +882,11 @@ class Handler(BaseHTTPRequestHandler):
             # 口径一致，否则"显示全部"会漏出 mock 而计数里又没有它。
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             show_all = qs.get("all", ["0"])[0] in ("1", "true")
+            statuses = [x for x in qs.get("status", []) if x] or None
             sessions = all_sessions(
                 include=("test", "diag") if show_all else None,
-                kind=None if show_all else "test")
+                kind=None if show_all else "test",
+                statuses=statuses)
             return self._json({"sessions": sessions,
                                "stats": session_stats_all(),
                                "kinds": session_kind_counts_all()})
@@ -1189,15 +1199,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _lan_ip() -> str:
+    """探测本机对外 IP（UDP 连接不发实际数据包，仅取本地 socket 地址）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Android AI 测试台")
     ap.add_argument("--port", type=int, default=8900)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="监听地址，默认 0.0.0.0（内网可访问）；"
+                         "用 --host 127.0.0.1 可退回仅本机")
     args = ap.parse_args()
     if args.host not in ("127.0.0.1", "localhost", "::1"):
-        print("⚠️ 警告：绑定非回环地址——Web UI 无鉴权，知识库 POST 接口可被"
-              "同网段任意改写，仅限可信内网短时使用！")
-    print(f"测试台: http://{args.host}:{args.port}")
+        print("⚠️ 警告：绑定非回环地址——Web UI 无鉴权，"
+              "删除记录 / 改写知识卡 / 编辑用例等接口同网段任意可调用，"
+              "仅限可信内网短时使用！")
+    lan = _lan_ip()
+    show = "127.0.0.1" if args.host in ("127.0.0.1", "localhost", "::1") else lan
+    print(f"测试台: http://{show}:{args.port}   (本机访问 http://127.0.0.1:{args.port})")
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
