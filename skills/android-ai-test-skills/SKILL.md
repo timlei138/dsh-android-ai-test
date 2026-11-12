@@ -549,6 +549,43 @@ android_vision(image="<上一次 act/observe 返回的 evidence.png>",
 - 它返回 `{text, usage, hint}`。**空回答 ≠ 画面里没有**：工具会自己报失败并提示加大 `max_tokens`（默认 2000）或把问题问短，别把空白当成否定证据。
 - 它只是辅助判据，PASS/FAIL 结论仍要结合 nodes / OCR 证据。
 
+### 通知栏 / 快捷设置 / 亮屏解锁：用 `android_system`，不要用 swipe 下拉
+
+**别用 `android_act` 的 swipe 去拉通知栏。** 手势要求起点贴着屏幕最顶端、速度有讲究、
+坐标还随分辨率变 —— 历史上有 9 次「再试一次拉下通知栏」，全是这么来的。
+
+```
+android_system(action="notifications", why="判提醒有没有来")
+android_system(action="notifications", close=True)   # 看一眼顺手收起
+android_system(action="quick_settings")
+android_system(action="close_shade")
+android_system(action="wake")      # 只点亮，不动当前 App
+android_system(action="unlock")    # 点亮 + 上滑解锁
+android_system(action="recents")   # 多任务
+```
+
+它一次调用就把「开 → 截图 → dump → 解析通知列表」做完，所以**不需要再 observe 一次**。
+
+返回里先看 `applied`（动作到底生效了没有）：
+
+| `applied` | 含义 | 你要做的 |
+|---|---|---|
+| `true` | 确认生效 | 继续 |
+| `false` | 确认没生效 | 先 `unlock` 再试一次；**同一步最多试 2 次** |
+| `null` | **工具判不了** | **看这次的截图确认，不要重试** —— 重试不会让判断更清楚 |
+
+`recents` 永远是 `null`：多任务界面由 launcher 决定（RecentsActivity / Overview / 直接叠桌面），
+没有跨 ROM 通用的标记。
+
+`notifications` 还会顺手给出面板内容，**但这只是参考**：
+
+- `notifications[]` —— 每条通知的 `title` / `texts` / `center`
+- `rows_detected` —— 认不认得出通知行。**`false` 时列表为空 ≠ 没有通知**，
+  是这个 ROM 换了行 id，**请看截图**，别据此判「提醒没来」
+- `shade_note` —— 认不出时的原因说明
+
+⚠️ 展开的通知栏会挡住后续操作，用完记得 `close_shade`。
+
 ## 权限：弹窗不用管
 
 **弹窗工具会自己点掉，你什么都不用做。**
@@ -635,7 +672,8 @@ abandon 不覆盖已写的结论」）—— 所以先 finish 再想作废，来
 假记录。跑完自检、装完机验证这类「不是用例」的会话，正确做法是趁它还是 `running`：
 
 ```bash
-python tools/session.py abandon --id N --reason "作废：装机冒烟，不是用例"
+& "<toolkit>\.venv\Scripts\python.exe" "<toolkit>\tools\session.py" abandon `
+    --id N --reason "作废：装机冒烟，不是用例"
 ```
 
 ### ⚠️ 用例写法：「字段（如…）」「（最多N）」这类括号**是要验的规格**
