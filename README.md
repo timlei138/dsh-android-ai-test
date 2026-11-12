@@ -63,6 +63,7 @@ dependency，`pnpm install` 对它们无事可做）；preset 不 import 任何�
 | DSH | 0.2.1-rc.2+ |
 | Node.js | 20+ |
 | Python | 3.10+ |
+| PowerShell 7（Windows） | **强烈建议装**，不装每次工具调用慢 0.9~1.5 秒（→ [安装说明 1.1](安装说明.md)） |
 | 系统 | Windows + PowerShell 是主线；Linux / macOS 已实跑验证（`toolkit/scripts/setup.sh`） |
 | 设备 | Android **真机**，已开 USB 调试 |
 
