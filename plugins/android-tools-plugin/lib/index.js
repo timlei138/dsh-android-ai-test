@@ -251,12 +251,12 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_act',
       description:
-        '在真机上执行一个动作（tap / longclick / input / swipe / back / home / key），执行后自动返回动作后的画面（截图 + UI 树 + 可点清单 next）。参数是结构化 JSON，不走 shell 解析。',
+        '在真机上执行一个动作（tap / longclick / input / swipe / back / home / recents / key），执行后自动返回动作后的画面（截图 + UI 树 + 可点清单 next）。参数是结构化 JSON，不走 shell 解析。',
       parameters: {
         action: {
           type: 'string',
           required: true,
-          enum: ['tap', 'longclick', 'input', 'swipe', 'back', 'home', 'key'],
+          enum: ['tap', 'longclick', 'input', 'swipe', 'back', 'home', 'recents', 'key'],
           description: '动作类型',
         },
         x: { type: 'number', description: 'tap/longclick/input 的 x 坐标' },
@@ -672,7 +672,7 @@ export function apply(ctx, config = {}) {
     defineTool({
       name: 'android_system',
       description:
-        '系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 多任务）。**别再用 swipe 手势下拉通知栏**：手势要求起点贴顶、速度有讲究、坐标随分辨率变，历史上同一会话里反复"再试一次拉下通知栏"的有 9 个；系统调用本身只要 43 毫秒。一次调用内做完「打开 → 截图 → dump → 解析出通知列表」，所以比「act 下拉 + observe 看」少一次往返（约省 5 秒）。返回值里的 notifications 已按条解析好（title/texts/clickable/center），判「提醒有没有来」直接看它，不必再 observe。',
+        '系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 横竖屏切换）。**别再用 swipe 手势下拉通知栏**：手势要求起点贴顶、速度有讲究、坐标随分辨率变，历史上同一会话里反复"再试一次拉下通知栏"的有 9 个；系统调用本身只要 43 毫秒。一次调用内做完「打开 → 截图 → dump → 解析出通知列表」，所以比「act 下拉 + observe 看」少一次往返（约省 5 秒）。返回值里的 notifications 已按条解析好（title/texts/clickable/center），判「提醒有没有来」直接看它，不必再 observe。',
       parameters: {
         action: {
           type: 'string',
@@ -683,15 +683,21 @@ export function apply(ctx, config = {}) {
             'close_shade',
             'wake',
             'unlock',
-            'recents',
+            'rotate',
           ],
           description:
-            'notifications=展开通知栏并解析通知列表 / quick_settings=展开快捷设置 / close_shade=收起面板 / wake=点亮屏幕 / unlock=点亮并上滑解锁（无密码锁屏）/ recents=打开多任务',
+            'notifications=展开通知栏并解析通知列表 / quick_settings=展开快捷设置 / close_shade=收起面板 / wake=点亮屏幕 / unlock=点亮并上滑解锁（无密码锁屏）/ rotate=切换横竖屏，返回切换前后的宽高（配 to 用）',
         },
         close: {
           type: 'boolean',
           description:
             'notifications / quick_settings 用：证据拍完顺手收起。证据仍是「展开的样子」，收起后 next 为空（那些坐标已失效）',
+        },
+        to: {
+          type: 'string',
+          enum: ['portrait', 'landscape', 'toggle'],
+          description:
+            'rotate 用：切到竖屏 / 横屏 / 切到当前朝向的反面（默认 toggle）。返回 rotate.before / rotate.after 的宽高与朝向',
         },
         why: { type: 'string', description: '为什么做这个动作（进时间轴）' },
         name: { type: 'string', description: '证据名，如 case85/step07' },
@@ -717,6 +723,7 @@ export function apply(ctx, config = {}) {
           properties: {
             ok: { type: 'boolean' },
             shade_open: { type: 'boolean' },
+            rotate: { type: 'object' },
             notifications: { type: 'array' },
             notification_count: { type: 'number' },
             hint: { type: 'string' },
@@ -734,6 +741,7 @@ export function apply(ctx, config = {}) {
           }
         }
         if (args.close === true) rest.push('--close')
+        push('--to', args.to)
         push('--why', args.why)
         push('--name', args.name)
         push('--expect', args.expect)

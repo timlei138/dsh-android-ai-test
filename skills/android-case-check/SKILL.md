@@ -147,9 +147,14 @@ AI 执行没有这层默契，同一条模糊用例每次补得不一样，结�
 **例外：横竖屏不拦。** 虽然物理上转不了设备，但可以用命令模拟：
 
 ```
-adb shell settings put system accelerometer_rotation 0   # 关掉自动旋转
-adb shell settings put system user_rotation 1             # 横屏（0 为竖屏）
+android_system(action="rotate", to="landscape")    # 横屏
+android_system(action="rotate", to="portrait")     # 竖屏
 ```
+
+工具会回读实测宽高，返回 `rotate.before` / `rotate.after` —— **判朝向看它，别按分辨率常量推**。
+
+> ⚠️ 别再用 `settings put system user_rotation`：它只写设置、**要等下一次旋转事件才生效**，
+> 写完立刻截图多半还是旧朝向。底层走的是 `cmd window user-rotation lock <0|1>`，立刻生效。
 
 用例步骤里出现「切换到横屏」「横屏模式下打开」这类，子 Agent 用上面的命令做就行，
 「横屏下显示正常」这类预期照样可判（看屏幕就是了）。不拦，放行。

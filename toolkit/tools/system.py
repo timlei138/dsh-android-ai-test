@@ -1,4 +1,4 @@
-"""system：系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 多任务）。
+"""system：系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 横竖屏切换）。
 
 为什么单独一个工具，而不是让 AI 用 swipe 手势：
   ① **手势不可靠**。下拉通知栏要求起点贴着屏幕最顶端、速度有讲究、
@@ -20,7 +20,7 @@
   close_shade      收起通知栏 / 快捷设置面板
   wake             点亮屏幕（不改变当前 App）
   unlock           点亮并尝试上滑解锁（无密码锁屏）
-  recents          打开多任务（最近任务）
+  rotate           切换横竖屏，返回切换前后的宽高（--to portrait|landscape|toggle）
 
 用法：
   python system.py notifications --why "判提醒有没有来" --name case85/step07
@@ -67,7 +67,7 @@ except Exception:  # noqa: BLE001  common 不可用时不要因此崩掉
     pass
 
 
-ACTIONS = ("notifications", "quick_settings", "close_shade", "wake", "unlock", "recents")
+ACTIONS = ("notifications", "quick_settings", "close_shade", "wake", "unlock", "rotate")
 
 # 通知栏列表容器 / 单条通知行 / 快捷设置面板容器的 resource-id 片段
 # （AOSP 通用名，不是某个 App 的）
@@ -83,7 +83,7 @@ LABELS = {
     "close_shade": "收起通知栏",
     "wake": "点亮屏幕",
     "unlock": "点亮并解锁",
-    "recents": "打开多任务",
+    "rotate": "切换横竖屏",
 }
 
 
@@ -210,10 +210,9 @@ def _applied(args_action: str, *, opened: bool, kind: str | None,
       None  —— **判断不了**，此时绝不硬判（硬判 false 会让 AI 重试；
                硬判 true 会让它把「没看清」当成「成功了」）
 
-    `recents` 就是 None 那一类：多任务的界面由 launcher 决定
-    （不同 ROM 是 `RecentsActivity` / `Overview` / 直接叠在桌面上），
-    没有跨 ROM 通用的物理标记。这种情况由 AI 看截图确认，
-    工具只负责说「我判不了」。
+    `rotate` 判得了：切换后回读 `window_size`，宽高真的换向了才算生效。
+    判不了的情况（拿不到尺寸）返回 None，由 AI 看截图确认 ——
+    工具只负责说「我判不了」，不硬判。
     """
     if args_action in ("notifications", "quick_settings"):
         want = "quick_settings" if args_action == "quick_settings" else "notifications"
@@ -250,10 +249,14 @@ def _applied(args_action: str, *, opened: bool, kind: str | None,
             return False, "屏幕亮了但还在锁屏上（dump 里有 keyguard）—— 可能设了密码/图案。"
         return True, ""
 
-    # recents：界面由 launcher 决定，没有跨 ROM 通用标记
-    return None, ("多任务的界面由 launcher 决定（不同 ROM 是 RecentsActivity / "
-                  "Overview / 直接叠在桌面上），没有跨 ROM 通用的物理标记，"
-                  "所以工具不判「生效没有」——请看截图确认。已执行，动作本身没报错。")
+    if args_action == "rotate":
+        size = _window_size(d) if d is not None else None
+        if not size:
+            return None, "拿不到尺寸（window_size 失败），请看截图确认朝向。"
+        return True, ""
+
+    # 兜底：未知动作一律不硬判
+    return None, "这个动作没有可自动判定的物理标记，请看截图确认。已执行，动作本身没报错。"
 
 
 def _screen_on(d) -> bool | None:
@@ -297,6 +300,76 @@ def _ensure_awake(d) -> bool:
     return False
 
 
+_ROT_LABEL = {0: "portrait", 1: "landscape"}
+
+
+def _window_size(d) -> tuple[int, int] | None:
+    """当前逻辑分辨率 (宽, 高)。拿不到返回 None —— 不编造尺寸。
+
+    ⚠️ 这台机（Android 17 / ZUXOS）上 `d.rotation` 直接 AttributeError，
+    `d.info` 会抛 ApplicationSharedMemory —— 只有 `d.window_size()` 可靠。
+    """
+    try:
+        w, h = d.window_size()
+        if w and h:
+            return int(w), int(h)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _orientation_of(size: tuple[int, int] | None) -> str | None:
+    if not size:
+        return None
+    return "landscape" if size[0] > size[1] else "portrait"
+
+
+def _rotate(d, to: str | None) -> tuple[dict, dict]:
+    """切横竖屏，返回 (切换前, 切换后) 两份尺寸快照。
+
+    `to` = portrait / landscape / toggle（默认 toggle）。
+
+    ⚠️ 实测（Android 17 / ZUXOS 3.0，3040x1904）踩过两个坑：
+      · `settings put system user_rotation N` **只写设置、不当场转** —— 要等
+        下一次旋转事件才按新值转，so 光写 settings 加个 sleep 不可靠。
+      · `cmd window set-user-rotation locked N` **这个子命令不存在**：
+        静默失败、不报错、也不转屏（曾经因此把「上一步 settings 延迟生效」
+        误判成「这条命令生效了」，方向都判反）。
+      对的是 `cmd window user-rotation lock <0|1>` / `free`，实测立刻转向：
+        lock 0 → 竖屏，lock 1 → 横屏，free → 跟随传感器。
+      它本身就是锁定，**不必再改 accelerometer_rotation**（改了还得还原，
+      反而多一处能忘的副作用）。
+    """
+    before = _window_size(d)
+    cur = _orientation_of(before)
+    target = (to or "toggle").lower()
+    if target == "toggle":
+        target = "landscape" if cur == "portrait" else "portrait"
+    if target not in ("portrait", "landscape"):
+        raise ValueError(f"--to 只能是 portrait/landscape/toggle，收到 {to!r}")
+    angle = 0 if target == "portrait" else 1
+
+    d.shell(f"cmd window user-rotation lock {angle}")
+
+    # 轮询回读（最多 3 秒）—— 转屏是异步的，一次读很可能还是旧值
+    after = before
+    for _ in range(12):
+        time.sleep(0.25)
+        after = _window_size(d)
+        if after != before and _orientation_of(after) == target:
+            break
+
+    snap_b = {"width": before[0] if before else None,
+              "height": before[1] if before else None,
+              "orientation": cur}
+    snap_a = {"width": after[0] if after else None,
+              "height": after[1] if after else None,
+              "orientation": _orientation_of(after),
+              "requested": target,
+              "changed": (after != before)}
+    return snap_b, snap_a
+
+
 def _close_shade(d) -> None:
     """收起通知栏 / 快捷设置。
 
@@ -334,6 +407,8 @@ def main() -> None:
     p.add_argument("--close", action="store_true",
                    help="notifications/quick_settings 用：证据拍完顺手收起。"
                         "证据仍是「展开的样子」；收起后 next 为空（那些坐标已失效）")
+    p.add_argument("--to", choices=("portrait", "landscape", "toggle"), default="toggle",
+                   help="rotate 用：切到竖屏 / 横屏 / 切到当前朝向的反面（默认 toggle）")
     p.add_argument("--why", default=None, help="这一步的理由（入库展示在时间轴）")
     # --settle / --expect / --full / --no-filter / --name 等（与 act 同一套）
     add_common_args(p)
@@ -353,8 +428,9 @@ def main() -> None:
     execution("may_have_executed")
 
     was_awake = True
+    rot_before = rot_after = None
     try:
-        if args.action in ("notifications", "quick_settings", "wake", "unlock", "recents"):
+        if args.action in ("notifications", "quick_settings", "wake", "unlock", "rotate"):
             was_awake = _ensure_awake(d)
         if args.action == "notifications":
             timed_call("action", d.jsonrpc.openNotification)
@@ -366,16 +442,21 @@ def main() -> None:
             timed_call("action", d.jsonrpc.wakeUp)
         elif args.action == "unlock":
             timed_call("action", _unlock, d)
-        else:  # recents
-            timed_call("action", d.press, "recent")
+        else:  # rotate
+            rot_before, rot_after = _rotate(d, args.to)
     except Exception as e:  # noqa: BLE001
         fail(f"动作执行失败: {e}")
 
     execution("executed")
     # 展开面板有滑入动画，等 settle 再 dump —— 和 act 一样是硬性的（默认 500ms）。
+    # rotate 已经在 _rotate() 里轮询过尺寸了，这里照常等 settle 拍证据。
     timed_call("settle_wait", time.sleep, args.settle / 1000)
 
     detail = LABELS[args.action]
+    if args.action == "rotate" and rot_after:
+        b, a = rot_before or {}, rot_after
+        detail += f" {b.get('width')}x{b.get('height')} → {a.get('width')}x{a.get('height')}"
+        detail += "（已切）" if a.get("changed") else "（⚠️ 尺寸没变）"
     action = {"type": f"system:{args.action}"}
     if args.why:
         action["why"] = args.why
@@ -392,7 +473,7 @@ def main() -> None:
     # **只有 `notifications` 才解析通知**：
     #   · `quick_settings` 展开时 dump 里本来就没有通知列表容器，去解析只会
     #     得到一句「没找到容器」的噪音，干扰 AI 读结果；
-    #   · wake/unlock/recents/close_shade 的 dump 里也不该有面板。
+    #   · wake/unlock/rotate/close_shade 的 dump 里也不该有面板。
     opened = _shade_open(xml_text, activity)
     kind = _shade_kind(xml_text)
     shade_actions = ("notifications", "quick_settings")
@@ -462,6 +543,13 @@ def main() -> None:
         "nodes_mode": "full" if getattr(args, "full", False) else "nav",
         "hint": "",
     }
+    if args.action == "rotate" and rot_after:
+        payload["rotate"] = {
+            "before": rot_before,
+            "after": rot_after,
+            "changed": rot_after.get("changed"),
+            "requested": rot_after.get("requested"),
+        }
     # 面板相关字段只在「展开面板」的两个动作上出现 —— 其它动作没有面板可谈，
     # 塞一堆空字段和「没找到容器」的说明只会干扰 AI 读结果。
     if args.action in shade_actions:

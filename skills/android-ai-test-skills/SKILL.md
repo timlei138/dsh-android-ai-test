@@ -561,7 +561,7 @@ android_system(action="quick_settings")
 android_system(action="close_shade")
 android_system(action="wake")      # 只点亮，不动当前 App
 android_system(action="unlock")    # 点亮 + 上滑解锁
-android_system(action="recents")   # 多任务
+android_system(action="rotate", to="landscape")   # 切横竖屏，返回切换前后宽高
 ```
 
 它一次调用就把「开 → 截图 → dump → 解析通知列表」做完，所以**不需要再 observe 一次**。
@@ -574,8 +574,12 @@ android_system(action="recents")   # 多任务
 | `false` | 确认没生效 | 先 `unlock` 再试一次；**同一步最多试 2 次** |
 | `null` | **工具判不了** | **看这次的截图确认，不要重试** —— 重试不会让判断更清楚 |
 
-`recents` 永远是 `null`：多任务界面由 launcher 决定（RecentsActivity / Overview / 直接叠桌面），
-没有跨 ROM 通用的标记。
+`rotate` 是唯一能自己判死生死的：切换后回读 `window_size`，宽高真换向了才给 `true`。
+返回里带 `rotate.before` / `rotate.after`（`width` / `height` / `orientation`）和 `changed`，
+**判横竖屏就照这份实测，别按分辨率常量推** —— 同一台机横竖宽高是反过来的一对。
+
+> 多任务（最近任务）**不在 `system` 里**，它和 back/home 一样是 `android_act(action="recents")`
+> —— 发给当前 App 的动作归 act，动系统面板的归 system。
 
 `notifications` 还会顺手给出面板内容，**但这只是参考**：
 

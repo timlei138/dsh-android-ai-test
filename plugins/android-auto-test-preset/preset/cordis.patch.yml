@@ -494,7 +494,7 @@
                             · android_read_file —— **读知识卡 + 路径卡**（UTF-8，永不乱码）
                             · android_perm      —— **查/授/撤权限**（走 adb，不走弹窗）
                             · android_state     —— **清数据 / 起停 App**（只在用例明确要求时用）
-                            · android_system    —— **通知栏 / 快捷设置 / 亮屏解锁 / 多任务**
+                            · android_system    —— **通知栏 / 快捷设置 / 亮屏解锁 / 横竖屏切换**
                                                   （别用 swipe 下拉，见下）
                             · bash              —— 只用来跑 `session.py`（开会话、记断言、收尾）
                                                   动设备、看屏幕一律走 android_* 工具，不要用 bash
@@ -568,7 +568,7 @@
                             android_act(action="input", x=1520, y=375, text="高数", via="rid=et_name")
                             android_act(action="input", x=1520, y=375, text="", via="rid=et_name")   # 清空
                             android_act(action="swipe", from="540,2000", to="540,800", dur=300)
-                            android_act(action="back")
+                            android_act(action="back")             # 返回；home / recents 也是 act 的动作
                             android_read(region="0,200,3040,600")
                             ```
 
@@ -697,7 +697,7 @@
                             android_system(action="close_shade")
                             android_system(action="wake")      # 只点亮，不动当前 App
                             android_system(action="unlock")    # 点亮 + 上滑解锁
-                            android_system(action="recents")   # 多任务
+                            android_system(action="rotate", to="landscape")   # 切横竖屏
                             ```
 
                             返回里先看 `applied`（**动作到底生效了没有**）：
@@ -705,8 +705,11 @@
                             · `true` —— 生效了
                             · `false` —— 没生效，先 `unlock` 再试一次；**同一步最多试 2 次**
                             · `null` —— **工具判不了**，这时必须看截图确认，**不要重试**
-                              （重试不会让判断更清楚）。`recents` 永远是 `null`，
-                              因为多任务界面由 launcher 决定，没有跨 ROM 通用的标记
+                              （重试不会让判断更清楚）
+
+                            `rotate` 会回读实测尺寸，返回 `rotate.before` / `rotate.after`
+                            （`width` / `height` / `orientation`）和 `changed` ——
+                            **判横竖屏照这份实测，别按分辨率常量推。**
 
                             `notifications` 还会顺手把面板内容解析出来：
 

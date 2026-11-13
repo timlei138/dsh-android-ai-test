@@ -8,6 +8,7 @@
   python act.py swipe --from 540,2000 --to 540,800 --dur 300 --watch text="允许" --name ...
   python act.py back --why "关闭二级页" --name ...
   python act.py home --name ...
+  python act.py recents --name ...             # 打开多任务（最近任务）
   python act.py key --code 4 --name ...        # 4=BACK 3=HOME（一般用 back/home 即可）
 
 语义说明：
@@ -473,7 +474,7 @@ def main() -> None:
     s.add_argument("--watch", default=None)
     s.add_argument("--watch-timeout", type=int, default=8000, dest="watch_timeout", help="watch 总窗口毫秒（系统权限框约6s自行消失）")
 
-    for name in ("back", "home"):
+    for name in ("back", "home", "recents"):
         s = sub.add_parser(name)
         s.add_argument("--why", default=None, help="这一步的理由（入库展示在时间轴）")
 
@@ -582,6 +583,9 @@ def main() -> None:
         elif args.action == "home":
             timed_call("action", d.press, "home")
             action = {"type": "home"}
+        elif args.action == "recents":
+            timed_call("action", d.press, "recent")
+            action = {"type": "recents"}
         else:
             timed_call("action", d.shell, f"input keyevent {args.code}")
             action = {"type": "key", "code": args.code}
@@ -617,6 +621,8 @@ def main() -> None:
         detail = "返回"
     elif args.action == "home":
         detail = "回到桌面"
+    elif args.action == "recents":
+        detail = "打开多任务"
     else:
         detail = f"keyevent {args.code}"
     if via:
