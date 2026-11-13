@@ -295,37 +295,41 @@ class SessionDB:
         if not path.is_file():
             raise ValueError(f"Event {event_id} evidence is missing: {path}")
 
-    # summary 里出现的统计数字，必须和库里的断言统计一致。
+    # 统计数字由工具算、工具写，**不再校验 AI 手写的数字**。
     #
-    # ⚠️ 为什么需要（2026-10-29 实测）：
-    #   176 那轮 summary 写着「12 条预期中 8 PASS / 4 FAIL」，
-    #   而 findings 表里实际是 **9 PASS / 3 FAIL**。
+    # 历史（2026-10-29 → 2026-11-13）：曾经用正则 grep summary 里的
+    # 「(\d+)\s*(PASS|FAIL|BLOCKED)」，把每个数字当计数和 findings 比对。
+    # 起因是 176 那轮 summary 写「8 PASS / 4 FAIL」而库里是 9/3。
     #
-    #   本项目的分工是「代码管纪律，AI 管语义」。数一数 findings 表
-    #   是**确定且唯一**的结果，却让 AI 手写 —— 必然出错，而且错了没人发现。
-    #   结论数字是读报告的人看到的第一条信息，错了会带偏后续所有判断。
+    # ⚠️ 为什么废掉：正则在**自由文本**上分不清「计数」和「编号」。
+    #   实测（2026-11-13 会话 #160）：summary 写「预期1 PASS，预期2 PASS，预期3 FAIL」，
+    #   断言实际是 2 PASS / 1 FAIL，正则抓出 1/2/3 三个数全当计数 → 连续 3 次
+    #   提交被拒，执行侧只能把结论改成纯文字描述才收得了尾。
+    #   加特例只治当下的写法：排除「预期N」之后，「第 2 条 PASS」「①PASS」
+    #   照样漏 —— 这是跟自然语言打地鼠，永远补不完。
     #
-    # 只校验形如「8 PASS」「4 FAIL」这种显式计数；不碰自然语言描述。
+    # ✅ 现在：findings 表是**确定且唯一**的真值，数字就该由工具算。
+    #   finish 时把权威统计追加到 summary 末尾（_STATS_LINE 前缀），
+    #   报告/回看读这一行；AI 正文怎么写都不影响。
     _COUNT_STATUSES = ("PASS", "FAIL", "BLOCKED")
+    _STATS_PREFIX = "[统计] "
 
-    def _check_summary_counts(self, summary: str, findings: list) -> None:
-        import re as _re
-        if not summary.strip():
-            return
-        actual: dict[str, int] = {}
+    def _stats_line(self, findings: list) -> str:
+        """权威统计行：断言总数 + 各结论条数（由 findings 表算出）。"""
+        counts = {word: 0 for word in self._COUNT_STATUSES}
         for finding in findings:
             st = finding["status"]
-            actual[st] = actual.get(st, 0) + 1
-        for word in self._COUNT_STATUSES:
-            for match in _re.finditer(rf"(\d+)\s*{word}\b", summary):
-                claimed = int(match.group(1))
-                real = actual.get(word, 0)
-                if claimed != real:
-                    raise ValueError(
-                        f"summary 里写的是「{claimed} {word}」，"
-                        f"但断言实际是 {real} 条 {word}"
-                        f"（共 {len(findings)} 条断言）。"
-                        f"结论里的统计数字必须和断言一致。")
+            if st in counts:
+                counts[st] += 1
+        parts = " / ".join(f"{word} {counts[word]}" for word in self._COUNT_STATUSES)
+        return f"{self._STATS_PREFIX}断言 {len(findings)} 条：{parts}"
+
+    @classmethod
+    def _strip_stats_line(cls, summary: str) -> str:
+        """去掉上一次追加的统计行，避免重复 append / resume 后叠加。"""
+        return "\n".join(
+            line for line in summary.split("\n")
+            if not line.startswith(cls._STATS_PREFIX))
 
     def finish_session(self, session_id: int, status: str, summary: str = "",
                        package: str | None = None) -> bool:
@@ -350,7 +354,10 @@ class SessionDB:
                 raise ValueError("FAIL requires a FAIL finding")
             if status in ("BLOCKED", "ERROR") and not summary.strip():
                 raise ValueError("BLOCKED/ERROR requires a reason in summary")
-            self._check_summary_counts(summary, findings)
+            # 统计行由工具追加（唯一权威来源）；先剥掉旧的再追加，防 resume 后叠加
+            _body = self._strip_stats_line(summary).rstrip()
+            _stats = self._stats_line(findings)
+            summary = f"{_body}\n{_stats}" if _body else _stats
             if status not in ("ERROR", "BLOCKED") and recording_issues(Path(self.path).parent, session_id):
                 raise ValueError("Recording/ledger is incomplete; finish ERROR/BLOCKED with a reason")
             for finding in findings if status in ("PASS", "FAIL") else []:
