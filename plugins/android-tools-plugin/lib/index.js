@@ -723,7 +723,7 @@ export function apply(ctx, config = {}) {
           properties: {
             ok: { type: 'boolean' },
             shade_open: { type: 'boolean' },
-            rotate: { type: 'object' },
+            rotate: { type: 'object', additionalProperties: true },
             notifications: { type: 'array' },
             notification_count: { type: 'number' },
             hint: { type: 'string' },

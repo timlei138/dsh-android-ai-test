@@ -201,7 +201,8 @@ def _shade_kind(xml_text: str) -> str | None:
 
 
 def _applied(args_action: str, *, opened: bool, kind: str | None,
-             xml_text: str, d=None) -> tuple[bool | None, str]:
+             xml_text: str, d=None,
+             rot_after: dict | None = None) -> tuple[bool | None, str]:
     """这个动作**证实**生效了吗？返回 (True/False/None, 说明)。
 
     三态，不是布尔 —— 这是刻意的：
@@ -250,9 +251,17 @@ def _applied(args_action: str, *, opened: bool, kind: str | None,
         return True, ""
 
     if args_action == "rotate":
+        # 判据是「**现在的朝向 == 请求的朝向**」，不是「尺寸变没变」。
+        #   本来就横屏、再请求横屏 → 尺寸不变但需求已满足，那是成功；
+        #   按 changed 判会报 False，AI 就会拿着这个「失败」去重试一遍。
         size = _window_size(d) if d is not None else None
         if not size:
             return None, "拿不到尺寸（window_size 失败），请看截图确认朝向。"
+        want = (rot_after or {}).get("requested")
+        got = _orientation_of(size)
+        if want and got and got != want:
+            return False, (f"要的是{want}，实测现在是{got} —— "
+                           "屏幕尺寸没跟着变，这个 ROM 可能不认这种调法。")
         return True, ""
 
     # 兜底：未知动作一律不硬判
@@ -486,7 +495,8 @@ def main() -> None:
     controls = shade["controls"]
     # 「动作生效了吗」由工具判 —— 但只判能证实的（见 _applied 的三态说明）
     applied, applied_note = _applied(
-        args.action, opened=opened, kind=kind, xml_text=xml_text, d=d)
+        args.action, opened=opened, kind=kind, xml_text=xml_text, d=d,
+        rot_after=rot_after)
     if args.action in shade_actions:
         detail += "（已展开）" if opened else "（⚠️ 没展开）"
         if notifications:

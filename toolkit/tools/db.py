@@ -311,7 +311,9 @@ class SessionDB:
     # ✅ 现在：findings 表是**确定且唯一**的真值，数字就该由工具算。
     #   finish 时把权威统计追加到 summary 末尾（_STATS_LINE 前缀），
     #   报告/回看读这一行；AI 正文怎么写都不影响。
-    _COUNT_STATUSES = ("PASS", "FAIL", "BLOCKED")
+    # ERROR 也算一条断言（进「断言 N 条」的分母），但它不是用例结论，
+    # 只在真出现时才出现在统计行里，免得每行都挂着「ERROR 0」。
+    _COUNT_STATUSES = ("PASS", "FAIL", "BLOCKED", "ERROR")
     _STATS_PREFIX = "[统计] "
 
     def _stats_line(self, findings: list) -> str:
@@ -321,7 +323,9 @@ class SessionDB:
             st = finding["status"]
             if st in counts:
                 counts[st] += 1
-        parts = " / ".join(f"{word} {counts[word]}" for word in self._COUNT_STATUSES)
+        words = [w for w in self._COUNT_STATUSES
+                 if w != "ERROR" or counts.get("ERROR")]
+        parts = " / ".join(f"{word} {counts[word]}" for word in words)
         return f"{self._STATS_PREFIX}断言 {len(findings)} 条：{parts}"
 
     @classmethod

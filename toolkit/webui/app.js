@@ -923,7 +923,7 @@ async function viewSession(id) {
   const s = await api(`/api/sessions/${id}`);  const kindLabel = { observe: "👁 观察", act: "✋ 操作", read: "🔍 读取",
                       note: "📝 备注",
                       state: "⚙️ 状态", logcat: "📎 取证", crash: "💥 崩溃",
-                      perm: "🔐 权限" };
+                      perm: "🔐 权限", vision: "👀 看图" };
 
   // 相邻事件时间差 = AI 决策耗时；事件自身 duration_ms = 工具执行耗时
   const ts = e => Date.parse(e.created_at);
