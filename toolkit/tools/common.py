@@ -869,13 +869,15 @@ def auto_name() -> str:
     命名形如 `step01 / step02 / step03 …`，和 AI 手动命名的风格一致。
     「一次运行只有一个会话」是常态，所以这不影响并发安全。
     """
-    import os
     try:
         from db import current_session
         sid = current_session()
     except Exception:  # noqa: BLE001
         sid = None
-    tag = str(sid) if sid else "loose"
+    # 没会话时的标签。以前是字面量 "loose"，但 evidence_paths 落盘时
+    # `d / name` 会把空标签压成路径里的 "None"（实测建出 storage/evidence/None/），
+    # 目录名看着像"某次运行叫 None"。换成一眼能认的 nosession。
+    tag = str(sid) if sid else "nosession"
     seq_file = STORAGE_DIR / f".evidence_seq_{tag}"
     lock = str(seq_file) + ".lock"
     seq_file.parent.mkdir(parents=True, exist_ok=True)
@@ -915,7 +917,7 @@ def auto_name() -> str:
     # 2 位补零：step01 / step02 …… step99；超过 99 自然变成 step100。
     # 必须和 AI 自己传的 --name（`case168/step01`）同一风格：
     # 两种位数混在一个目录里按字符排序会错乱（"step0001" < "step00"）。
-    return f"{sid}/step{n:02d}"
+    return f"{tag}/step{n:02d}"
 
 
 def evidence_paths(base_dir: str | None, name: str | None) -> tuple[Path, Path, Path]:
@@ -928,22 +930,79 @@ def evidence_paths(base_dir: str | None, name: str | None) -> tuple[Path, Path, 
     证据没有归属（多轮运行叠加、想删某次无从下手、只增不减）。
 
     没有运行目录（工具被单独调用、没开会话）时退到
-    `storage/evidence/<name>/`，保证工具可独立使用。
+    `storage/evidence/_orphan/<会话标签>/stepNN/`（见下）。
+
+    ## 无运行目录时：落 _orphan/，并留下"为什么没有归属"
+
+    ★ 2026-11-13 修：以前退到 `storage/evidence/<name>/`，而 name 走
+      auto_name() → `<sid>/stepNN`。sid 为空时返回的是 f"{None}/step01"，
+      落盘后成了 `storage/evidence/None/step01/` —— 目录名是个字面量 "None"，
+      事后既看不出属于哪次运行，也分不清是哪个 Group 跑的。
+      （实测 2026-11-12 22:21–22:24 攒了 48 个这样的目录、约 28MB，
+      库里 0 条事件，全靠人肉反推。）
+
+     现在：
+       · 落点固定 `_orphan/<会话标签>/stepNN/`，一眼能看出是"孤儿证据"；
+       · 目录里写 `_orphan.json`（orphan / session / ts / hint），
+         并往 `storage/orphan_evidence.log` 追加一行，事后能对上时间线。
+      不用 meta.json 承载这个标记：meta 是 capture() 晚一步才写的，
+      采集失败时根本不产生 meta —— 而没有归属恰恰是要留痕的那种失败。
 
     ## name 由调用方给
 
-      传了就按传的；没传走 auto_name()，生成 `<session_id>/stepNNNN`。
+      传了就按传的；没传走 auto_name()，生成 `<会话标签>/stepNN`。
     """
     if not name:
         name = auto_name()
+    orphan = False
     if base_dir:
         d = Path(base_dir)
     else:
         run = current_record_dir()
-        d = (run / "evidence") if run else DEFAULT_EVIDENCE_DIR
+        if run:
+            d = run / "evidence"
+        else:
+            # 没运行目录 = 没会话（或指针刚被 finish 清掉）→ 孤儿证据
+            orphan = True
+            d = DEFAULT_EVIDENCE_DIR / "_orphan"
     d = d / name
     d.mkdir(parents=True, exist_ok=True)
+    if orphan:
+        _note_orphan_evidence(d)
     return d / "shot.png", d / "dump.xml", d / "meta.json"
+
+
+def _note_orphan_evidence(d: Path) -> None:
+    """孤儿证据留痕：写 sidecar 标记 + 追加一行日志。失败不外抛。
+
+    为什么不写在 meta.json 里：meta 是 capture() 晚一步才写的，而且
+    capture 失败时根本不会产生 meta —— 而"这次调用没归属"正是要留痕的
+    那种失败场景。sidecar 由本函数立刻落盘，不依赖后续流程。
+    """
+    try:
+        from db import current_session
+        sid = current_session()
+    except Exception:  # noqa: BLE001
+        sid = None
+    try:
+        marker = d / "_orphan.json"
+        marker.write_text(json.dumps({
+            "orphan": True,
+            "session": sid,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "hint": ("这次调用没有当前运行目录（run_history/.current 不存在），"
+                     "证据无法归属到任何一次运行；结论要能复核，"
+                     "请先 session.py start 再操作。"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        log = STORAGE_DIR / "orphan_evidence.log"
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')}\t"
+                     f"session={sid}\t{d}\n")
+    except OSError:
+        pass
 
 
 def log_auto(kind: str, tool: str, detail: str, data: dict | None = None,

@@ -14,9 +14,10 @@ import base64
 import json
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
-from common import apply_stdin_args, emit, fail
+from common import apply_stdin_args, emit, fail, log_auto, rel
 from runtime import STORAGE_DIR
 
 try:
@@ -95,8 +96,37 @@ def main() -> None:
             + "。加大 --max-tokens 重试（如 3000），"
               "或把问题问得更短更具体。**不要把空回答当成「画面里没有」**")
 
-    emit(True, {"text": text, "usage": usage,
-                "hint": "视觉模型输出是辅助判据，PASS/FAIL 结论仍需结合 dump/OCR 证据"})
+    # ★ 必须落一条事件，否则这条视觉断言**绑不到证据**。
+    #
+    #   实测（2026-11-13）：findings-batch 要求 PASS/FAIL 至少带一个 event_id，
+    #   而 vision 原来一个事件都不记 → 拿 vision 做完断言只能引用别的一步
+    #   （图上到底问了什么、答了什么，事后查不到），或者干脆判 BLOCKED。
+    #
+    #   证据就用传进来的那张图（不重拍）：视觉断言的对象本来就是那张图。
+    #
+    # ⚠️ log_auto 在**没有活动会话**时返回 None（静默不记），所以下面要判空：
+    #    无条件把 event_id 塞进 payload 的话，调用方看到的是 `event_id: null`
+    #    —— 分不清"记了但没 id"还是"根本没记"，绑证据时就会拿个空值上去。
+    _eid = log_auto(
+        "vision", "vision ask",
+        f"问图：{args.prompt[:40]}",
+        {"image": str(img), "prompt": args.prompt,
+         "answer": text, "usage": usage,
+         "model": model, "max_tokens": args.max_tokens},
+        rel(img), None,
+        datetime.now().isoformat(timespec="milliseconds"))
+
+    payload = {"text": text, "usage": usage,
+               "hint": "视觉模型输出是辅助判据，PASS/FAIL 结论仍需结合 dump/OCR 证据"}
+    if _eid:
+        payload["event_id"] = _eid
+        payload["evidence"] = rel(img)
+    else:
+        # 没会话就没账 —— 必须说出来，不能让调用方以为已经绑好了证据
+        payload["recorded"] = False
+        payload["record_hint"] = ("本次调用**没有活动会话**，事件未落库；"
+                                  "结论要能复核，请先 session.py start 再问图")
+    emit(True, payload)
 
 
 if __name__ == "__main__":
