@@ -108,7 +108,12 @@ if [ ! -x "$VenvPy" ]; then
 fi
 [ -f "$Root/requirements.txt" ] || die "缺 $Root/requirements.txt"
 # 国内直连 pypi.org 经常超时（200MB 的 onnxruntime 尤其），镜像源是默认动作不是可选项
-"$VenvPy" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+# ★ pip 自愈：以前这里会先 upgrade pip（没带镜像），中断时会把 pip 升级到一半
+#   （先删旧、没装新）弄坏 venv。这里只检测，坏了用 ensurepip 离线修复。
+if ! "$VenvPy" -m pip --version >/dev/null 2>&1; then
+    printf '  · pip 不可用，用 ensurepip 离线修复...\n'
+    "$VenvPy" -m ensurepip --upgrade >/dev/null 2>&1 || die "ensurepip 修复失败，手动跑: python -m ensurepip --upgrade"
+fi
 printf '  · pip install -r requirements.txt -i %s\n' "$Mirror"
 "$VenvPy" -m pip install -r "$Root/requirements.txt" -i "$Mirror" || die "依赖安装失败：换源再试 --mirror https://pypi.tuna.tsinghua.edu.cn/simple"
 ok "依赖装完"
