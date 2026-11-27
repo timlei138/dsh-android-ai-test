@@ -7,6 +7,7 @@ import time
 
 def parse_swipe(start, stages, parse_xy):
     """复用调用方已有的 xy() 解析器，在按下前完成全部参数校验。"""
+
     def coordinate(value, field):
         if not isinstance(value, str):
             raise ValueError(f"{field} 必须是 x,y 坐标字符串")
@@ -61,15 +62,15 @@ def check_bounds(start, stages, size):
 def run_swipe(device, start, stages, *, clock=time.monotonic, sleep=time.sleep):
     """按顺序执行按下、移动或停留、松手；时长为目标值，不保证严格实时。
 
-    ⚠️ 松手放进 finally：中途任何异常（u2 断连、坐标被拒、sleep 被打断）都必须
-       抬手。少了这一步，手指会**一直按在屏幕上** —— 后续所有 tap 都变成
-       屏内误触，且只有断开 USB 才能恢复。异常照常往外抛，不吞。
+    finally 统一尝试抬手，包括按下失败、移动失败和中断。
+    down/move 响应丢失时触摸可能已经执行；清理失败不能覆盖原始异常，
+    正常完成动作后若抬手失败，则向调用方抛出该异常。
     """
     touch = device.touch
     position = start
-    touch.down(*position)
     ok = False
     try:
+        touch.down(*position)
         for stage in stages:
             seconds = stage["dur"] / 1000
             if stage["type"] == "hold":
@@ -87,16 +88,16 @@ def run_swipe(device, start, stages, *, clock=time.monotonic, sleep=time.sleep):
                 point = tuple(round(a + (b - a) * fraction)
                               for a, b in zip(origin, target))
                 if point != position or fraction >= 1:
-                    touch.move(*point)
+                    # 响应丢失时移动可能已执行，先记录本次尝试的目标坐标。
                     position = point
+                    touch.move(*position)
                 if fraction >= 1:
                     break
         ok = True
     finally:
-        # 抬手本身也可能失败（设备已掉线）。此时连接已经废了，
-        # 不能让它盖掉真正的根因 —— 只在「原本一切正常、只有 up 失败」时才外抛。
+        # 抬手失败或被中断时保留原始异常；动作成功时才外抛清理异常。
         try:
             touch.up(*position)
-        except Exception:  # noqa: BLE001
+        except BaseException:
             if ok:
                 raise

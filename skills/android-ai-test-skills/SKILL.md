@@ -620,6 +620,37 @@ android_vision(image="<上一次 act/observe 返回的 evidence.png>",
 - 它返回 `{text, usage, hint}`。**空回答 ≠ 画面里没有**：工具会自己报失败并提示加大 `max_tokens`（默认 2000）或把问题问短，别把空白当成否定证据。
 - 它只是辅助判据，PASS/FAIL 结论仍要结合 nodes / OCR 证据。
 
+### 精细系统手势（固定预设）：android_gesture
+
+android_gesture 专门执行精细的系统手势。细微的操作偏差可能触发不同的系统行为，因此由工具统一完成预设手势。
+**开发者负责实现和维护预设，工具负责执行；Agent 负责判断何时调用、选择 action，并核对结果**；对于已有预设，不让执行 Agent 临时设计手指运动轨迹。
+
+**何时选择：**
+
+- 用例明确要求通过真实触摸「底部上划唤起任务栏」「上划停留进入最近任务」「上划回桌面」或「底部左滑 / 右滑切换相邻应用」时，调用对应预设。不要用 android_act 的 swipe / multi_stage_swipe 自行拼接或微调这些手势。
+- 用例只要求回桌面或进入最近任务、没有要求真实上划时，优先用 android_act(action="home"/"recents") 的按键动作；通知栏、快捷设置等系统操作用 android_system 封装的系统命令。
+- 普通页面滑动、拖拽和通用连续轨迹继续用 android_act。
+- 对于尚未支持的精细系统手势，只能由执行 Agent 临时编排轨迹，不过开发者会在将来增加支持。
+
+当前提供以下五个预设：
+
+| 调用 | 动作含义 |
+|---|---|
+| android_gesture(action="show_taskbar") | 底部上划唤起任务栏 |
+| android_gesture(action="recents") | 底部上划停留，进入最近任务 |
+| android_gesture(action="home") | 底部上划回到桌面 |
+| android_gesture(action="switch_app_left") | 底部左滑切换相邻应用 |
+| android_gesture(action="switch_app_right") | 底部右滑切换相邻应用 |
+
+left / right 表示手指移动方向；实际切到哪个应用需结合本次截图和前台信息确认。没有可切换的相邻任务时，界面可能保持不变。
+预设动作只需选择 action，不能传入自定义轨迹参数。settle 仅控制动作完成后的稳定等待。
+show_taskbar / switch_app_left / switch_app_right 要求前台有应用；桌面、最近任务、系统面板或前台不明时工具拒绝执行。
+home / recents 允许从桌面发起。设备应处于亮屏且已启用手势导航；工具不检查亮屏状态，也不自动解锁或打开应用。
+
+一次调用完成手势和取证，返回全屏节点及 next，保留任务栏目标。
+ok=true 只代表手势与取证完成，applied=null 时必须看本次截图确认落点，不要因此重试，也不能仅凭 ok=true 判定应用已切换。
+注入失败或已执行后的取证失败也不自动重试；检查 execution_state 和已有证据。
+
 ### 通知栏 / 快捷设置 / 亮屏解锁：用 `android_system`，不要用 swipe 下拉
 
 **别用 `android_act` 的 swipe 去拉通知栏。** 手势要求起点贴着屏幕最顶端、速度有讲究、
@@ -649,8 +680,8 @@ android_system(action="rotate", to="landscape")   # 切横竖屏，返回切换�
 返回里带 `rotate.before` / `rotate.after`（`width` / `height` / `orientation`）和 `changed`，
 **判横竖屏就照这份实测，别按分辨率常量推** —— 同一台机横竖宽高是反过来的一对。
 
-> 多任务（最近任务）**不在 `system` 里**，它和 back/home 一样是 `android_act(action="recents")`
-> —— 发给当前 App 的动作归 act，动系统面板的归 system。
+> 最近任务可通过 android_act(action="recents") 发按键，
+> 或通过 android_gesture(action="recents") 执行真实上划停留手势；按用例要求选择。
 
 `notifications` 还会顺手给出面板内容，**但这只是参考**：
 

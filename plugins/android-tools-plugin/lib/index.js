@@ -776,6 +776,65 @@ export function apply(ctx, config = {}) {
 
   ctx.tools.register(
     defineTool({
+      name: 'android_gesture',
+      description:
+        '执行由开发者预先实现的精细系统手势。细微的操作偏差可能触发不同的系统行为，因此由工具统一完成预设手势。' +
+        'Agent 负责按用例意图选择 action，已有预设不自行设计或调节轨迹，也不要用 android_act 的 swipe / multi_stage_swipe 拼接替代。当前支持底部上划唤起任务栏、进入最近任务、回桌面，以及底部左滑/右滑切换相邻应用。' +
+        'show_taskbar=底部上划唤起任务栏；recents=底部上划停留进入最近任务；home=底部上划回桌面；switch_app_left / switch_app_right=底部左滑 / 右滑切换相邻应用。左右表示手指方向，实际切到哪个应用需结合本次截图和前台信息确认。show_taskbar 和两个 switch_app 动作要求前台有应用。' +
+        '当用例明确要求通过真实触摸执行上述手势时调用；只需回桌面或进入最近任务时，优先用 android_act(action="home"/"recents")；通知栏、快捷设置等系统操作用 android_system；普通页面滑动用 android_act。' +
+        '对于尚未支持的精细系统手势，只能由执行 Agent 通过 android_act 临时编排轨迹，开发者会在将来补充预设。' +
+        '本工具每次调用结束后会返回截图、全屏节点与 next。applied=null 表示需看本次截图确认落点，不要自动重试。' +
+        '注意：设备必须已启用手势导航。',
+      parameters: {
+        action: {
+          type: 'string', required: true,
+          enum: ['show_taskbar', 'recents', 'home', 'switch_app_left', 'switch_app_right'],
+          description: 'show_taskbar=底部上划唤起任务栏 / recents=上划停留进入最近任务 / home=上划回桌面 / switch_app_left=底部左滑切换相邻应用 / switch_app_right=底部右滑切换相邻应用',
+        },
+        why: { type: 'string', description: '动作理由，记录到时间轴' },
+        name: { type: 'string', description: '证据名，如 case85/step07' },
+        serial: { type: 'string', description: '多设备时指定设备 serial' },
+        settle: { type: 'integer', description: '动作完成后的稳定等待，非负整数毫秒，默认 500；不改变预设动作' },
+        expect: { type: 'string', description: '落点检查点，如 activity=XxxActivity 或 rid=xxx' },
+        full: { type: 'boolean', description: '返回全量语义节点；默认导航模式。始终保留系统和任务栏节点' },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: true,
+          properties: {
+            ok: { type: 'boolean' },
+            action: { type: 'object', additionalProperties: true },
+            execution_state: { type: 'string' },
+            hint: { type: 'string' },
+          },
+        },
+        render: (_a, v) => [
+          { type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v) },
+        ],
+      },
+      async execute(args, exec) {
+        const allowed = ['action', 'why', 'name', 'serial', 'settle', 'expect', 'full']
+        const unknown = Object.keys(args).filter((key) => !allowed.includes(key))
+        let error
+        if (unknown.length) error = 'android_gesture 不接受参数: ' + unknown.join(', ')
+        else if (!['show_taskbar', 'recents', 'home', 'switch_app_left', 'switch_app_right'].includes(args.action))
+          error = 'action 必须为 show_taskbar / recents / home / switch_app_left / switch_app_right'
+        else if (args.settle !== undefined && (!Number.isSafeInteger(args.settle) || args.settle < 0))
+          error = 'settle 必须为非负整数毫秒'
+        if (error) return { ok: false, rejected: true, execution_state: 'not_executed', error }
+        const rest = [args.action]
+        for (const key of ['why', 'name', 'serial', 'settle', 'expect']) {
+          if (args[key] !== undefined && args[key] !== null && args[key] !== '')
+            rest.push('--' + key, String(args[key]))
+        }
+        if (args.full === true) rest.push('--full')
+        return runTool('gesture.py', rest, exec)
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
       name: 'android_system',
       description:
         '系统级界面动作（通知栏 / 快捷设置 / 亮屏解锁 / 横竖屏切换）。**别再用 swipe 手势下拉通知栏**：手势要求起点贴顶、速度有讲究、坐标随分辨率变，历史上同一会话里反复"再试一次拉下通知栏"的有 9 个；系统调用本身只要 43 毫秒。一次调用内做完「打开 → 截图 → dump → 解析出通知列表」，所以比「act 下拉 + observe 看」少一次往返（约省 5 秒）。返回值里的 notifications 已按条解析好（title/texts/clickable/center），判「提醒有没有来」直接看它，不必再 observe。',
