@@ -6,44 +6,32 @@
 # 用法：照着点即可。每步点之前验 expect，不命中就停、交回 AI。
 # 注意：这是**上一次**的实测路径，不是唯一正确路径。
 case: com.zui.calendar_拍照图库权限_169
-source_run: e1a6dc0b-2637-48ec-b4fd-4dd40880f242
-last_run: 2026-11-27T10:28:44.432
+source_run: d948313e-c216-40d7-a076-90ebd5cd774a
+last_run: 2026-11-27T11:45:41.801
 verdict: PASS
-step_count: 8
+step_count: 5
 start_from: activity=com.zui.calendar.timetable.widget.TimetableGuideActivity
 steps:
   - n: 1
-    why: 关掉课程表上新引导弹窗，进首页
+    why: 关掉课程表上新引导弹窗，回日历首页
     via: rid=timetable_guide_button,text=我知道了
     expect: activity=com.zui.calendar.AllInOneActivity
   - n: 2
-    why: 开更多菜单
+    why: 用例步骤1：点首页右上角更多按钮
     via: rid=iv_more
     expect: rid=item_title
     in_page: true
   - n: 3
-    why: 步骤1：进入课程表页
+    why: 用例步骤1：更多菜单里选择课程表
     via: text=课程表
     expect: activity=com.zui.calendar.timetable.display.TimetableActivity
   - n: 4
-    why: 允许分支：点仅在使用时允许，预期打开相机取景
-    via: rid=permission_allow_foreground_only_button
-    expect: activity=com.zui.calendar.timetable.display.TimetableActivity
-  - n: 5
-    why: 允许分支重试：点仅在使用时允许
-    via: text=仅在使用时允许
-    expect: activity=com.zui.calendar.timetable.display.TimetableActivity
-  - n: 6
-    why: 第4次触发拍照导入，改点 grant_singleton
-    via: rid=btnImportFromPhoto
+    why: 第二次点"拍照导入课程表"，走允许分支
+    via: rid=btnImportFromPhoto,text=拍照导入课程表
     expect: rid=alertTitle
     in_page: true
-  - n: 7
-    why: 改点 grant_singleton 验证允许是否可生效
-    via: rid=grant_singleton
-    expect: activity=com.zui.camera.CaptureActivity
-  - n: 8
-    why: 允许分支：再点从图库导入（意图改为允许）
-    via: rid=btnImportFromGallery
+  - n: 5
+    why: 第二次点"从图库导入课程表"，走允许分支
+    via: rid=btnImportFromGallery,text=从图库导入课程表
     expect: rid=alertTitle
     in_page: true
