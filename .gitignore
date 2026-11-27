@@ -14,6 +14,9 @@ venv/
 .pytest_cache/
 *.egg-info/
 
+# ── 插件 node 依赖符号链接（link-dsh-deps.ps1 产物，每台机器自己生成）─────
+node_modules/
+
 # ── 运行产物 ──────────────────────────────────────────────────────────
 # storage/ 里是 test.db、证据、临时文件 —— 只属于跑它的那台机器。
 # 注意路径不带前缀，这样 toolkit/storage 和 skills/*/storage 都会被忽略。
