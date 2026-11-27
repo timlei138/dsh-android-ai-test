@@ -208,9 +208,20 @@ Write-Ok "venv 就绪 ($VenvPy)"
 if ($SkipDeps) {
     Write-Warn '已跳过依赖安装（-SkipDeps）'
 } else {
-    Write-Info '升级 pip / setuptools / wheel ...'
-    (Invoke-Native $VenvPy @('-m','pip','install','--upgrade','pip','setuptools','wheel')).Output |
-        Select-Object -Last 3 | ForEach-Object { Write-Info $_ }
+    # ★ pip 自愈：以前这里是 `pip install --upgrade pip setuptools wheel`，没带镜像，
+    #   直连 pypi.org 卡住 + 会话中断杀进程 → pip 升级到一半（先删旧、没装新）
+    #   → venv 里没了 pip，后面所有 pip install 都跑在坏 venv 上（0 输出、像"卡死"）。
+    #   Python 3.13 venv 自带 pip 25.x 完全够用，不需要升级 —— 这里只做自愈检测。
+    $pipCheck = Invoke-Native $VenvPy @('-m','pip','--version')
+    if (-not $pipCheck.Ok) {
+        Write-Warn 'venv 里 pip 不可用（多半是被中断的 upgrade 弄坏了），用 ensurepip 离线修复...'
+        $fix = Invoke-Native $VenvPy @('-m','ensurepip','--upgrade')
+        if (-not $fix.Ok) {
+            Write-Fail 'ensurepip 修复失败，手动跑: python -m ensurepip --upgrade'
+            exit 1
+        }
+        Write-Ok 'pip 已用 ensurepip 离线修复'
+    }
 
     Write-Info '安装 uiautomator2 / rapidocr / pillow 等（首次较慢，请耐心）...'
     $req = Join-Path $Root 'requirements.txt'
